@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bsale_client import get_client
+from bsale_client import emission_range_from_iso, get_client
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -18,12 +18,16 @@ def register(mcp) -> None:  # noqa: ANN001
         officeid: int | None = None,
         state: int | None = None,
     ) -> dict[str, Any]:
-        """Lista documentos de Bsale (facturas, boletas, notas de credito)."""
+        """Lista documentos de Bsale.
+
+        emissiondate_range acepta 'YYYY-MM-DD,YYYY-MM-DD' o 'EPOCH,EPOCH'.
+        Internamente convierte ISO a epoch (lo que Bsale requiere).
+        """
         client = get_client()
         params = {
             "limit": min(limit, 50),
             "offset": offset,
-            "emissiondaterange": emissiondate_range,
+            "emissiondaterange": emission_range_from_iso(emissiondate_range),
             "documenttypeid": documenttypeid,
             "officeid": officeid,
             "state": state,

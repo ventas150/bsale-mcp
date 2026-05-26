@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
-from bsale_client import get_client
+from bsale_client import get_client, iso_to_epoch_range
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -32,7 +32,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
         params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date},{end_date}",
+            "emissiondaterange": iso_to_epoch_range(start_date, end_date),
             "officeid": officeid,
             "documenttypeid": documenttypeid,
             "state": 0,
@@ -100,7 +100,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
         params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date},{end_date}",
+            "emissiondaterange": iso_to_epoch_range(start_date, end_date),
             "state": 0,
         }
         max_pages = max(1, max_documents // 50)
@@ -168,7 +168,7 @@ def register(mcp) -> None:  # noqa: ANN001
         def _range(m: int) -> str:
             start = f"{year:04d}-{m:02d}-01"
             end = f"{year:04d}-{m:02d}-{_last_day(year, m):02d}"
-            return f"{start},{end}"
+            return iso_to_epoch_range(start, end)
 
         def _total(m: int) -> dict[str, Any]:
             params = {

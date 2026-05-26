@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from bsale_client import get_client
+from bsale_client import get_client, iso_to_epoch_range
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def register(mcp) -> None:  # noqa: ANN001
         start_date = end_date - timedelta(days=lookback_days)
         sales_params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
         }
         if office_id:
@@ -195,7 +195,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "/v1/documents.json",
             params={
                 "limit": 50,
-                "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+                "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
                 "state": 0,
                 "expand": "[office]",
             },
@@ -322,7 +322,7 @@ def register(mcp) -> None:  # noqa: ANN001
         start_date = end_date - timedelta(days=lookback_days)
         sales_params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
         }
         docs = client.paginated_get("/v1/documents.json", params=sales_params, max_pages=150)
@@ -397,7 +397,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
         params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
             "expand": "[office]",
         }
@@ -466,7 +466,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
         params = {
             "limit": 50,
-            "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
             "expand": "[client]",
         }

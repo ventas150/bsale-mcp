@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -25,6 +26,32 @@ from cache import get_cache
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def iso_to_epoch_range(date_from: str, date_to: str) -> str:
+    """Convierte YYYY-MM-DD,YYYY-MM-DD a EPOCH_START,EPOCH_END para Bsale.
+
+    Bsale requiere Unix timestamps (segundos epoch) en emissiondaterange,
+    no fechas ISO. start = 00:00:00 UTC, end = 23:59:59 UTC del dia.
+    """
+    start_dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_dt = datetime.strptime(date_to, "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=timezone.utc,
+    )
+    return f"{int(start_dt.timestamp())},{int(end_dt.timestamp())}"
+
+
+def emission_range_from_iso(emissiondate_range: str | None) -> str | None:
+    """Acepta 'YYYY-MM-DD,YYYY-MM-DD' o 'EPOCH,EPOCH' y siempre devuelve EPOCH,EPOCH."""
+    if not emissiondate_range:
+        return None
+    if "," not in emissiondate_range:
+        return emissiondate_range
+    parts = emissiondate_range.split(",", 1)
+    # Si ya es epoch (numerico), pasar tal cual
+    if parts[0].strip().isdigit():
+        return emissiondate_range
+    return iso_to_epoch_range(parts[0].strip(), parts[1].strip())
 
 
 class BsaleError(Exception):
