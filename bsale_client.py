@@ -54,6 +54,34 @@ def emission_range_from_iso(emissiondate_range: str | None) -> str | None:
     return iso_to_epoch_range(parts[0].strip(), parts[1].strip())
 
 
+def is_sales_doc(doc: dict) -> bool:
+    """True si el documento es venta real (no guia de despacho).
+
+    Bsale document_type.use semantica:
+      use=0 -> documento normal (boleta, factura)  -> True (venta)
+      use=1 -> nota de credito  -> True (resta de venta)
+      use=2 -> guia de despacho  -> False (NO venta, solo movimiento)
+      use=4 -> nota de debito  -> True
+
+    Excluir guias de despacho evita doble conteo (cuando luego se emite
+    factura del mismo pedido).
+    """
+    doctype = doc.get("document_type") or {}
+    return doctype.get("use") != 2
+
+
+def doc_revenue_signed(doc: dict) -> float:
+    """Devuelve totalAmount con signo: negativo si es nota de credito.
+
+    Notas de credito tienen use=1 -> restan del bruto/neto.
+    """
+    amount = float(doc.get("totalAmount", 0) or 0)
+    doctype = doc.get("document_type") or {}
+    if doctype.get("use") == 1:
+        return -amount
+    return amount
+
+
 class BsaleError(Exception):
     """Error base para fallos del API de Bsale."""
 

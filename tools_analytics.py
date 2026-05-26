@@ -5,7 +5,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
-from bsale_client import get_client, iso_to_epoch_range
+from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -53,7 +53,11 @@ def register(mcp) -> None:  # noqa: ANN001
         by_day: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "amount": 0.0})
 
         for doc in docs:
-            amount = float(doc.get("totalAmount", 0) or 0)
+            # Excluir guias de despacho (use=2) - no son ventas reales
+            if not is_sales_doc(doc):
+                continue
+
+            amount = doc_revenue_signed(doc)  # nota credito = negativo
             total_amount += amount
 
             office = doc.get("office") or {}
@@ -102,6 +106,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "limit": 50,
             "emissiondaterange": iso_to_epoch_range(start_date, end_date),
             "state": 0,
+            "expand": "[document_type]",  # necesario para is_sales_doc
         }
         max_pages = max(1, max_documents // 50)
         docs = client.paginated_get(
@@ -115,6 +120,9 @@ def register(mcp) -> None:  # noqa: ANN001
         for doc in docs[:max_documents]:
             doc_id = doc.get("id")
             if not doc_id:
+                continue
+            # Excluir guias de despacho
+            if not is_sales_doc(doc):
                 continue
             try:
                 details = client.get(
@@ -176,10 +184,12 @@ def register(mcp) -> None:  # noqa: ANN001
                 "emissiondaterange": _range(m),
                 "officeid": officeid,
                 "state": 0,
+                "expand": "[document_type]",
             }
             docs = client.paginated_get("/v1/documents.json", params=params, max_pages=50)
-            total = sum(float(d.get("totalAmount", 0) or 0) for d in docs)
-            return {"count": len(docs), "amount": total}
+            sales_docs = [d for d in docs if is_sales_doc(d)]
+            total = sum(doc_revenue_signed(d) for d in sales_docs)
+            return {"count": len(sales_docs), "amount": total}
 
         m1 = _total(month1)
         m2 = _total(month2)

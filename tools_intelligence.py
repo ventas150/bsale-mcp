@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from bsale_client import get_client, iso_to_epoch_range
+from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "limit": 50,
             "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
+            "expand": "[document_type]",  # para filtrar guias
         }
         if office_id:
             sales_params["officeid"] = office_id
@@ -99,6 +100,9 @@ def register(mcp) -> None:  # noqa: ANN001
         for doc in docs[:500]:  # cap razonable
             doc_id = doc.get("id")
             if not doc_id:
+                continue
+            # Excluir guias de despacho (no son ventas reales)
+            if not is_sales_doc(doc):
                 continue
             try:
                 details = client.get(
@@ -197,7 +201,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 "limit": 50,
                 "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
                 "state": 0,
-                "expand": "[office]",
+                "expand": "[office,document_type]",
             },
             max_pages=100,
         )
@@ -207,6 +211,9 @@ def register(mcp) -> None:  # noqa: ANN001
             office = doc.get("office") or {}
             oid = office.get("id", 0)
             if not doc_id or not oid:
+                continue
+            # Excluir guias de despacho
+            if not is_sales_doc(doc):
                 continue
             try:
                 details = client.get(
@@ -324,6 +331,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "limit": 50,
             "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
+            "expand": "[document_type]",
         }
         docs = client.paginated_get("/v1/documents.json", params=sales_params, max_pages=150)
 
@@ -331,6 +339,9 @@ def register(mcp) -> None:  # noqa: ANN001
         for doc in docs[:1000]:
             doc_id = doc.get("id")
             if not doc_id:
+                continue
+            # Excluir guias de despacho
+            if not is_sales_doc(doc):
                 continue
             try:
                 details = client.get(
@@ -399,7 +410,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "limit": 50,
             "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
-            "expand": "[office]",
+            "expand": "[office,document_type]",
         }
         docs = client.paginated_get("/v1/documents.json", params=params, max_pages=100)
 
@@ -408,9 +419,12 @@ def register(mcp) -> None:  # noqa: ANN001
         )
 
         for doc in docs:
+            # Excluir guias de despacho - no son ventas
+            if not is_sales_doc(doc):
+                continue
             o = doc.get("office") or {}
             oid = o.get("id", 0)
-            amount = float(doc.get("totalAmount", 0) or 0)
+            amount = doc_revenue_signed(doc)  # notas credito = negativo
             by_office[oid]["office_name"] = o.get("name", "?")
             by_office[oid]["revenue"] += amount
             by_office[oid]["doc_count"] += 1
@@ -468,7 +482,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "limit": 50,
             "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
             "state": 0,
-            "expand": "[client]",
+            "expand": "[client,document_type]",
         }
         docs = client.paginated_get("/v1/documents.json", params=params, max_pages=100)
 
@@ -477,11 +491,14 @@ def register(mcp) -> None:  # noqa: ANN001
         )
 
         for doc in docs[:max_clients * 5]:
+            # Excluir guias de despacho
+            if not is_sales_doc(doc):
+                continue
             client_ref = doc.get("client") or {}
             cid = client_ref.get("id")
             if not cid:
                 continue
-            amount = float(doc.get("totalAmount", 0) or 0)
+            amount = doc_revenue_signed(doc)
             emit_ts = doc.get("emissionDate", 0)
             if emit_ts and emit_ts > client_rfm[cid]["last_purchase_ts"]:
                 client_rfm[cid]["last_purchase_ts"] = emit_ts
