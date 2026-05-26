@@ -1,0 +1,27 @@
+# Render Blueprint para Bsale MCP (estructura flat)
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: bsale-mcp-myscrubs
+    runtime: python
+    plan: standard  # $25/mo - balance precio/performance
+    region: oregon  # mas cercano a Chile
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BSALE_ACCESS_TOKEN
+        sync: false  # IMPORTANTE: setear manualmente en dashboard, no en git
+      - key: BSALE_BASE_URL
+        value: https://api.bsale.io
+      - key: BSALE_TIMEOUT
+        value: "30"
+      - key: BSALE_DEFAULT_LIMIT
+        value: "25"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: "3.11.9"
