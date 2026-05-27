@@ -164,36 +164,25 @@ def register(mcp) -> None:  # noqa: ANN001
         variant_id: int,
         lookback_days: int = 60,
     ) -> dict[str, Any]:
-        """Sugerencia de allocation desde snapshot. ~50x mas rapido que version live."""
+        """Sugerencia de allocation. Hibrido: stock LIVE de Bsale + velocity desde snapshot.
+
+        Es ~10x mas rapido que la version full-live (1 API call a Bsale en vez de paginar
+        miles de docs). Stock siempre actualizado, velocity precalculada.
+        """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
 
+        # 1. Stock LIVE de Bsale (1 API call - rapido y siempre actualizado)
+        client = get_client()
+        stock_data = client.get(
+            "/v1/stocks.json",
+            params={"variantid": variant_id, "limit": 50, "expand": "[variant,office]"},
+            use_cache=False,
+        )
+        stock_items = stock_data.get("items", []) or []
+
+        # 2. Velocity desde snapshot (rapido SQL)
         with db_session() as s:
-            # Stock actual por sucursal (ultimo snapshot)
-            latest_stock = (
-                select(
-                    stock_snapshot.c.office_id,
-                    func.max(stock_snapshot.c.snapshot_date).label("max_ts"),
-                )
-                .where(stock_snapshot.c.variant_id == variant_id)
-                .group_by(stock_snapshot.c.office_id)
-                .subquery()
-            )
-            stock_stmt = select(
-                stock_snapshot.c.office_id,
-                stock_snapshot.c.quantity,
-                stock_snapshot.c.office_name,
-            ).join(
-                latest_stock,
-                and_(
-                    stock_snapshot.c.office_id == latest_stock.c.office_id,
-                    stock_snapshot.c.snapshot_date == latest_stock.c.max_ts,
-                ),
-            ).where(stock_snapshot.c.variant_id == variant_id)
-
-            stock_rows = s.execute(stock_stmt).fetchall()
-
-            # Velocity por sucursal
             vel_stmt = select(
                 document_details_snapshot.c.office_id,
                 func.sum(document_details_snapshot.c.quantity).label("total_qty"),
@@ -210,14 +199,18 @@ def register(mcp) -> None:  # noqa: ANN001
         velocity_by_office = {r.office_id: float(r.total_qty or 0) for r in vel_rows}
 
         rows = []
-        for r in stock_rows:
-            v_total = velocity_by_office.get(r.office_id, 0)
+        for item in stock_items:
+            office = item.get("office") or {}
+            oid = office.get("id")
+            if oid is None:
+                continue
+            stock = float(item.get("quantity", 0) or 0)
+            v_total = velocity_by_office.get(oid, 0)
             vpd = v_total / lookback_days if lookback_days > 0 else 0
-            stock = float(r.quantity or 0)
             cov = stock / vpd if vpd > 0 else (9999 if stock > 0 else 0)
             rows.append({
-                "office_id": r.office_id,
-                "office_name": r.office_name,
+                "office_id": oid,
+                "office_name": office.get("name"),
                 "stock": stock,
                 "velocity_per_day": round(vpd, 2),
                 "coverage_days": round(cov, 1),
