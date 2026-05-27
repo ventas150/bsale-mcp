@@ -89,54 +89,80 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
 
 
-def snapshot_stock(max_pages: int = 50) -> dict[str, Any]:
-    """Snapshot del stock actual por sucursal."""
+def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
+    """Snapshot del stock actual por sucursal.
+
+    Pagina incrementalmente y persiste cada N paginas para no perder data si timeout.
+    """
     client = get_client()
     snapshot_ts = datetime.now(timezone.utc)
 
-    items = client.paginated_get(
-        "/v1/stocks.json",
-        params={"limit": 50, "expand": "[variant,office]"},
-        max_pages=max_pages,
-    )
+    PERSIST_EVERY = 10  # persiste cada 10 paginas (500 rows) para no perder progreso
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    total_persisted = 0
 
-    rows = []
-    for item in items:
-        variant = item.get("variant") or {}
-        office = item.get("office") or {}
-        rows.append({
-            "snapshot_date": snapshot_ts,
-            "variant_id": variant.get("id"),
-            "office_id": office.get("id"),
-            "quantity": float(item.get("quantity", 0) or 0),
-            "variant_code": variant.get("code"),
-            "office_name": office.get("name"),
-        })
+    def _flush(buffer: list[dict[str, Any]]) -> int:
+        if not buffer:
+            return 0
+        with db_session() as s:
+            stmt = pg_insert(stock_snapshot).values(buffer)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["snapshot_date", "variant_id", "office_id"]
+            )
+            s.execute(stmt)
+        return len(buffer)
 
-    # Dedup por (snapshot_date, variant_id, office_id)
-    seen = set()
-    deduped = []
-    for r in rows:
-        key = (r["snapshot_date"], r["variant_id"], r["office_id"])
-        if r["variant_id"] is None or r["office_id"] is None:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
+    for page in range(max_pages):
+        try:
+            data = client.get(
+                "/v1/stocks.json",
+                params={"limit": 50, "offset": page * 50, "expand": "[variant,office]"},
+                use_cache=False,
+            )
+        except Exception:  # noqa: BLE001
+            break
+        items = data.get("items", []) or []
+        if not items:
+            break
 
-    if deduped:
-        CHUNK = 500
-        for i in range(0, len(deduped), CHUNK):
-            chunk = deduped[i:i + CHUNK]
-            with db_session() as s:
-                stmt = pg_insert(stock_snapshot).values(chunk)
-                stmt = stmt.on_conflict_do_nothing(
-                    index_elements=["snapshot_date", "variant_id", "office_id"]
-                )
-                s.execute(stmt)
+        for item in items:
+            variant = item.get("variant") or {}
+            office = item.get("office") or {}
+            vid = variant.get("id")
+            oid = office.get("id")
+            if vid is None or oid is None:
+                continue
+            key = (snapshot_ts, vid, oid)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "snapshot_date": snapshot_ts,
+                "variant_id": vid,
+                "office_id": oid,
+                "quantity": float(item.get("quantity", 0) or 0),
+                "variant_code": variant.get("code"),
+                "office_name": office.get("name"),
+            })
 
-    return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(deduped)}
+        # Flush incremental cada N paginas
+        if (page + 1) % PERSIST_EVERY == 0 and rows:
+            total_persisted += _flush(rows)
+            rows = []
+
+        if len(items) < 50:
+            break
+
+    # Flush remaining
+    if rows:
+        total_persisted += _flush(rows)
+
+    return {
+        "snapshot_ts": snapshot_ts.isoformat(),
+        "rows": total_persisted,
+        "max_pages_attempted": max_pages,
+    }
 
 
 def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
