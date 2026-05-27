@@ -50,109 +50,105 @@ def register(mcp) -> None:  # noqa: ANN001
         days_horizon: int = 14,
         lookback_days: int = 30,
         office_id: int | None = None,
-        min_velocity: float = 0.1,
-        top_n: int = 100,
+        min_velocity: float = 0.5,
+        top_velocity_check: int = 100,
     ) -> dict[str, Any]:
-        """Quiebres proyectados desde snapshot Postgres. ~100x mas rapido que la version live.
+        """Quiebres proyectados. HIBRIDO: velocity SQL + stock LIVE Bsale.
 
-        Requiere snapshot de stock + document_details (corre bsale_snapshot_details_batch primero).
+        Pasos:
+        1. SQL: top N variantes por velocity en lookback period (de snapshot completo)
+        2. Bsale live: stock actual de esas variantes (1 API call por variante)
+        3. Computa dias_hasta_quiebre y filtra por horizon
+
+        Tiempo tipico: 30-90s para top_velocity_check=100.
 
         Args:
             days_horizon: Horizonte de prediccion (default 14d).
-            lookback_days: Ventana para calcular velocity (default 30d).
-            office_id: Filtra por sucursal. None = totales por variante.
-            min_velocity: Ignora variantes con velocity < esto.
-            top_n: Max risks a retornar.
+            lookback_days: Ventana de velocity (default 30d).
+            office_id: Filtra por sucursal. None = totales.
+            min_velocity: Velocity minima (units/d) para considerar.
+            top_velocity_check: Cuantas variantes top-velocity revisar contra stock live.
+                                Mas alto = mas completo pero mas lento.
         """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
 
+        # 1. Top variantes por velocity (snapshot SQL, instantaneo)
         with db_session() as s:
-            # 1. Stock actual: ultimo snapshot por variante×office
-            latest_stock = (
-                select(
-                    stock_snapshot.c.variant_id,
-                    stock_snapshot.c.office_id,
-                    func.max(stock_snapshot.c.snapshot_date).label("max_ts"),
-                )
-                .group_by(stock_snapshot.c.variant_id, stock_snapshot.c.office_id)
-                .subquery()
-            )
-            stock_stmt = select(
-                stock_snapshot.c.variant_id,
-                stock_snapshot.c.office_id,
-                stock_snapshot.c.quantity,
-                stock_snapshot.c.variant_code,
-            ).join(
-                latest_stock,
-                and_(
-                    stock_snapshot.c.variant_id == latest_stock.c.variant_id,
-                    stock_snapshot.c.office_id == latest_stock.c.office_id,
-                    stock_snapshot.c.snapshot_date == latest_stock.c.max_ts,
-                ),
-            )
-            if office_id:
-                stock_stmt = stock_stmt.where(stock_snapshot.c.office_id == office_id)
-
-            stock_rows = s.execute(stock_stmt).fetchall()
-
-            # 2. Velocity: suma de quantity por variante en lookback (excluyendo guias)
             vel_stmt = select(
                 document_details_snapshot.c.variant_id,
                 func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.max(document_details_snapshot.c.variant_code).label("code"),
+                func.max(document_details_snapshot.c.variant_description).label("desc"),
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,  # excluir guias
+                    document_details_snapshot.c.document_type_use != 2,
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id)
             if office_id:
                 vel_stmt = vel_stmt.where(document_details_snapshot.c.office_id == office_id)
 
+            vel_stmt = vel_stmt.having(
+                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+            ).order_by(desc("total_qty")).limit(top_velocity_check)
+
             vel_rows = s.execute(vel_stmt).fetchall()
-            velocity_by_variant = {r.variant_id: float(r.total_qty or 0) for r in vel_rows}
 
-        # 3. Agregar stock por variante
-        stock_by_variant: dict[int, dict[str, Any]] = defaultdict(
-            lambda: {"stock_total": 0.0, "stock_by_office": {}, "variant_code": None}
-        )
-        for r in stock_rows:
-            stock_by_variant[r.variant_id]["stock_total"] += float(r.quantity or 0)
-            stock_by_variant[r.variant_id]["stock_by_office"][r.office_id] = float(r.quantity or 0)
-            if not stock_by_variant[r.variant_id]["variant_code"]:
-                stock_by_variant[r.variant_id]["variant_code"] = r.variant_code
-
-        # 4. Computar dias hasta quiebre
+        # 2. Stock live de Bsale por cada variante (paralelizable pero por simplicidad serial)
+        client = get_client()
         risks = []
-        for vid, info in stock_by_variant.items():
-            vtot = velocity_by_variant.get(vid, 0)
-            vpd = vtot / lookback_days if lookback_days > 0 else 0
-            if vpd < min_velocity:
+        for r in vel_rows:
+            vid = r.variant_id
+            try:
+                stock_params = {"variantid": vid, "limit": 50, "expand": "[office]"}
+                if office_id:
+                    stock_params["officeid"] = office_id
+                stock_data = client.get("/v1/stocks.json", params=stock_params, use_cache=False)
+                stock_items = stock_data.get("items", []) or []
+            except Exception:  # noqa: BLE001
                 continue
-            stock = info["stock_total"]
-            days = stock / vpd if vpd > 0 else 9999
+
+            stock_by_office = {}
+            stock_total = 0.0
+            for item in stock_items:
+                office = item.get("office") or {}
+                oid = office.get("id")
+                if oid is None:
+                    continue
+                qty = float(item.get("quantity", 0) or 0)
+                stock_by_office[oid] = qty
+                stock_total += qty
+
+            vtot = float(r.total_qty or 0)
+            vpd = vtot / lookback_days
+            days = stock_total / vpd if vpd > 0 else 9999
+
             if days <= days_horizon:
                 risks.append({
                     "variant_id": vid,
-                    "code": info["variant_code"],
-                    "stock_total": stock,
-                    "stock_by_office": info["stock_by_office"],
+                    "code": r.code,
+                    "description": r.desc,
+                    "stock_total": stock_total,
+                    "stock_by_office": stock_by_office,
                     "velocity_per_day": round(vpd, 2),
                     "lookback_units": round(vtot, 0),
                     "days_until_stockout": round(days, 1),
                     "category": _coverage_category(days),
                 })
 
-        risks.sort(key=lambda r: r["days_until_stockout"])
+        risks.sort(key=lambda x: x["days_until_stockout"])
 
         return {
-            "source": "snapshot",
+            "source": "hybrid (velocity:snapshot, stock:live)",
             "horizon_days": days_horizon,
             "lookback_days": lookback_days,
             "office_id": office_id,
+            "min_velocity": min_velocity,
+            "checked_variants": len(vel_rows),
             "total_at_risk": len(risks),
-            "risks": risks[:top_n],
+            "risks": risks,
         }
 
     # ============================
@@ -258,84 +254,81 @@ def register(mcp) -> None:  # noqa: ANN001
     def bsale_proyeccion_compras_fast(
         target_coverage_days: int = 45,
         lookback_days: int = 90,
-        min_velocity: float = 0.05,
-        top_n: int = 100,
+        min_velocity: float = 0.5,
+        top_velocity_check: int = 100,
     ) -> dict[str, Any]:
-        """Proyeccion de compras desde snapshot. ~100x mas rapido que version live."""
+        """Proyeccion de compras. HIBRIDO: velocity SQL + stock LIVE Bsale.
+
+        Calcula compra sugerida = max(0, velocity_per_day * target_coverage_days - stock_total).
+        Solo recorre las top_velocity_check variantes por venta historica.
+
+        Tiempo tipico: 30-90s para top_velocity_check=100.
+        """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
 
+        # 1. Top variantes por velocity
         with db_session() as s:
-            # Stock total por variante (ultimo snapshot)
-            latest_stock = (
-                select(
-                    stock_snapshot.c.variant_id,
-                    stock_snapshot.c.office_id,
-                    func.max(stock_snapshot.c.snapshot_date).label("max_ts"),
-                )
-                .group_by(stock_snapshot.c.variant_id, stock_snapshot.c.office_id)
-                .subquery()
-            )
-            stock_stmt = select(
-                stock_snapshot.c.variant_id,
-                func.sum(stock_snapshot.c.quantity).label("stock_total"),
-                func.max(stock_snapshot.c.variant_code).label("code"),
-            ).join(
-                latest_stock,
-                and_(
-                    stock_snapshot.c.variant_id == latest_stock.c.variant_id,
-                    stock_snapshot.c.office_id == latest_stock.c.office_id,
-                    stock_snapshot.c.snapshot_date == latest_stock.c.max_ts,
-                ),
-            ).group_by(stock_snapshot.c.variant_id)
-
-            stock_rows = s.execute(stock_stmt).fetchall()
-
-            # Velocity por variante
             vel_stmt = select(
                 document_details_snapshot.c.variant_id,
                 func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.max(document_details_snapshot.c.variant_code).label("code"),
+                func.max(document_details_snapshot.c.variant_description).label("desc"),
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
                     document_details_snapshot.c.document_type_use != 2,
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
-            ).group_by(document_details_snapshot.c.variant_id)
+            ).group_by(document_details_snapshot.c.variant_id).having(
+                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+            ).order_by(desc("total_qty")).limit(top_velocity_check)
 
             vel_rows = s.execute(vel_stmt).fetchall()
 
-        velocity = {r.variant_id: float(r.total_qty or 0) for r in vel_rows}
-
+        # 2. Stock live por variante
+        client = get_client()
         recs = []
-        for r in stock_rows:
+        for r in vel_rows:
             vid = r.variant_id
-            vtot = velocity.get(vid, 0)
-            vpd = vtot / lookback_days if lookback_days > 0 else 0
-            if vpd < min_velocity:
+            try:
+                stock_data = client.get(
+                    "/v1/stocks.json",
+                    params={"variantid": vid, "limit": 50},
+                    use_cache=False,
+                )
+                stock_items = stock_data.get("items", []) or []
+            except Exception:  # noqa: BLE001
                 continue
-            stock = float(r.stock_total or 0)
+
+            stock_total = sum(float(item.get("quantity", 0) or 0) for item in stock_items)
+            vtot = float(r.total_qty or 0)
+            vpd = vtot / lookback_days
             target = vpd * target_coverage_days
-            order_qty = max(0, target - stock)
+            order_qty = max(0, target - stock_total)
+
             if order_qty <= 0:
                 continue
             recs.append({
                 "variant_id": vid,
                 "code": r.code,
-                "stock_total": stock,
+                "description": r.desc,
+                "stock_total": stock_total,
                 "velocity_per_day": round(vpd, 2),
                 "target_stock": round(target, 0),
                 "order_qty_suggested": round(order_qty, 0),
-                "current_coverage_days": round(stock / vpd, 1) if vpd > 0 else 9999,
+                "current_coverage_days": round(stock_total / vpd, 1) if vpd > 0 else 9999,
             })
         recs.sort(key=lambda x: x["current_coverage_days"])
 
         return {
-            "source": "snapshot",
+            "source": "hybrid (velocity:snapshot, stock:live)",
             "target_coverage_days": target_coverage_days,
             "lookback_days": lookback_days,
+            "min_velocity": min_velocity,
+            "checked_variants": len(vel_rows),
             "total_recommendations": len(recs),
-            "recommendations": recs[:top_n],
+            "recommendations": recs,
         }
 
     # ============================
