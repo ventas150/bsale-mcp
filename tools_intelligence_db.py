@@ -469,6 +469,137 @@ def register(mcp) -> None:  # noqa: ANN001
     # 6. TOP PRODUCTOS (FAST)
     # ============================
 
+    # ============================
+    # 7. BRIEFING DIARIO (PURE SQL + HYBRID)
+    # ============================
+
+    @mcp.tool()
+    def bsale_briefing_diario(
+        lookback_days: int = 7,
+    ) -> dict[str, Any]:
+        """Briefing matinal: ventas dia anterior + quiebres + proyeccion + top sellers + at-risk RFM.
+
+        Aggregator que combina lo mas accionable en una sola call.
+        Tipico runtime: 30-60s.
+
+        Args:
+            lookback_days: Ventana para top_sellers y ranking (default 7d).
+        """
+        from datetime import date
+        now = datetime.now(timezone.utc)
+        yesterday = now.date() - timedelta(days=1)
+        week_ago = now.date() - timedelta(days=lookback_days)
+        lookback30_cutoff = now - timedelta(days=30)
+
+        with db_session() as s:
+            # 1. Ventas ayer
+            yesterday_dt_start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
+            yesterday_dt_end = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=timezone.utc)
+
+            yest = s.execute(select(
+                func.count().label("docs"),
+                func.sum(documents_snapshot.c.total_amount).label("revenue"),
+            ).where(documents_snapshot.c.emission_date.between(yesterday_dt_start, yesterday_dt_end))).first()
+
+            # 2. Ranking sucursales ultimos N dias
+            week_dt = datetime.combine(week_ago, datetime.min.time()).replace(tzinfo=timezone.utc)
+            ranking = s.execute(select(
+                documents_snapshot.c.office_id,
+                func.max(documents_snapshot.c.office_name).label("name"),
+                func.sum(documents_snapshot.c.total_amount).label("rev"),
+                func.count().label("docs"),
+            ).where(
+                documents_snapshot.c.emission_date >= week_dt
+            ).group_by(documents_snapshot.c.office_id).order_by(desc("rev")).limit(5)).fetchall()
+
+            # 3. Top 5 productos vendidos ultima semana
+            top_prod = s.execute(select(
+                document_details_snapshot.c.variant_id,
+                func.max(document_details_snapshot.c.variant_code).label("code"),
+                func.sum(document_details_snapshot.c.quantity).label("units"),
+                func.sum(document_details_snapshot.c.total_amount).label("revenue"),
+            ).where(
+                and_(
+                    document_details_snapshot.c.emission_date >= week_dt,
+                    document_details_snapshot.c.document_type_use != 2,
+                    document_details_snapshot.c.variant_id.isnot(None),
+                )
+            ).group_by(document_details_snapshot.c.variant_id).order_by(desc("units")).limit(5)).fetchall()
+
+            # 4. Top 5 variantes por velocity 30d (para chequeo de quiebres live)
+            top_vel = s.execute(select(
+                document_details_snapshot.c.variant_id,
+                func.max(document_details_snapshot.c.variant_code).label("code"),
+                func.sum(document_details_snapshot.c.quantity).label("units"),
+            ).where(
+                and_(
+                    document_details_snapshot.c.emission_date >= lookback30_cutoff,
+                    document_details_snapshot.c.document_type_use != 2,
+                    document_details_snapshot.c.variant_id.isnot(None),
+                )
+            ).group_by(document_details_snapshot.c.variant_id).order_by(desc("units")).limit(30)).fetchall()
+
+        # 5. Stock live para top 30 velocity → detectar quiebres + proyeccion
+        client = get_client()
+        quiebres_criticos = []
+        compras_urgentes = []
+        for r in top_vel:
+            vid = r.variant_id
+            vtot = float(r.units or 0)
+            vpd = vtot / 30
+            try:
+                stock_data = client.get(
+                    "/v1/stocks.json",
+                    params={"variantid": vid, "limit": 50},
+                    use_cache=False,
+                )
+                stocks = stock_data.get("items", []) or []
+                stock_total = sum(float(it.get("quantity", 0) or 0) for it in stocks)
+            except Exception:  # noqa: BLE001
+                continue
+
+            days_to_stockout = stock_total / vpd if vpd > 0 else 9999
+            if days_to_stockout <= 14:
+                quiebres_criticos.append({
+                    "variant_id": vid,
+                    "code": r.code,
+                    "stock": stock_total,
+                    "vel_per_day": round(vpd, 2),
+                    "days_until_stockout": round(days_to_stockout, 1),
+                })
+            target_45d = vpd * 45
+            if stock_total < target_45d:
+                compras_urgentes.append({
+                    "variant_id": vid,
+                    "code": r.code,
+                    "stock": stock_total,
+                    "vel_per_day": round(vpd, 2),
+                    "order_qty": round(target_45d - stock_total, 0),
+                    "current_coverage": round(days_to_stockout, 1),
+                })
+
+        quiebres_criticos.sort(key=lambda x: x["days_until_stockout"])
+        compras_urgentes.sort(key=lambda x: x["current_coverage"])
+
+        return {
+            "fecha_briefing": now.date().isoformat(),
+            "ventas_ayer": {
+                "fecha": yesterday.isoformat(),
+                "documentos": yest.docs if yest else 0,
+                "revenue": float(yest.revenue or 0) if yest else 0,
+            },
+            "ranking_sucursales_semana": [
+                {"office_id": r.office_id, "name": r.name, "revenue": float(r.rev or 0), "docs": r.docs}
+                for r in ranking
+            ],
+            "top_productos_semana": [
+                {"variant_id": r.variant_id, "code": r.code, "units": float(r.units or 0), "revenue": float(r.revenue or 0)}
+                for r in top_prod
+            ],
+            "quiebres_criticos_proximos_14d": quiebres_criticos[:10],
+            "compras_urgentes_top_velocity": compras_urgentes[:10],
+        }
+
     @mcp.tool()
     def bsale_top_productos_fast(
         date_from: str,
