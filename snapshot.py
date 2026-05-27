@@ -9,10 +9,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
 from db import (
+    document_details_snapshot,
     documents_snapshot,
     stock_snapshot,
     variants_snapshot,
@@ -169,6 +171,114 @@ def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows)}
 
 
+def snapshot_details(
+    batch_size: int = 50,
+    max_docs: int = 500,
+    only_recent_days: int | None = None,
+) -> dict[str, Any]:
+    """Para docs en documents_snapshot que aun no tienen details, fetch y store.
+
+    Bsale requiere 1 API call por documento para sus details. Esta funcion
+    es la mas costosa - se ejecuta en batches para no timeout.
+
+    Args:
+        batch_size: Cuantos docs procesar por llamada.
+        max_docs: Cap absoluto de docs a procesar en esta llamada.
+        only_recent_days: Si pasa N, solo procesa docs con emission_date >= now - N dias.
+                          None = todos los docs sin details aun.
+
+    Returns:
+        Dict con count de docs procesados, lineas insertadas, errores.
+    """
+    client = get_client()
+
+    # 1. Encuentra docs sin details aun (LEFT JOIN antimatch)
+    with db_session() as s:
+        existing_doc_ids = set(s.execute(
+            select(document_details_snapshot.c.document_id).distinct()
+        ).scalars().all())
+
+        # Docs candidatos
+        cand_stmt = select(
+            documents_snapshot.c.document_id,
+            documents_snapshot.c.emission_date,
+            documents_snapshot.c.office_id,
+            documents_snapshot.c.raw,
+        )
+        if only_recent_days:
+            from datetime import timedelta as _td
+            cutoff = datetime.now(timezone.utc) - _td(days=only_recent_days)
+            cand_stmt = cand_stmt.where(documents_snapshot.c.emission_date >= cutoff)
+        cand_stmt = cand_stmt.order_by(documents_snapshot.c.emission_date.desc())
+
+        candidates = s.execute(cand_stmt).fetchall()
+
+    # Filtra los que ya tienen details
+    todo = [c for c in candidates if c.document_id not in existing_doc_ids][:max_docs]
+
+    rows_inserted = 0
+    docs_processed = 0
+    errors = 0
+
+    for cand in todo[:batch_size]:
+        doc_id = cand.document_id
+        emission_date = cand.emission_date
+        office_id = cand.office_id
+        raw = cand.raw or {}
+        doctype = (raw.get("document_type") or {})
+        use = doctype.get("use", 0)
+
+        try:
+            resp = client.get(
+                f"/v1/documents/{doc_id}/details.json",
+                params={"limit": 50, "expand": "[variant]"},
+                use_cache=False,
+            )
+        except Exception:  # noqa: BLE001
+            errors += 1
+            continue
+
+        items = resp.get("items", []) or []
+        line_rows = []
+        for line in items:
+            variant = line.get("variant") or {}
+            line_id = line.get("id")
+            if line_id is None:
+                continue
+            line_rows.append({
+                "document_id": doc_id,
+                "line_id": line_id,
+                "variant_id": variant.get("id"),
+                "variant_code": variant.get("code"),
+                "variant_description": (variant.get("description") or "")[:500],
+                "office_id": office_id,
+                "emission_date": emission_date,
+                "document_type_use": use,
+                "quantity": float(line.get("quantity", 0) or 0),
+                "net_amount": float(line.get("netAmount", 0) or 0),
+                "total_amount": float(line.get("totalAmount", 0) or 0),
+                "fetched_at": datetime.now(timezone.utc),
+            })
+
+        if line_rows:
+            with db_session() as s:
+                stmt = pg_insert(document_details_snapshot).values(line_rows)
+                stmt = stmt.on_conflict_do_nothing(index_elements=["document_id", "line_id"])
+                s.execute(stmt)
+                rows_inserted += len(line_rows)
+        docs_processed += 1
+
+    remaining = max(0, len(todo) - batch_size)
+
+    return {
+        "docs_processed": docs_processed,
+        "lines_inserted": rows_inserted,
+        "errors": errors,
+        "remaining_to_process": remaining,
+        "candidates_total": len(todo),
+    }
+
+
 def nightly_snapshot() -> dict[str, Any]:
     """Job nocturno: ejecuta todos los snapshots en orden."""
     logger.info("Iniciando snapshot nocturno")
@@ -190,6 +300,13 @@ def nightly_snapshot() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_variants: %s", e)
         results["variants_error"] = str(e)
+
+    # Details para docs recientes (~10 por noche, escala)
+    try:
+        results["details"] = snapshot_details(batch_size=100, max_docs=100, only_recent_days=2)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en snapshot_details: %s", e)
+        results["details_error"] = str(e)
 
     logger.info("Snapshot nocturno completado: %s", results)
     return results

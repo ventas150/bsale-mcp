@@ -87,6 +87,25 @@ stock_snapshot = Table(
     Column("office_name", String(200)),
 )
 
+# Line items de cada documento (1 row por linea de doc).
+# Esta tabla es la que permite calcular velocity, top sellers, allocation, etc.
+document_details_snapshot = Table(
+    "document_details_snapshot",
+    metadata,
+    Column("document_id", Integer, primary_key=True),
+    Column("line_id", Integer, primary_key=True),
+    Column("variant_id", Integer, index=True, nullable=True),
+    Column("variant_code", String(100), index=True, nullable=True),
+    Column("variant_description", String(500), nullable=True),
+    Column("office_id", Integer, index=True, nullable=True),
+    Column("emission_date", DateTime(timezone=True), index=True),
+    Column("document_type_use", Integer, index=True),  # 0=venta, 1=NC, 2=guia
+    Column("quantity", Float),
+    Column("net_amount", Float),
+    Column("total_amount", Float),
+    Column("fetched_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
+)
+
 sku_mapping = Table(
     "sku_mapping",
     metadata,

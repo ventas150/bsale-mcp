@@ -156,14 +156,16 @@ tools_writes.register(mcp)
 tools_diagnostics.register(mcp)
 tools_intelligence.register(mcp)
 
-# Snapshot + mapping tools si DB configurada
+# Snapshot + mapping + intelligence-DB tools si DB configurada
 if os.getenv("DATABASE_URL"):
     try:
         import tools_snapshot
         import tools_mapping
+        import tools_intelligence_db
 
         tools_snapshot.register(mcp)
         tools_mapping.register(mcp)
+        tools_intelligence_db.register(mcp)
 
         # Auto-init schema
         try:
@@ -172,7 +174,7 @@ if os.getenv("DATABASE_URL"):
         except Exception as e:  # noqa: BLE001
             logger.warning("init_db fallo: %s", e)
 
-        logger.info("Snapshot + mapping tools registrados (DATABASE_URL detected)")
+        logger.info("Snapshot + mapping + intelligence-DB tools registrados (DATABASE_URL detected)")
     except ImportError as e:
         logger.warning("No se pudieron registrar DB tools: %s", e)
 
