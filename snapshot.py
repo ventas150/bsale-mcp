@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from bsale_client import get_client
+from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
 from db import (
     documents_snapshot,
     stock_snapshot,
@@ -45,13 +45,16 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
 
     params = {
         "limit": 50,
-        "emissiondaterange": f"{start_date.isoformat()},{end_date.isoformat()}",
+        "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
         "expand": "[document_type,office,client]",
     }
     docs = client.paginated_get("/v1/documents.json", params=params, max_pages=max_pages)
 
     rows = []
     for doc in docs:
+        # Excluir guias de despacho (use=2) del snapshot tambien
+        if not is_sales_doc(doc):
+            continue
         office = doc.get("office") or {}
         doctype = doc.get("document_type") or {}
         client_ref = doc.get("client") or {}
