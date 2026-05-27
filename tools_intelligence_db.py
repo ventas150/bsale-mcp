@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, desc, func, not_, select, text
 
 from bsale_client import get_client
 from db import (
@@ -23,7 +23,21 @@ from db import (
     documents_snapshot,
     session as db_session,
     stock_snapshot,
+    variants_snapshot,
 )
+
+
+def _service_variant_ids_subquery():
+    """Subquery: variant_ids que son servicios (unlimitedStock=1) -> EXCLUIR de quiebres.
+
+    Bsale marca servicios con unlimitedStock=1 (ej. bordado, servicios intangibles).
+    Esos no deben aparecer en quiebres/proyeccion porque no se quiebran.
+    """
+    return (
+        select(variants_snapshot.c.variant_id)
+        .where(text("(raw ->> 'unlimitedStock') = '1'"))
+        .scalar_subquery()
+    )
 
 
 def _coverage_category(days: float) -> str:
@@ -90,6 +104,10 @@ def register(mcp) -> None:  # noqa: ANN001
             if office_id:
                 vel_stmt = vel_stmt.where(document_details_snapshot.c.office_id == office_id)
 
+            # Excluir servicios (unlimitedStock=1)
+            vel_stmt = vel_stmt.where(
+                not_(document_details_snapshot.c.variant_id.in_(_service_variant_ids_subquery()))
+            )
             vel_stmt = vel_stmt.having(
                 func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
             ).order_by(desc("total_qty")).limit(top_velocity_check)
@@ -283,6 +301,10 @@ def register(mcp) -> None:  # noqa: ANN001
             ).group_by(document_details_snapshot.c.variant_id).having(
                 func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
             ).order_by(desc("total_qty")).limit(top_velocity_check)
+            # Excluir servicios (unlimitedStock=1)
+            vel_stmt = vel_stmt.where(
+                not_(document_details_snapshot.c.variant_id.in_(_service_variant_ids_subquery()))
+            )
 
             vel_rows = s.execute(vel_stmt).fetchall()
 
@@ -538,6 +560,14 @@ def register(mcp) -> None:  # noqa: ANN001
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).order_by(desc("units")).limit(30)).fetchall()
+
+            # Filtra servicios (unlimitedStock=1) - mismo session
+            svc_rows = s.execute(
+                select(variants_snapshot.c.variant_id).where(text("(raw ->> 'unlimitedStock') = '1'"))
+            ).fetchall()
+            service_ids = {r.variant_id for r in svc_rows}
+
+        top_vel = [r for r in top_vel if r.variant_id not in service_ids]
 
         # 5. Stock live para top 30 velocity → detectar quiebres + proyeccion
         client = get_client()
