@@ -77,10 +77,14 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
         })
 
     if rows:
-        with db_session() as s:
-            stmt = pg_insert(documents_snapshot).values(rows)
-            stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "document_id"])
-            s.execute(stmt)
+        # Chunked insert (500 por chunk) para evitar SSL EOF en queries enormes
+        CHUNK = 500
+        for i in range(0, len(rows), CHUNK):
+            chunk = rows[i:i + CHUNK]
+            with db_session() as s:
+                stmt = pg_insert(documents_snapshot).values(chunk)
+                stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "document_id"])
+                s.execute(stmt)
 
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
 
@@ -122,12 +126,15 @@ def snapshot_stock(max_pages: int = 50) -> dict[str, Any]:
         deduped.append(r)
 
     if deduped:
-        with db_session() as s:
-            stmt = pg_insert(stock_snapshot).values(deduped)
-            stmt = stmt.on_conflict_do_nothing(
-                index_elements=["snapshot_date", "variant_id", "office_id"]
-            )
-            s.execute(stmt)
+        CHUNK = 500
+        for i in range(0, len(deduped), CHUNK):
+            chunk = deduped[i:i + CHUNK]
+            with db_session() as s:
+                stmt = pg_insert(stock_snapshot).values(chunk)
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=["snapshot_date", "variant_id", "office_id"]
+                )
+                s.execute(stmt)
 
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(deduped)}
 
@@ -163,10 +170,13 @@ def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
         })
 
     if rows:
-        with db_session() as s:
-            stmt = pg_insert(variants_snapshot).values(rows)
-            stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "variant_id"])
-            s.execute(stmt)
+        CHUNK = 500
+        for i in range(0, len(rows), CHUNK):
+            chunk = rows[i:i + CHUNK]
+            with db_session() as s:
+                stmt = pg_insert(variants_snapshot).values(chunk)
+                stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "variant_id"])
+                s.execute(stmt)
 
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows)}
 
