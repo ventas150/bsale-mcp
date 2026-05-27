@@ -4,6 +4,7 @@ Solo se registran si DATABASE_URL esta seteado (ver server.py).
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import desc, func, select
@@ -75,9 +76,15 @@ def register(mcp) -> None:  # noqa: ANN001
             office_id: Filtra por sucursal.
             limit: Max documentos a retornar.
         """
+        # Convertir strings a datetime con timezone
+        start_dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(date_to, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc,
+        )
+
         with db_session() as s:
             stmt = select(documents_snapshot).where(
-                documents_snapshot.c.emission_date.between(date_from, date_to)
+                documents_snapshot.c.emission_date.between(start_dt, end_dt)
             )
             if office_id:
                 stmt = stmt.where(documents_snapshot.c.office_id == office_id)
