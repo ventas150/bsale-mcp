@@ -354,6 +354,139 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
     # ============================
+    # 3b. SOBRESTOCKEOS DETECTADOS (FAST)
+    # ============================
+
+    @mcp.tool()
+    def bsale_sobrestockeos_detectados(
+        min_coverage_days: int = 180,
+        lookback_days: int = 30,
+        min_velocity: float = 0.05,
+        top_check: int = 150,
+    ) -> dict[str, Any]:
+        """Detecta SKUs sobrestockeados (cobertura > N dias). Inversa de quiebres.
+
+        Identifica capital muerto en bodega. Hibrido: velocity + precio del snapshot,
+        stock LIVE de Bsale.
+
+        Args:
+            min_coverage_days: Umbral. Default 180 = 6 meses de stock = sobrestock.
+            lookback_days: Ventana de velocity (default 30d).
+            min_velocity: Velocity minima (units/d) para incluir. <esto = stock muerto, no sobrestockeo.
+            top_check: Cuantas variantes top-velocity revisar (max 200 por timeout).
+
+        Returns:
+            Lista de SKUs sobrestockeados con capital_tied calculado.
+        """
+        now = datetime.now(timezone.utc)
+        lookback_cutoff = now - timedelta(days=lookback_days)
+
+        # 1. Top variantes por velocity con precio promedio (SQL puro)
+        with db_session() as s:
+            vel_stmt = select(
+                document_details_snapshot.c.variant_id,
+                func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.sum(document_details_snapshot.c.total_amount).label("total_revenue"),
+                func.max(document_details_snapshot.c.variant_code).label("code"),
+                func.max(document_details_snapshot.c.variant_description).label("desc"),
+            ).where(
+                and_(
+                    document_details_snapshot.c.emission_date >= lookback_cutoff,
+                    document_details_snapshot.c.document_type_use != 2,
+                    document_details_snapshot.c.variant_id.isnot(None),
+                )
+            ).group_by(document_details_snapshot.c.variant_id).having(
+                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+            ).order_by(desc("total_qty")).limit(top_check)
+
+            # Excluir servicios (unlimitedStock=1)
+            vel_stmt = vel_stmt.where(
+                not_(document_details_snapshot.c.variant_id.in_(_service_variant_ids_subquery()))
+            )
+
+            vel_rows = s.execute(vel_stmt).fetchall()
+
+        # 2. Stock live por variante + calculo cobertura
+        client = get_client()
+        sobrestockeos = []
+        for r in vel_rows:
+            vid = r.variant_id
+            try:
+                stock_data = client.get(
+                    "/v1/stocks.json",
+                    params={"variantid": vid, "limit": 50, "expand": "[office]"},
+                    use_cache=False,
+                )
+                stock_items = stock_data.get("items", []) or []
+            except Exception:  # noqa: BLE001
+                continue
+
+            stock_by_office: dict[int, dict[str, Any]] = {}
+            stock_total = 0.0
+            for item in stock_items:
+                office = item.get("office") or {}
+                oid = office.get("id")
+                if oid is None:
+                    continue
+                qty = float(item.get("quantity", 0) or 0)
+                if qty > 0:
+                    stock_by_office[oid] = {
+                        "office_name": office.get("name"),
+                        "stock": qty,
+                    }
+                    stock_total += qty
+
+            if stock_total == 0:
+                continue
+
+            vtot = float(r.total_qty or 0)
+            vpd = vtot / lookback_days
+            coverage = stock_total / vpd if vpd > 0 else 9999
+
+            if coverage < min_coverage_days:
+                continue
+
+            avg_price = float(r.total_revenue or 0) / vtot if vtot > 0 else 0
+            capital_tied = stock_total * avg_price
+
+            # Detectar concentracion en una sola sucursal (>70% en una office)
+            largest_office_stock = max((o["stock"] for o in stock_by_office.values()), default=0)
+            concentration_pct = (largest_office_stock / stock_total * 100) if stock_total else 0
+            largest_office = next(
+                (o for o in stock_by_office.values() if o["stock"] == largest_office_stock),
+                None,
+            )
+
+            sobrestockeos.append({
+                "variant_id": vid,
+                "code": r.code,
+                "description": r.desc,
+                "stock_total": stock_total,
+                "stock_by_office": stock_by_office,
+                "velocity_per_day": round(vpd, 2),
+                "lookback_units_sold": round(vtot, 0),
+                "coverage_days": round(coverage, 0),
+                "avg_price": round(avg_price, 0),
+                "capital_tied_clp": round(capital_tied, 0),
+                "concentration_pct": round(concentration_pct, 1),
+                "concentrated_in": largest_office["office_name"] if largest_office else None,
+            })
+
+        # Ordenar por capital_tied descendente (donde hay mas plata muerta)
+        sobrestockeos.sort(key=lambda x: x["capital_tied_clp"], reverse=True)
+
+        total_capital_tied = sum(s["capital_tied_clp"] for s in sobrestockeos)
+        return {
+            "source": "hybrid (velocity:snapshot, stock:live)",
+            "min_coverage_days": min_coverage_days,
+            "lookback_days": lookback_days,
+            "checked_variants": len(vel_rows),
+            "total_sobrestockeos": len(sobrestockeos),
+            "total_capital_tied_clp": total_capital_tied,
+            "sobrestockeos": sobrestockeos,
+        }
+
+    # ============================
     # 4. RANKING SUCURSALES (FAST)
     # ============================
 
