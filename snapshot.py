@@ -1,7 +1,10 @@
 """Snapshot nocturno de data Bsale a Postgres.
 
-Llamado por scheduler (apscheduler) o manualmente via tool.
+Llamado por el Render Cron Job (cron_snapshot.py) o manualmente via tool.
 Hace upsert idempotente para que correrlo dos veces no rompa nada.
+
+documents_snapshot: una fila por document_id (PK = document_id) -> upsert.
+Esto evita el doble conteo que existia con la PK compuesta (snapshot_date, document_id).
 """
 from __future__ import annotations
 
@@ -68,6 +71,7 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
             "office_name": office.get("name"),
             "document_type_id": doctype.get("id"),
             "document_type_name": doctype.get("name"),
+            "document_type_use": doctype.get("use", 0),
             "client_id": client_ref.get("id"),
             "total_amount": float(doc.get("totalAmount", 0) or 0),
             "net_amount": float(doc.get("netAmount", 0) or 0),
@@ -83,7 +87,24 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
             chunk = rows[i:i + CHUNK]
             with db_session() as s:
                 stmt = pg_insert(documents_snapshot).values(chunk)
-                stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "document_id"])
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["document_id"],
+                    set_={
+                        "snapshot_date": stmt.excluded.snapshot_date,
+                        "emission_date": stmt.excluded.emission_date,
+                        "office_id": stmt.excluded.office_id,
+                        "office_name": stmt.excluded.office_name,
+                        "document_type_id": stmt.excluded.document_type_id,
+                        "document_type_name": stmt.excluded.document_type_name,
+                        "document_type_use": stmt.excluded.document_type_use,
+                        "client_id": stmt.excluded.client_id,
+                        "total_amount": stmt.excluded.total_amount,
+                        "net_amount": stmt.excluded.net_amount,
+                        "tax_amount": stmt.excluded.tax_amount,
+                        "state": stmt.excluded.state,
+                        "raw": stmt.excluded.raw,
+                    },
+                )
                 s.execute(stmt)
 
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
@@ -221,7 +242,7 @@ def snapshot_details(
         batch_size: Cuantos docs procesar por llamada.
         max_docs: Cap absoluto de docs a procesar en esta llamada.
         only_recent_days: Si pasa N, solo procesa docs con emission_date >= now - N dias.
-                          None = todos los docs sin details aun.
+            None = todos los docs sin details aun.
 
     Returns:
         Dict con count de docs procesados, lineas insertadas, errores.
@@ -301,7 +322,7 @@ def snapshot_details(
                 stmt = pg_insert(document_details_snapshot).values(line_rows)
                 stmt = stmt.on_conflict_do_nothing(index_elements=["document_id", "line_id"])
                 s.execute(stmt)
-                rows_inserted += len(line_rows)
+            rows_inserted += len(line_rows)
         docs_processed += 1
 
     remaining = max(0, len(todo) - batch_size)
@@ -337,9 +358,10 @@ def nightly_snapshot() -> dict[str, Any]:
         logger.error("Error en snapshot_variants: %s", e)
         results["variants_error"] = str(e)
 
-    # Details para docs recientes (~10 por noche, escala)
+    # Details para docs recientes. Ahora corre en el Cron Job dedicado (no compite
+    # con el web service), por lo que se puede subir el batch para mejor cobertura.
     try:
-        results["details"] = snapshot_details(batch_size=100, max_docs=100, only_recent_days=2)
+        results["details"] = snapshot_details(batch_size=400, max_docs=400, only_recent_days=3)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_details: %s", e)
         results["details_error"] = str(e)
