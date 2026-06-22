@@ -8,6 +8,12 @@ Se registran solo si DATABASE_URL esta configurado (ver server.py).
 Sobreescriben las versiones de tools_intelligence.py si esta cargado.
 Decision: registrar nombres DISTINTOS con sufijo _fast para que ambas coexistan
 y el agente pueda elegir. Si las _fast funcionan, las antiguas se pueden retirar.
+
+Correctitud (P0):
+- documents_snapshot tiene PK = document_id (una fila por documento), asi que
+  los SUM ya no doble-cuentan.
+- Las notas de credito (document_type_use=1) se RESTAN via signed_amount().
+- Las guias (use=2) se excluyen.
 """
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ from db import (
     document_details_snapshot,
     documents_snapshot,
     session as db_session,
+    signed_amount,
     stock_snapshot,
     variants_snapshot,
 )
@@ -82,16 +89,22 @@ def register(mcp) -> None:  # noqa: ANN001
             office_id: Filtra por sucursal. None = totales.
             min_velocity: Velocity minima (units/d) para considerar.
             top_velocity_check: Cuantas variantes top-velocity revisar contra stock live.
-                                Mas alto = mas completo pero mas lento.
+                Mas alto = mas completo pero mas lento.
         """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
+
+        # velocity firmada: las notas de credito (use=1) restan unidades
+        qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
 
         # 1. Top variantes por velocity (snapshot SQL, instantaneo)
         with db_session() as s:
             vel_stmt = select(
                 document_details_snapshot.c.variant_id,
-                func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.sum(qty).label("total_qty"),
                 func.max(document_details_snapshot.c.variant_code).label("code"),
                 func.max(document_details_snapshot.c.variant_description).label("desc"),
             ).where(
@@ -109,7 +122,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 not_(document_details_snapshot.c.variant_id.in_(_service_variant_ids_subquery()))
             )
             vel_stmt = vel_stmt.having(
-                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+                func.sum(qty) >= min_velocity * lookback_days
             ).order_by(desc("total_qty")).limit(top_velocity_check)
 
             vel_rows = s.execute(vel_stmt).fetchall()
@@ -135,9 +148,9 @@ def register(mcp) -> None:  # noqa: ANN001
                 oid = office.get("id")
                 if oid is None:
                     continue
-                qty = float(item.get("quantity", 0) or 0)
-                stock_by_office[oid] = qty
-                stock_total += qty
+                qv = float(item.get("quantity", 0) or 0)
+                stock_by_office[oid] = qv
+                stock_total += qv
 
             vtot = float(r.total_qty or 0)
             vpd = vtot / lookback_days
@@ -195,11 +208,15 @@ def register(mcp) -> None:  # noqa: ANN001
         )
         stock_items = stock_data.get("items", []) or []
 
-        # 2. Velocity desde snapshot (rapido SQL)
+        # 2. Velocity desde snapshot (rapido SQL), firmada (NC restan)
+        qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
         with db_session() as s:
             vel_stmt = select(
                 document_details_snapshot.c.office_id,
-                func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.sum(qty).label("total_qty"),
             ).where(
                 and_(
                     document_details_snapshot.c.variant_id == variant_id,
@@ -285,11 +302,16 @@ def register(mcp) -> None:  # noqa: ANN001
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
 
+        qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
+
         # 1. Top variantes por velocity
         with db_session() as s:
             vel_stmt = select(
                 document_details_snapshot.c.variant_id,
-                func.sum(document_details_snapshot.c.quantity).label("total_qty"),
+                func.sum(qty).label("total_qty"),
                 func.max(document_details_snapshot.c.variant_code).label("code"),
                 func.max(document_details_snapshot.c.variant_description).label("desc"),
             ).where(
@@ -299,7 +321,7 @@ def register(mcp) -> None:  # noqa: ANN001
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).having(
-                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+                func.sum(qty) >= min_velocity * lookback_days
             ).order_by(desc("total_qty")).limit(top_velocity_check)
             # Excluir servicios (unlimitedStock=1)
             vel_stmt = vel_stmt.where(
@@ -381,12 +403,21 @@ def register(mcp) -> None:  # noqa: ANN001
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
 
+        qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
+        rev = signed_amount(
+            document_details_snapshot.c.total_amount,
+            document_details_snapshot.c.document_type_use,
+        )
+
         # 1. Top variantes por velocity con precio promedio (SQL puro)
         with db_session() as s:
             vel_stmt = select(
                 document_details_snapshot.c.variant_id,
-                func.sum(document_details_snapshot.c.quantity).label("total_qty"),
-                func.sum(document_details_snapshot.c.total_amount).label("total_revenue"),
+                func.sum(qty).label("total_qty"),
+                func.sum(rev).label("total_revenue"),
                 func.max(document_details_snapshot.c.variant_code).label("code"),
                 func.max(document_details_snapshot.c.variant_description).label("desc"),
             ).where(
@@ -396,7 +427,7 @@ def register(mcp) -> None:  # noqa: ANN001
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).having(
-                func.sum(document_details_snapshot.c.quantity) >= min_velocity * lookback_days
+                func.sum(qty) >= min_velocity * lookback_days
             ).order_by(desc("total_qty")).limit(top_check)
 
             # Excluir servicios (unlimitedStock=1)
@@ -428,13 +459,13 @@ def register(mcp) -> None:  # noqa: ANN001
                 oid = office.get("id")
                 if oid is None:
                     continue
-                qty = float(item.get("quantity", 0) or 0)
-                if qty > 0:
+                qv = float(item.get("quantity", 0) or 0)
+                if qv > 0:
                     stock_by_office[oid] = {
                         "office_name": office.get("name"),
-                        "stock": qty,
+                        "stock": qv,
                     }
-                    stock_total += qty
+                    stock_total += qv
 
             if stock_total == 0:
                 continue
@@ -496,23 +527,31 @@ def register(mcp) -> None:  # noqa: ANN001
     ) -> dict[str, Any]:
         """Ranking sucursales desde snapshot. Lectura SQL pura, sub-segundo.
 
-        NOTA: notas de credito (use=1) ya estan en raw, pero para simplicidad
-        sumamos total_amount; el cliente que quiera neto puede sumar - notas_credito.
+        Neto correcto: notas de credito (use=1) restan; guias (use=2) excluidas;
+        sin doble conteo (PK = document_id).
         """
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=days_back)
+
+        amt = signed_amount(
+            documents_snapshot.c.total_amount,
+            documents_snapshot.c.document_type_use,
+        )
 
         with db_session() as s:
             stmt = select(
                 documents_snapshot.c.office_id,
                 func.max(documents_snapshot.c.office_name).label("office_name"),
-                func.sum(documents_snapshot.c.total_amount).label("revenue"),
-                func.count().label("doc_count"),
-                func.avg(documents_snapshot.c.total_amount).label("avg_ticket"),
-                func.max(documents_snapshot.c.total_amount).label("max_ticket"),
-                func.min(documents_snapshot.c.total_amount).label("min_ticket"),
+                func.sum(amt).label("revenue"),
+                func.count().filter(documents_snapshot.c.document_type_use != 1).label("doc_count"),
+                func.avg(amt).label("avg_ticket"),
+                func.max(amt).label("max_ticket"),
+                func.min(amt).label("min_ticket"),
             ).where(
-                documents_snapshot.c.emission_date >= cutoff
+                and_(
+                    documents_snapshot.c.emission_date >= cutoff,
+                    documents_snapshot.c.document_type_use != 2,
+                )
             ).group_by(documents_snapshot.c.office_id)
 
             rows = s.execute(stmt).fetchall()
@@ -555,12 +594,17 @@ def register(mcp) -> None:  # noqa: ANN001
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=days_back)
 
+        amt = signed_amount(
+            documents_snapshot.c.total_amount,
+            documents_snapshot.c.document_type_use,
+        )
+
         with db_session() as s:
             stmt = select(
                 documents_snapshot.c.client_id,
                 func.max(documents_snapshot.c.emission_date).label("last_purchase"),
-                func.count().label("frequency"),
-                func.sum(documents_snapshot.c.total_amount).label("monetary"),
+                func.count().filter(documents_snapshot.c.document_type_use != 1).label("frequency"),
+                func.sum(amt).label("monetary"),
                 func.max(documents_snapshot.c.raw["firstName"].astext).label("first_name"),
                 func.max(documents_snapshot.c.raw["lastName"].astext).label("last_name"),
                 func.max(documents_snapshot.c.raw["company"].astext).label("company"),
@@ -568,6 +612,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 and_(
                     documents_snapshot.c.emission_date >= cutoff,
                     documents_snapshot.c.client_id.isnot(None),
+                    documents_snapshot.c.document_type_use != 2,
                 )
             ).group_by(documents_snapshot.c.client_id)
 
@@ -621,11 +666,7 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
     # ============================
-    # 6. TOP PRODUCTOS (FAST)
-    # ============================
-
-    # ============================
-    # 7. BRIEFING DIARIO (PURE SQL + HYBRID)
+    # 6. BRIEFING DIARIO (PURE SQL + HYBRID)
     # ============================
 
     @mcp.tool()
@@ -640,11 +681,23 @@ def register(mcp) -> None:  # noqa: ANN001
         Args:
             lookback_days: Ventana para top_sellers y ranking (default 7d).
         """
-        from datetime import date
         now = datetime.now(timezone.utc)
         yesterday = now.date() - timedelta(days=1)
         week_ago = now.date() - timedelta(days=lookback_days)
         lookback30_cutoff = now - timedelta(days=30)
+
+        amt = signed_amount(
+            documents_snapshot.c.total_amount,
+            documents_snapshot.c.document_type_use,
+        )
+        det_qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
+        det_rev = signed_amount(
+            document_details_snapshot.c.total_amount,
+            document_details_snapshot.c.document_type_use,
+        )
 
         with db_session() as s:
             # 1. Ventas ayer
@@ -652,27 +705,35 @@ def register(mcp) -> None:  # noqa: ANN001
             yesterday_dt_end = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=timezone.utc)
 
             yest = s.execute(select(
-                func.count().label("docs"),
-                func.sum(documents_snapshot.c.total_amount).label("revenue"),
-            ).where(documents_snapshot.c.emission_date.between(yesterday_dt_start, yesterday_dt_end))).first()
+                func.count().filter(documents_snapshot.c.document_type_use != 1).label("docs"),
+                func.sum(amt).label("revenue"),
+            ).where(
+                and_(
+                    documents_snapshot.c.emission_date.between(yesterday_dt_start, yesterday_dt_end),
+                    documents_snapshot.c.document_type_use != 2,
+                )
+            )).first()
 
             # 2. Ranking sucursales ultimos N dias
             week_dt = datetime.combine(week_ago, datetime.min.time()).replace(tzinfo=timezone.utc)
             ranking = s.execute(select(
                 documents_snapshot.c.office_id,
                 func.max(documents_snapshot.c.office_name).label("name"),
-                func.sum(documents_snapshot.c.total_amount).label("rev"),
-                func.count().label("docs"),
+                func.sum(amt).label("rev"),
+                func.count().filter(documents_snapshot.c.document_type_use != 1).label("docs"),
             ).where(
-                documents_snapshot.c.emission_date >= week_dt
+                and_(
+                    documents_snapshot.c.emission_date >= week_dt,
+                    documents_snapshot.c.document_type_use != 2,
+                )
             ).group_by(documents_snapshot.c.office_id).order_by(desc("rev")).limit(5)).fetchall()
 
             # 3. Top 5 productos vendidos ultima semana
             top_prod = s.execute(select(
                 document_details_snapshot.c.variant_id,
                 func.max(document_details_snapshot.c.variant_code).label("code"),
-                func.sum(document_details_snapshot.c.quantity).label("units"),
-                func.sum(document_details_snapshot.c.total_amount).label("revenue"),
+                func.sum(det_qty).label("units"),
+                func.sum(det_rev).label("revenue"),
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= week_dt,
@@ -685,7 +746,7 @@ def register(mcp) -> None:  # noqa: ANN001
             top_vel = s.execute(select(
                 document_details_snapshot.c.variant_id,
                 func.max(document_details_snapshot.c.variant_code).label("code"),
-                func.sum(document_details_snapshot.c.quantity).label("units"),
+                func.sum(det_qty).label("units"),
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback30_cutoff,
@@ -700,7 +761,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).fetchall()
             service_ids = {r.variant_id for r in svc_rows}
 
-        top_vel = [r for r in top_vel if r.variant_id not in service_ids]
+            top_vel = [r for r in top_vel if r.variant_id not in service_ids]
 
         # 5. Stock live para top 30 velocity → detectar quiebres + proyeccion
         client = get_client()
@@ -763,6 +824,10 @@ def register(mcp) -> None:  # noqa: ANN001
             "compras_urgentes_top_velocity": compras_urgentes[:10],
         }
 
+    # ============================
+    # 7. TOP PRODUCTOS (FAST)
+    # ============================
+
     @mcp.tool()
     def bsale_top_productos_fast(
         date_from: str,
@@ -776,13 +841,22 @@ def register(mcp) -> None:  # noqa: ANN001
             hour=23, minute=59, second=59, tzinfo=timezone.utc,
         )
 
+        qty = signed_amount(
+            document_details_snapshot.c.quantity,
+            document_details_snapshot.c.document_type_use,
+        )
+        rev = signed_amount(
+            document_details_snapshot.c.total_amount,
+            document_details_snapshot.c.document_type_use,
+        )
+
         with db_session() as s:
             stmt = select(
                 document_details_snapshot.c.variant_id,
                 func.max(document_details_snapshot.c.variant_code).label("code"),
                 func.max(document_details_snapshot.c.variant_description).label("desc"),
-                func.sum(document_details_snapshot.c.quantity).label("units"),
-                func.sum(document_details_snapshot.c.total_amount).label("revenue"),
+                func.sum(qty).label("units"),
+                func.sum(rev).label("revenue"),
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date.between(start_dt, end_dt),

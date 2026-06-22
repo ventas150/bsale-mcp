@@ -1,11 +1,11 @@
 """MCP server principal de Bsale.
 
 v0.2.0 — production grade:
-- Healthcheck profundo (token vigente, ultima request, errores)
+- Healthcheck profundo (token vigente, ultima request, errores, lag de snapshot)
 - Sentry SDK opcional (via env var SENTRY_DSN)
 - Audit log endpoint (/audit) para revisar writes recientes
 - Cache stats endpoint
-- Scheduler de snapshots nocturnos (si DATABASE_URL esta configurado)
+- El snapshot nocturno corre como Render Cron Job (cron_snapshot.py), NO in-process.
 """
 from __future__ import annotations
 
@@ -52,7 +52,6 @@ mcp = FastMCP(
     ),
 )
 
-
 # ============================
 # Health & Diagnostics
 # ============================
@@ -84,17 +83,22 @@ async def health_check(request):  # noqa: ARG001
     except Exception as e:  # noqa: BLE001
         status["cache_error"] = str(e)[:200]
 
-    # DB si aplica
+    # DB + frescura del snapshot si aplica
     if os.getenv("DATABASE_URL"):
         try:
-            from db import db_health
+            from db import db_health, snapshot_lag_hours
 
             status["db"] = db_health()
+            lag = snapshot_lag_hours()
+            status["snapshot_lag_hours"] = round(lag, 1) if lag is not None else None
+            # Si el snapshot quedo viejo (>26h), marcar degraded para alertar.
+            if lag is not None and lag > 26:
+                status["status"] = "degraded"
+                code = 503
         except Exception as e:  # noqa: BLE001
             status["db_error"] = str(e)[:200]
 
     return JSONResponse(status, status_code=code)
-
 
 @mcp.custom_route("/health/deep", methods=["GET"])
 async def health_check_deep(request):  # noqa: ARG001
@@ -110,7 +114,6 @@ async def health_check_deep(request):  # noqa: ARG001
         "bsale_client": client.health_status(),
     }, status_code=200 if bsale_ok else 503)
 
-
 @mcp.custom_route("/audit", methods=["GET"])
 async def audit_endpoint(request):  # noqa: ARG001
     """Devuelve los ultimos N eventos del audit log (writes)."""
@@ -121,7 +124,6 @@ async def audit_endpoint(request):  # noqa: ARG001
     events = read_recent(limit=limit)
     return JSONResponse({"count": len(events), "events": events})
 
-
 @mcp.custom_route("/cache/clear", methods=["POST"])
 async def cache_clear(request):  # noqa: ARG001
     """Limpia el cache. Util tras un sync o cambios manuales en Bsale."""
@@ -130,7 +132,6 @@ async def cache_clear(request):  # noqa: ARG001
 
     cleared = get_cache().clear()
     return JSONResponse({"cleared_entries": cleared})
-
 
 # ============================
 # Registrar tools
@@ -178,31 +179,13 @@ if os.getenv("DATABASE_URL"):
     except ImportError as e:
         logger.warning("No se pudieron registrar DB tools: %s", e)
 
-
 # ============================
-# Scheduler (opcional)
+# Entry point
 # ============================
 
-def _start_scheduler() -> None:
-    """Inicia APScheduler si esta habilitado."""
-    if not os.getenv("ENABLE_SCHEDULER") == "1":
-        return
-    if not os.getenv("DATABASE_URL"):
-        logger.info("Scheduler skipped: DATABASE_URL no configurado")
-        return
-
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-        from snapshot import nightly_snapshot
-
-        scheduler = BackgroundScheduler(timezone="America/Santiago")
-        # Cron: todos los dias a las 3am Chile
-        scheduler.add_job(nightly_snapshot, "cron", hour=3, minute=0, id="nightly_snapshot")
-        scheduler.start()
-        logger.info("Scheduler iniciado: snapshot diario 3am Chile")
-    except Exception as e:  # noqa: BLE001
-        logger.error("No se pudo iniciar scheduler: %s", e)
-
+# NOTA: el snapshot nocturno YA NO corre in-process con APScheduler.
+# Ahora se ejecuta como Render Cron Job separado (ver cron_snapshot.py),
+# para no competir por memoria con el web service ni morir en redeploys.
 
 def main() -> None:
     """Entry point. Render llama esto via startCommand."""
@@ -212,15 +195,12 @@ def main() -> None:
     logger.info("Sentry: %s", "enabled" if SENTRY_DSN else "disabled")
     logger.info("DB: %s", "configured" if os.getenv("DATABASE_URL") else "not configured")
 
-    _start_scheduler()
-
     mcp.run(
         transport="streamable-http",
         host=host,
         port=port,
         path="/mcp",
     )
-
 
 if __name__ == "__main__":
     main()

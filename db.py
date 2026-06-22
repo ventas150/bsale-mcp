@@ -27,6 +27,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    case,
     create_engine,
     text,
 )
@@ -38,23 +39,26 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-
 # ============================
 # Schema
 # ============================
 
 metadata = MetaData()
 
+# NOTA: PK = document_id (una fila por documento). El snapshot hace upsert
+# (on_conflict_do_update). snapshot_date queda como columna informativa.
+# document_type_use: 0=venta, 1=nota de credito, 2=guia.
 documents_snapshot = Table(
     "documents_snapshot",
     metadata,
-    Column("snapshot_date", DateTime(timezone=True), primary_key=True),
     Column("document_id", Integer, primary_key=True),
-    Column("emission_date", DateTime(timezone=True)),
-    Column("office_id", Integer),
+    Column("snapshot_date", DateTime(timezone=True)),
+    Column("emission_date", DateTime(timezone=True), index=True),
+    Column("office_id", Integer, index=True),
     Column("office_name", String(200)),
     Column("document_type_id", Integer),
     Column("document_type_name", String(100)),
+    Column("document_type_use", Integer, index=True),
     Column("client_id", Integer, nullable=True),
     Column("total_amount", Float),
     Column("net_amount", Float),
@@ -138,6 +142,18 @@ mapping_audit = Table(
 
 
 # ============================
+# Helpers de agregacion
+# ============================
+
+def signed_amount(amount_col, use_col):
+    """Monto con notas de credito (use=1) en negativo; el resto suma.
+
+    Usar en todos los SUM de venta para obtener el neto correcto.
+    """
+    return case((use_col == 1, -amount_col), else_=amount_col)
+
+
+# ============================
 # Engine
 # ============================
 
@@ -209,3 +225,25 @@ def db_health() -> dict[str, Any]:
         return {"status": "ok" if ok else "degraded", "reachable": ok}
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": str(e)[:200]}
+
+
+def snapshot_lag_hours() -> float | None:
+    """Horas desde el ultimo snapshot de documents. None si no hay data/DB.
+
+    Sirve para que /health marque 'degraded' si el snapshot quedo viejo.
+    """
+    if not DATABASE_URL:
+        return None
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            ts = conn.execute(
+                text("SELECT max(snapshot_date) FROM documents_snapshot")
+            ).scalar()
+        if not ts:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    except Exception:  # noqa: BLE001
+        return None
