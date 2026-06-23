@@ -3,8 +3,8 @@
 Se regeneran al final de cada sync (sync_incremental.py / nightly).
 El agente los lee al instante via el tool bsale_digest(), sin correr SQL pesado.
 
-Tabla destino: llm_digests (ver migration_p1.sql).
-  digest_key TEXT PK, data JSONB, generated_at TIMESTAMPTZ.
+Tabla destino: llm_digests (digest_key TEXT PK, data JSONB, generated_at TIMESTAMPTZ).
+El esquema se autoprovisiona (ensure_schema): no requiere correr migración a mano.
 
 Convenciones de negocio (mismas que el resto del MCP):
   - document_type_use: 0=venta, 1=nota de crédito, 2=guía.
@@ -23,6 +23,33 @@ from sqlalchemy import text
 from db import session as db_session
 
 logger = logging.getLogger(__name__)
+
+_schema_ready = False
+
+_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS llm_digests (
+        digest_key    TEXT PRIMARY KEY,
+        data          JSONB NOT NULL,
+        generated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_stock_snapshot_date ON stock_snapshot (snapshot_date)",
+)
+
+
+def ensure_schema() -> None:
+    """Crea la tabla de digests (idempotente). Se ejecuta una vez por proceso."""
+    global _schema_ready
+    if _schema_ready:
+        return
+    with db_session() as s:
+        for stmt in _DDL:
+            try:
+                s.execute(text(stmt))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ensure_schema: %s", e)
+    _schema_ready = True
 
 
 # ============================
@@ -49,6 +76,7 @@ def _save_digest(key: str, data: dict[str, Any]) -> None:
 
 def get_digest(key: str) -> dict[str, Any] | None:
     """Lee un digest (lo usa el tool). Devuelve None si no existe."""
+    ensure_schema()
     with db_session() as s:
         row = s.execute(
             text("SELECT data, generated_at FROM llm_digests WHERE digest_key = :k"),
@@ -65,6 +93,7 @@ def get_digest(key: str) -> dict[str, Any] | None:
 
 def list_digests() -> list[dict[str, Any]]:
     """Lista los digests disponibles y su frescura."""
+    ensure_schema()
     with db_session() as s:
         rows = s.execute(
             text("SELECT digest_key, generated_at FROM llm_digests ORDER BY digest_key")
@@ -191,33 +220,37 @@ def build_ventas_periodo(dias: int) -> dict[str, Any]:
 def build_stock_resumen(umbral_bajo: float = 3) -> dict[str, Any]:
     """Resumen del stock actual: por sucursal, quiebres y bajo stock.
 
-    Lee de la vista stock_current (última foto).
+    Usa la foto más reciente (max snapshot_date), sin depender de una vista.
     """
     with db_session() as s:
         por_sucursal = s.execute(text(
             """
-            SELECT office_id,
-                   max(office_name)                          AS sucursal,
-                   count(*)                                  AS skus,
-                   sum(quantity)                             AS unidades,
-                   count(*) FILTER (WHERE quantity <= 0)     AS quiebres
-            FROM stock_current
-            GROUP BY office_id
+            WITH latest AS (SELECT max(snapshot_date) AS d FROM stock_snapshot)
+            SELECT s.office_id,
+                   max(s.office_name)                          AS sucursal,
+                   count(*)                                    AS skus,
+                   sum(s.quantity)                             AS unidades,
+                   count(*) FILTER (WHERE s.quantity <= 0)     AS quiebres
+            FROM stock_snapshot s, latest
+            WHERE s.snapshot_date = latest.d
+            GROUP BY s.office_id
             ORDER BY sucursal
             """
         )).fetchall()
 
         quiebres = s.execute(text(
             """
-            SELECT variant_code, office_name, quantity
-            FROM stock_current
-            WHERE quantity <= :u
-            ORDER BY quantity ASC
+            WITH latest AS (SELECT max(snapshot_date) AS d FROM stock_snapshot)
+            SELECT s.variant_code, s.office_name, s.quantity
+            FROM stock_snapshot s, latest
+            WHERE s.snapshot_date = latest.d
+              AND s.quantity <= :u
+            ORDER BY s.quantity ASC
             LIMIT 20
             """
         ), {"u": umbral_bajo}).fetchall()
 
-        foto = s.execute(text("SELECT max(snapshot_date) FROM stock_current")).scalar()
+        foto = s.execute(text("SELECT max(snapshot_date) FROM stock_snapshot")).scalar()
 
     return {
         "foto_stock": foto.isoformat() if foto else None,
@@ -244,6 +277,7 @@ def build_stock_resumen(umbral_bajo: float = 3) -> dict[str, Any]:
 
 def build_all() -> dict[str, Any]:
     """Regenera todos los digests. Se llama al final de cada sync."""
+    ensure_schema()
     results: dict[str, Any] = {}
     for key, fn in (
         ("ventas_hoy", build_ventas_hoy),
