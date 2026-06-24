@@ -80,6 +80,15 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
             "raw": doc,
         })
 
+    # Dedupe por document_id: ON CONFLICT DO UPDATE no permite afectar la misma
+    # fila dos veces en un mismo statement (CardinalityViolation). Bsale a veces
+    # devuelve el mismo documento en dos paginas, asi que limpiamos antes del upsert.
+    if rows:
+        dedup: dict[Any, dict[str, Any]] = {}
+        for r in rows:
+            dedup[r["document_id"]] = r
+        rows = list(dedup.values())
+
     if rows:
         # Chunked insert (500 por chunk) para evitar SSL EOF en queries enormes
         CHUNK = 500
@@ -318,6 +327,12 @@ def snapshot_details(
             })
 
         if line_rows:
+            # Dedupe por (document_id, line_id) por la misma razon que en documentos.
+            dedup_lines: dict[tuple, dict[str, Any]] = {}
+            for lr in line_rows:
+                dedup_lines[(lr["document_id"], lr["line_id"])] = lr
+            line_rows = list(dedup_lines.values())
+
             with db_session() as s:
                 stmt = pg_insert(document_details_snapshot).values(line_rows)
                 stmt = stmt.on_conflict_do_nothing(index_elements=["document_id", "line_id"])
