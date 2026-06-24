@@ -264,12 +264,14 @@ def snapshot_details(
             select(document_details_snapshot.c.document_id).distinct()
         ).scalars().all())
 
-        # Docs candidatos
+        # Docs candidatos. Seleccionamos document_type_use (columna liviana) en vez
+        # de raw (JSONB completo) para no cargar miles de documentos enteros en
+        # memoria — esto evita los OOM al ampliar la ventana de dias.
         cand_stmt = select(
             documents_snapshot.c.document_id,
             documents_snapshot.c.emission_date,
             documents_snapshot.c.office_id,
-            documents_snapshot.c.raw,
+            documents_snapshot.c.document_type_use,
         )
         if only_recent_days:
             from datetime import timedelta as _td
@@ -290,9 +292,7 @@ def snapshot_details(
         doc_id = cand.document_id
         emission_date = cand.emission_date
         office_id = cand.office_id
-        raw = cand.raw or {}
-        doctype = (raw.get("document_type") or {})
-        use = doctype.get("use", 0)
+        use = cand.document_type_use or 0
 
         try:
             resp = client.get(

@@ -48,7 +48,10 @@ def sync_ventas() -> dict[str, Any]:
     out: dict[str, Any] = {}
     # days_back=2 cubre documentos de ayer que entran tarde; upsert evita duplicar.
     out["documents"] = snapshot_documents(days_back=2, max_pages=200)
-    out["details"] = snapshot_details(batch_size=400, max_docs=400, only_recent_days=3)
+    # Ventana de 90 dias: cada corrida procesa hasta 400 documentos sin detalle,
+    # asi el cron va completando el backlog historico de ~90 dias por si solo
+    # (de lo mas reciente a lo mas viejo). Cuando esta al dia, solo mantiene lo nuevo.
+    out["details"] = snapshot_details(batch_size=400, max_docs=100000, only_recent_days=90)
     return out
 
 
