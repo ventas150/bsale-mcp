@@ -68,6 +68,14 @@ def _month_ranges(date_from: date, date_to: date) -> list[tuple[str, str]]:
 
 
 def _upsert_documents(rows: list[dict[str, Any]]) -> None:
+    # Dedupe por document_id: Postgres ON CONFLICT DO UPDATE no permite afectar
+    # la misma fila dos veces en un mismo statement (CardinalityViolation).
+    # Bsale a veces devuelve el mismo documento en dos paginas, asi que limpiamos.
+    dedup: dict[Any, dict[str, Any]] = {}
+    for r in rows:
+        dedup[r["document_id"]] = r
+    rows = list(dedup.values())
+
     CHUNK = 500
     for i in range(0, len(rows), CHUNK):
         chunk = rows[i:i + CHUNK]
