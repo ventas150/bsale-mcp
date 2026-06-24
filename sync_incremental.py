@@ -40,6 +40,53 @@ logger = logging.getLogger("sync_incremental")
 # Hora UTC en la que el modo auto refresca el catálogo de variantes (1x/día).
 VARIANTS_HOUR_UTC = 5
 
+# Backfill histórico de documentos por tramos (un mes por corrida :30 del cron).
+# Recorre desde HIST_START hasta HIST_END (exclusivo). 2026 ya está cargado.
+HIST_START = "2024-12"
+HIST_END = "2026-01"
+
+
+def _month_bounds(ym: str):
+    y, m = int(ym[:4]), int(ym[5:7])
+    start = "%04d-%02d-01" % (y, m)
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    nxt = "%04d-%02d-01" % (ny, nm)
+    return start, nxt, "%04d-%02d" % (ny, nm)
+
+
+def _hist_cursor_get() -> str:
+    from sqlalchemy import text
+    from db import session as db_session
+    with db_session() as s:
+        row = s.execute(text(
+            "select data->>'cursor' from llm_digests where digest_key='hist_backfill_cursor'"
+        )).first()
+    return row[0] if row and row[0] else HIST_START
+
+
+def _hist_cursor_set(ym: str) -> None:
+    import json as _json
+    from sqlalchemy import text
+    from db import session as db_session
+    with db_session() as s:
+        s.execute(text(
+            "insert into llm_digests (digest_key, data, generated_at) "
+            "values ('hist_backfill_cursor', cast(:d as jsonb), now()) "
+            "on conflict (digest_key) do update set data=excluded.data, generated_at=excluded.generated_at"
+        ), {"d": _json.dumps({"cursor": ym})})
+
+
+def backfill_historico_step() -> dict[str, Any]:
+    """Carga UN mes histórico de documentos y avanza el cursor. Idempotente."""
+    cur = _hist_cursor_get()
+    if cur >= HIST_END:
+        return {"hist": "completo", "cursor": cur}
+    from snapshot import snapshot_documents_range
+    start, nxt, nxt_ym = _month_bounds(cur)
+    res = snapshot_documents_range(start, nxt, max_pages=200)
+    _hist_cursor_set(nxt_ym)
+    return {"hist_mes": cur, "rows": res.get("rows"), "next_cursor": nxt_ym}
+
 
 def sync_ventas() -> dict[str, Any]:
     """Documentos recientes + detalle reciente. Barato (usa emissiondaterange)."""
@@ -78,6 +125,8 @@ def run(modo: str) -> int:
     do_stock = modo in ("stock", "full") or (modo == "auto" and now.minute < 15)
     # variantes: solo en auto, 1 vez al día
     do_variants = modo == "auto" and now.hour == VARIANTS_HOUR_UTC and now.minute < 15
+    # backfill histórico de documentos: en auto, en las corridas :30 (no choca con stock)
+    do_hist = modo == "auto" and now.minute >= 15
 
     if do_ventas:
         try:
@@ -99,6 +148,13 @@ def run(modo: str) -> int:
         except Exception as e:  # noqa: BLE001
             logger.error("Error en sync_variantes: %s", e)
             results["variants_error"] = str(e)
+
+    if do_hist:
+        try:
+            results["historico"] = backfill_historico_step()
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error en backfill_historico_step: %s", e)
+            results["hist_error"] = str(e)
 
     # Regenerar la capa LLM al final, siempre.
     try:

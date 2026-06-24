@@ -119,6 +119,80 @@ def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, An
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
 
 
+def snapshot_documents_range(date_from: str, date_to: str, max_pages: int = 120) -> dict[str, Any]:
+    """Como snapshot_documents pero para un rango de fechas EXPLICITO [date_from, date_to] (ISO).
+
+    Pensado para backfill historico por tramos (un mes por corrida del cron).
+    Upsert idempotente con dedupe por document_id (re-cargar un mes parcial lo completa).
+    """
+    client = get_client()
+    snapshot_ts = datetime.now(timezone.utc)
+
+    params = {
+        "limit": 50,
+        "emissiondaterange": iso_to_epoch_range(date_from, date_to),
+        "expand": "[document_type,office,client]",
+    }
+    docs = client.paginated_get("/v1/documents.json", params=params, max_pages=max_pages)
+
+    rows = []
+    for doc in docs:
+        if not is_sales_doc(doc):
+            continue
+        office = doc.get("office") or {}
+        doctype = doc.get("document_type") or {}
+        client_ref = doc.get("client") or {}
+        rows.append({
+            "snapshot_date": snapshot_ts,
+            "document_id": doc.get("id"),
+            "emission_date": _ts_to_dt(doc.get("emissionDate")),
+            "office_id": office.get("id"),
+            "office_name": office.get("name"),
+            "document_type_id": doctype.get("id"),
+            "document_type_name": doctype.get("name"),
+            "document_type_use": doctype.get("use", 0),
+            "client_id": client_ref.get("id"),
+            "total_amount": float(doc.get("totalAmount", 0) or 0),
+            "net_amount": float(doc.get("netAmount", 0) or 0),
+            "tax_amount": float(doc.get("taxAmount", 0) or 0),
+            "state": doc.get("state"),
+            "raw": doc,
+        })
+
+    # Dedupe por document_id (CardinalityViolation guard) y upsert chunked.
+    if rows:
+        dedup: dict[Any, dict[str, Any]] = {}
+        for r in rows:
+            dedup[r["document_id"]] = r
+        rows = list(dedup.values())
+        CHUNK = 500
+        for i in range(0, len(rows), CHUNK):
+            chunk = rows[i:i + CHUNK]
+            with db_session() as s:
+                stmt = pg_insert(documents_snapshot).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["document_id"],
+                    set_={
+                        "snapshot_date": stmt.excluded.snapshot_date,
+                        "emission_date": stmt.excluded.emission_date,
+                        "office_id": stmt.excluded.office_id,
+                        "office_name": stmt.excluded.office_name,
+                        "document_type_id": stmt.excluded.document_type_id,
+                        "document_type_name": stmt.excluded.document_type_name,
+                        "document_type_use": stmt.excluded.document_type_use,
+                        "client_id": stmt.excluded.client_id,
+                        "total_amount": stmt.excluded.total_amount,
+                        "net_amount": stmt.excluded.net_amount,
+                        "tax_amount": stmt.excluded.tax_amount,
+                        "state": stmt.excluded.state,
+                        "raw": stmt.excluded.raw,
+                    },
+                )
+                s.execute(stmt)
+
+    return {"date_from": date_from, "date_to": date_to, "rows": len(rows)}
+
+
 def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
     """Snapshot del stock actual por sucursal.
 
