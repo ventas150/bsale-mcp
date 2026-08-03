@@ -40,10 +40,13 @@ logger = logging.getLogger("sync_incremental")
 # Hora UTC en la que el modo auto refresca el catálogo de variantes (1x/día).
 VARIANTS_HOUR_UTC = 5
 
-# Backfill histórico de documentos por tramos (un mes por corrida :30 del cron).
-# Recorre desde HIST_START hasta HIST_END (exclusivo). 2026 ya está cargado.
+# Backfill histórico de documentos por tramos (hasta HIST_MESES_POR_CORRIDA
+# meses por corrida :30 del cron). Recorre desde HIST_START hasta HIST_END
+# (exclusivo). Tras el incidente de storage ago-2026 la base se reconstruye
+# desde cero, por lo que el rango cubre hasta hoy.
 HIST_START = "2024-12"
-HIST_END = "2026-01"
+HIST_END = "2026-09"
+HIST_MESES_POR_CORRIDA = 4
 
 
 def _month_bounds(ym: str):
@@ -151,7 +154,13 @@ def run(modo: str) -> int:
 
     if do_hist:
         try:
-            results["historico"] = backfill_historico_step()
+            pasos = []
+            for _ in range(HIST_MESES_POR_CORRIDA):
+                paso = backfill_historico_step()
+                pasos.append(paso)
+                if paso.get("hist") == "completo":
+                    break
+            results["historico"] = pasos
         except Exception as e:  # noqa: BLE001
             logger.error("Error en backfill_historico_step: %s", e)
             results["hist_error"] = str(e)
