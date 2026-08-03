@@ -164,6 +164,16 @@ def run(modo: str) -> int:
         logger.error("Error en digests: %s", e)
         results["digests_error"] = str(e)
 
+    # Retencion: purga fotos viejas de stock/variantes para que la DB no
+    # crezca sin limite (incidente storage ago-2026). Barato; corre siempre.
+    # Los errores de retencion NO marcan la corrida como fallida.
+    try:
+        from retention import apply_retention
+        results["retention"] = apply_retention()
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en retention: %s", e)
+        results["retention_warning"] = str(e)
+
     logger.info("Sync (%s) terminado [stock=%s variants=%s]: %s",
                 modo, do_stock, do_variants, results)
 
