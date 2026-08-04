@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -39,6 +40,41 @@ logger = logging.getLogger("sync_incremental")
 
 # Hora UTC en la que el modo auto refresca el catálogo de variantes (1x/día).
 VARIANTS_HOUR_UTC = 5
+
+# La foto completa de stock via API tarda ~2h (235k registros a 50/pagina).
+# Correrla cada hora bloqueaba todas las corridas del cron (incidente ago-2026):
+# ahora solo corre si la ultima foto tiene mas de STOCK_EVERY_HOURS horas, y
+# SIEMPRE al final de la corrida para no retrasar ventas/backfill/digests.
+STOCK_EVERY_HOURS = float(os.getenv("STOCK_EVERY_HOURS", "12"))
+
+
+def _stock_photo_age_hours() -> float:
+    """Horas desde la ultima foto de stock. Infinito si no hay ninguna."""
+    from sqlalchemy import text
+    from db import session as db_session
+    try:
+        with db_session() as s:
+            ts = s.execute(text("select max(snapshot_date) from stock_snapshot")).scalar()
+        if not ts:
+            return float("inf")
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    except Exception as e:  # noqa: BLE001
+        logger.warning("_stock_photo_age_hours: %s", e)
+        return 0.0  # ante la duda, no correr el paso pesado
+
+
+def _variants_empty() -> bool:
+    """True si el catalogo de variantes aun no se carga en esta base."""
+    from sqlalchemy import text
+    from db import session as db_session
+    try:
+        with db_session() as s:
+            row = s.execute(text("select 1 from variants_snapshot limit 1")).first()
+        return row is None
+    except Exception:  # noqa: BLE001
+        return False
 
 # Backfill histórico de documentos por tramos (hasta HIST_MESES_POR_CORRIDA
 # meses por corrida :30 del cron). Recorre desde HIST_START hasta HIST_END
@@ -123,13 +159,25 @@ def run(modo: str) -> int:
     results: dict[str, Any] = {}
     now = datetime.now(timezone.utc)
 
+    # Asegura el esquema de digests ANTES de todo: el cursor del backfill
+    # historico vive en llm_digests y en una base recien creada aun no existe.
+    try:
+        from digests import ensure_schema
+        ensure_schema()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ensure_schema fallo: %s", e)
+
     do_ventas = modo in ("ventas", "full", "auto")
-    # stock: en full/stock siempre; en auto solo al top of hour
-    do_stock = modo in ("stock", "full") or (modo == "auto" and now.minute < 15)
-    # variantes: solo en auto, 1 vez al día
-    do_variants = modo == "auto" and now.hour == VARIANTS_HOUR_UTC and now.minute < 15
-    # backfill histórico de documentos: en auto, en las corridas :30 (no choca con stock)
-    do_hist = modo == "auto" and now.minute >= 15
+    # stock: en full/stock siempre; en auto solo si la foto esta vieja (ver arriba)
+    do_stock = modo in ("stock", "full") or (
+        modo == "auto" and _stock_photo_age_hours() >= STOCK_EVERY_HOURS
+    )
+    # variantes: 1 vez al día, o si el catalogo aun no existe en esta base
+    do_variants = modo == "auto" and (
+        (now.hour == VARIANTS_HOUR_UTC and now.minute < 15) or _variants_empty()
+    )
+    # backfill histórico de documentos: siempre que quede pendiente (no-op al completar)
+    do_hist = modo == "auto"
 
     if do_ventas:
         try:
@@ -137,20 +185,6 @@ def run(modo: str) -> int:
         except Exception as e:  # noqa: BLE001
             logger.error("Error en sync_ventas: %s", e)
             results["ventas_error"] = str(e)
-
-    if do_stock:
-        try:
-            results.update(sync_stock())
-        except Exception as e:  # noqa: BLE001
-            logger.error("Error en sync_stock: %s", e)
-            results["stock_error"] = str(e)
-
-    if do_variants:
-        try:
-            results.update(sync_variantes())
-        except Exception as e:  # noqa: BLE001
-            logger.error("Error en sync_variantes: %s", e)
-            results["variants_error"] = str(e)
 
     if do_hist:
         try:
@@ -165,7 +199,14 @@ def run(modo: str) -> int:
             logger.error("Error en backfill_historico_step: %s", e)
             results["hist_error"] = str(e)
 
-    # Regenerar la capa LLM al final, siempre.
+    if do_variants:
+        try:
+            results.update(sync_variantes())
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error en sync_variantes: %s", e)
+            results["variants_error"] = str(e)
+
+    # Regenerar la capa LLM (antes del stock, que es el paso lento).
     try:
         from digests import build_all
         results["digests"] = build_all()
@@ -182,6 +223,15 @@ def run(modo: str) -> int:
     except Exception as e:  # noqa: BLE001
         logger.error("Error en retention: %s", e)
         results["retention_warning"] = str(e)
+
+    # Stock AL FINAL: es el paso lento (~2h por la API de Bsale) y no debe
+    # bloquear ventas, backfill ni digests si la corrida se corta.
+    if do_stock:
+        try:
+            results.update(sync_stock())
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error en sync_stock: %s", e)
+            results["stock_error"] = str(e)
 
     logger.info("Sync (%s) terminado [stock=%s variants=%s]: %s",
                 modo, do_stock, do_variants, results)
