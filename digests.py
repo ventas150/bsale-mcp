@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from sqlalchemy import text
@@ -34,7 +35,6 @@ _DDL = (
         generated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
-    "CREATE INDEX IF NOT EXISTS ix_stock_snapshot_date ON stock_snapshot (snapshot_date)",
 )
 
 
@@ -105,6 +105,19 @@ def list_digests() -> list[dict[str, Any]]:
 
 
 # ============================
+# Chile, no UTC. Render corre en UTC: a las 21:00 de Santiago ya es el dia
+# siguiente en el servidor, asi que `current_date` dejaba el digest "ventas_hoy"
+# en cero durante las ultimas 3-4 horas de operacion — justo el cierre de tiendas
+# y de mall — con un _generated_at fresco que daba confianza falsa.
+TZ_NEGOCIO = "America/Santiago"
+HOY_NEGOCIO = f"(now() AT TIME ZONE '{TZ_NEGOCIO}')::date"
+
+
+def _dia_hoy(alias: str = "") -> str:
+    pre = f"{alias}." if alias else ""
+    return f"({pre}emission_date AT TIME ZONE '{TZ_NEGOCIO}')::date = {HOY_NEGOCIO}"
+
+
 def _official_sale_sql(alias: str = "") -> str:
     """Filtro SQL de venta oficial para documents_snapshot.
 
@@ -138,32 +151,33 @@ def build_ventas_hoy() -> dict[str, Any]:
                    sum(CASE WHEN document_type_use = 1 THEN -net_amount
                             ELSE net_amount END)                                 AS neto
             FROM documents_snapshot
-            WHERE emission_date::date = current_date
+            WHERE {DIA_HOY}
               AND {OFICIAL}
             GROUP BY office_id
             ORDER BY total DESC NULLS LAST
-            """.format(OFICIAL=_official_sale_sql())
+            """.format(DIA_HOY=_dia_hoy(), OFICIAL=_official_sale_sql())
         )).fetchall()
 
         top_sku = s.execute(text(
             """
-            SELECT variant_code,
-                   max(variant_description)                          AS descripcion,
-                   sum(CASE WHEN document_type_use = 1 THEN -quantity
-                            ELSE quantity END)                       AS unidades,
-                   sum(CASE WHEN document_type_use = 1 THEN -total_amount
-                            ELSE total_amount END)                   AS ingresos
-            FROM document_details_snapshot
-            WHERE emission_date::date = current_date
-              AND document_type_use <> 2
-            GROUP BY variant_code
+            SELECT d.variant_code,
+                   max(d.variant_description)                          AS descripcion,
+                   sum(CASE WHEN d.document_type_use = 1 THEN -d.quantity
+                            ELSE d.quantity END)                       AS unidades,
+                   sum(CASE WHEN d.document_type_use = 1 THEN -d.total_amount
+                            ELSE d.total_amount END)                   AS ingresos
+            FROM document_details_snapshot d
+            WHERE {DIA_HOY}
+              AND EXISTS (SELECT 1 FROM documents_snapshot h
+                           WHERE h.document_id = d.document_id AND {OFICIAL})
+            GROUP BY d.variant_code
             ORDER BY unidades DESC NULLS LAST
             LIMIT 10
-            """
+            """.format(DIA_HOY=_dia_hoy("d"), OFICIAL=_official_sale_sql("h"))
         )).fetchall()
 
     return {
-        "fecha": datetime.now(timezone.utc).date().isoformat(),
+        "fecha": datetime.now(ZoneInfo(TZ_NEGOCIO)).date().isoformat(),
         "por_sucursal": [
             {
                 "office_id": r.office_id,
@@ -203,19 +217,20 @@ def build_ventas_periodo(dias: int) -> dict[str, Any]:
 
         top = s.execute(text(
             """
-            SELECT variant_code,
-                   max(variant_description)                        AS descripcion,
-                   sum(CASE WHEN document_type_use = 1 THEN -quantity
-                            ELSE quantity END)                     AS unidades,
-                   sum(CASE WHEN document_type_use = 1 THEN -total_amount
-                            ELSE total_amount END)                 AS ingresos
-            FROM document_details_snapshot
-            WHERE emission_date >= now() - make_interval(days => :d)
-              AND document_type_use <> 2
-            GROUP BY variant_code
+            SELECT d.variant_code,
+                   max(d.variant_description)                        AS descripcion,
+                   sum(CASE WHEN d.document_type_use = 1 THEN -d.quantity
+                            ELSE d.quantity END)                     AS unidades,
+                   sum(CASE WHEN d.document_type_use = 1 THEN -d.total_amount
+                            ELSE d.total_amount END)                 AS ingresos
+            FROM document_details_snapshot d
+            WHERE d.emission_date >= now() - make_interval(days => :d)
+              AND EXISTS (SELECT 1 FROM documents_snapshot h
+                           WHERE h.document_id = d.document_id AND {OFICIAL})
+            GROUP BY d.variant_code
             ORDER BY ingresos DESC NULLS LAST
             LIMIT 20
-            """
+            """.format(OFICIAL=_official_sale_sql("h"))
         ), {"d": dias}).fetchall()
 
     return {

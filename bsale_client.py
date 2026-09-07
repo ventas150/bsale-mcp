@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
@@ -77,6 +80,7 @@ def is_sales_doc(doc: dict) -> bool:
 SALES_NOTE_TYPE_IDS_FALLBACK = frozenset({3, 23, 24, 26, 27})
 
 _sales_note_ids_cache: frozenset[int] | None = None
+_sales_note_ids_from_api: bool = False
 
 
 def sales_note_type_ids(refresh: bool = False) -> frozenset[int]:
@@ -85,21 +89,30 @@ def sales_note_type_ids(refresh: bool = False) -> frozenset[int]:
     Si la API no responde, devuelve la lista fallback en vez de fallar: es
     preferible excluir los tipos conocidos a contar notas de venta como venta.
     """
-    global _sales_note_ids_cache
+    global _sales_note_ids_cache, _sales_note_ids_from_api
     if _sales_note_ids_cache is not None and not refresh:
         return _sales_note_ids_cache
     try:
-        data = get_client().get("/v1/document_types.json", params={"limit": 50})
+        fetch = get_client().paginated_fetch(
+            "/v1/document_types.json", params={"limit": 50}, max_items=500
+        )
         ids = {
             int(t["id"])
-            for t in (data.get("items") or [])
+            for t in fetch["items"]
             if int(t.get("isSalesNote") or 0) == 1 and t.get("id") is not None
         }
-        _sales_note_ids_cache = frozenset(ids) if ids else SALES_NOTE_TYPE_IDS_FALLBACK
+        if ids:
+            _sales_note_ids_cache = frozenset(ids)
+            _sales_note_ids_from_api = True
+            return _sales_note_ids_cache
+    except BsaleAuthError:
+        raise  # un token vencido no se disfraza de "degradado"
     except Exception:  # noqa: BLE001
         logger.warning("No se pudo leer document_types.json; uso lista fallback de notas de venta")
-        _sales_note_ids_cache = SALES_NOTE_TYPE_IDS_FALLBACK
-    return _sales_note_ids_cache
+    # NO se memoiza el fallback: un fallo transitorio al arranque no puede
+    # congelar la lista hardcodeada hasta el proximo redeploy.
+    _sales_note_ids_from_api = False
+    return SALES_NOTE_TYPE_IDS_FALLBACK
 
 
 def is_sales_note(doc: dict) -> bool:
@@ -195,6 +208,22 @@ class BsaleClient:
         self._last_success_ts: float | None = None
         self._total_requests = 0
         self._total_retries = 0
+        # paginated_fetch baja paginas en paralelo: sin lock, `+= 1` se pierde
+        # actualizaciones y `_last_error` se pisa entre hilos, con lo cual el
+        # healthcheck reporta "sin errores" en plena tanda de 429.
+        self._stats_lock = threading.Lock()
+
+    def _bump(self, what: str, error: str | None = None, success: bool = False) -> None:
+        with self._stats_lock:
+            if what == "requests":
+                self._bump("requests")
+            elif what == "retries":
+                self._bump("retries")
+            if error is not None:
+                self._last_error = error
+            if success:
+                self._last_success_ts = time.time()
+                self._last_error = None
 
     def _cache_key(self, path: str, params: dict[str, Any] | None) -> str:
         """Genera key estable para cache."""
@@ -211,8 +240,17 @@ class BsaleClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Hace request con retry + backoff exponencial."""
+        """Hace request con retry + backoff exponencial.
+
+        OJO: el POST NO se reintenta. Bsale no expone idempotency keys, asi que un
+        timeout tras aplicar el cambio y un timeout sin aplicarlo son
+        indistinguibles desde aca: reintentar puede consumir el stock dos veces
+        (o cuatro). Un POST que falla devuelve un error que dice explicitamente
+        que el estado quedo indeterminado. GET/PUT/DELETE son idempotentes y si
+        se reintentan.
+        """
         url = f"{self.base_url}{path}"
+        reintentable = method.upper() != "POST"
 
         # Filtrar None de params (Bsale no los acepta)
         if params:
@@ -224,19 +262,30 @@ class BsaleClient:
                 self._total_requests += 1
                 response = self._client.request(method, url, params=params, json=json_body)
             except httpx.TimeoutException as e:
-                last_exc = BsaleError(f"Timeout llamando a Bsale: {e}")
-                self._total_retries += 1
+                last_exc = BsaleError(
+                    f"Timeout llamando a Bsale: {e}"
+                    + ("" if reintentable else
+                       " — ESTADO INDETERMINADO: era un POST y no se reintenta. "
+                       "Bsale pudo haber aplicado el cambio. VERIFICAR en Bsale "
+                       "antes de volver a intentar.")
+                )
+                self._bump("retries")
                 # Backoff exponencial: 1s, 2s, 4s
-                if attempt < self.max_retries:
+                if reintentable and attempt < self.max_retries:
                     sleep_s = 2 ** attempt
                     logger.warning("Timeout (intento %d), reintentando en %ds", attempt + 1, sleep_s)
                     time.sleep(sleep_s)
                     continue
                 break
             except httpx.RequestError as e:
-                last_exc = BsaleError(f"Error de red llamando a Bsale: {e}")
-                self._total_retries += 1
-                if attempt < self.max_retries:
+                last_exc = BsaleError(
+                    f"Error de red llamando a Bsale: {e}"
+                    + ("" if reintentable else
+                       " — ESTADO INDETERMINADO: era un POST y no se reintenta. "
+                       "VERIFICAR en Bsale antes de volver a intentar.")
+                )
+                self._bump("retries")
+                if reintentable and attempt < self.max_retries:
                     sleep_s = 2 ** attempt
                     logger.warning("Network error (intento %d), reintentando en %ds", attempt + 1, sleep_s)
                     time.sleep(sleep_s)
@@ -245,25 +294,25 @@ class BsaleClient:
 
             # Status codes
             if response.status_code == 401:
-                self._last_error = "AUTH_401"
+                self._bump("noop", error="AUTH_401")
                 raise BsaleAuthError("Token rechazado por Bsale (401). Verifica que sea valido.")
 
             if response.status_code == 429:
                 # Rate limit - respeta Retry-After si viene
                 retry_after = response.headers.get("Retry-After")
                 wait_s = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 2 ** attempt * 5)
-                self._total_retries += 1
-                logger.warning("Rate limit 429, esperando %ds (intento %d)", wait_s, attempt + 1)
-                if attempt < self.max_retries:
-                    time.sleep(wait_s)
+                if reintentable and attempt < self.max_retries:
+                    self._bump("retries")
+                    logger.warning("Rate limit 429, esperando %ds (intento %d)", wait_s, attempt + 1)
+                    time.sleep(wait_s + random.uniform(0, 1.5))  # jitter: evita thundering herd
                     continue
-                self._last_error = "RATE_LIMIT"
+                self._bump("noop", error="RATE_LIMIT")
                 raise BsaleRateLimitError(f"Rate limit alcanzado tras {self.max_retries} reintentos.")
 
             if response.status_code >= 500:
                 # Server error - retry con backoff
-                self._total_retries += 1
-                if attempt < self.max_retries:
+                self._bump("retries")
+                if reintentable and attempt < self.max_retries:
                     sleep_s = 2 ** attempt
                     logger.warning(
                         "Server error %d (intento %d), reintentando en %ds",
@@ -271,14 +320,14 @@ class BsaleClient:
                     )
                     time.sleep(sleep_s)
                     continue
-                self._last_error = f"SERVER_{response.status_code}"
+                self._bump("noop", error=f"SERVER_{response.status_code}")
                 raise BsaleError(
                     f"Bsale 5xx persistente: {response.status_code} - {response.text[:300]}"
                 )
 
             if response.status_code >= 400:
                 # 4xx que no es 401/429 - no reintentamos
-                self._last_error = f"CLIENT_{response.status_code}"
+                self._bump("noop", error=f"CLIENT_{response.status_code}")
                 raise BsaleError(
                     f"Bsale respondio {response.status_code}: {response.text[:500]}"
                 )
@@ -286,7 +335,7 @@ class BsaleClient:
             try:
                 payload = response.json()
             except ValueError as e:
-                self._last_error = "INVALID_JSON"
+                self._bump("noop", error="INVALID_JSON")
                 raise BsaleError(f"Bsale devolvio JSON invalido: {e}") from e
 
             self._last_success_ts = time.time()
@@ -329,20 +378,54 @@ class BsaleClient:
 
         return result
 
-    def post(self, path: str, json_body: dict[str, Any]) -> dict[str, Any]:
-        result = self._request_with_retry("POST", path, json_body=json_body)
-        audit_log("POST", path, params=None, body=json_body, result_summary=_summarize_result(result))
+    def _write(self, method: str, path: str, json_body: dict[str, Any] | None) -> dict[str, Any]:
+        """Escritura con audit WRITE-AHEAD.
+
+        El log se escribe ANTES de llamar a Bsale (evento `intent`) y otra vez
+        despues (`outcome`). El orden importa: si se logueara solo despues y solo
+        en exito, un timeout tras aplicar el cambio dejaria una escritura real en
+        el ERP sin ningun rastro local. Un `intent` sin `outcome` es la senal
+        inequivoca de "estado indeterminado, hay que verificar en Bsale".
+        """
+        operation_id = uuid.uuid4().hex[:12]
+        audit_log(
+            method,
+            path,
+            params={"operation_id": operation_id, "phase": "intent"},
+            body=json_body,
+            result_summary=None,
+        )
+        try:
+            result = self._request_with_retry(method, path, json_body=json_body)
+        except Exception as e:  # noqa: BLE001
+            audit_log(
+                method,
+                path,
+                params={"operation_id": operation_id, "phase": "outcome"},
+                body=None,
+                result_summary={
+                    "status": "indeterminado" if method == "POST" else "failed",
+                    "error": str(e)[:500],
+                },
+            )
+            raise
+        audit_log(
+            method,
+            path,
+            params={"operation_id": operation_id, "phase": "outcome"},
+            body=None,
+            result_summary={"status": "ok", **_summarize_result(result)},
+        )
         return result
+
+    def post(self, path: str, json_body: dict[str, Any]) -> dict[str, Any]:
+        return self._write("POST", path, json_body)
 
     def put(self, path: str, json_body: dict[str, Any]) -> dict[str, Any]:
-        result = self._request_with_retry("PUT", path, json_body=json_body)
-        audit_log("PUT", path, params=None, body=json_body, result_summary=_summarize_result(result))
-        return result
+        return self._write("PUT", path, json_body)
 
     def delete(self, path: str) -> dict[str, Any]:
-        result = self._request_with_retry("DELETE", path)
-        audit_log("DELETE", path, params=None, body=None, result_summary=_summarize_result(result))
-        return result
+        return self._write("DELETE", path, None)
 
     def paginated_fetch(
         self,
@@ -369,7 +452,12 @@ class BsaleClient:
 
         first = self.get(path, params={**params, "offset": 0}, use_cache=False)
         items: list[dict[str, Any]] = list(first.get("items") or [])
-        total_count = int(first.get("count") or len(items))
+        # Si el endpoint no devuelve `count` no podemos saber el universo: decirlo,
+        # en vez de asumir que la primera pagina es todo (que es el mismo bug de
+        # "parcial presentado como total" por otra puerta).
+        count_declarado = first.get("count")
+        total_count = int(count_declarado) if count_declarado is not None else len(items)
+        total_desconocido = count_declarado is None and len(items) >= limit
 
         target = min(total_count, max_items)
         if len(items) >= target or len(items) < limit:
@@ -377,7 +465,8 @@ class BsaleClient:
                 "items": items[:target] if target else items,
                 "total_count": total_count,
                 "fetched": min(len(items), target) if target else len(items),
-                "truncated": total_count > max_items,
+                "truncated": bool(total_count > max_items or total_desconocido),
+                "total_count_desconocido": total_desconocido,
                 "pages": 1,
             }
 
@@ -404,7 +493,8 @@ class BsaleClient:
             "items": merged[:target],
             "total_count": total_count,
             "fetched": min(len(merged), target),
-            "truncated": total_count > max_items,
+            "truncated": bool(total_count > max_items or total_desconocido),
+            "total_count_desconocido": total_desconocido,
             "pages": len(pages),
         }
 
@@ -433,6 +523,7 @@ class BsaleClient:
             "total_requests": self._total_requests,
             "total_retries": self._total_retries,
             "cache_size": self._cache.size(),
+            "notas_de_venta_desde_api": _sales_note_ids_from_api,
         }
 
     def ping(self) -> bool:
@@ -447,16 +538,23 @@ class BsaleClient:
         self._client.close()
 
 
-def _summarize_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Resumen seguro para audit log (sin PII, sin payloads enormes)."""
-    summary = {}
-    if "id" in result:
-        summary["id"] = result["id"]
-    if "href" in result:
-        summary["href"] = result["href"]
-    if "count" in result:
-        summary["count"] = result["count"]
-    return summary or {"_keys": list(result.keys())[:5]}
+def _summarize_result(result: Any) -> dict[str, Any]:
+    """Resumen corto del resultado para el audit log.
+
+    Blindado a proposito: se evalua como argumento de audit_log(), asi que si
+    revienta impide que el evento se registre — justo despues de haber escrito
+    en Bsale. Nunca debe lanzar.
+    """
+    try:
+        if not isinstance(result, dict):
+            return {"_type": type(result).__name__, "_len": len(result) if hasattr(result, "__len__") else None}
+        summary: dict[str, Any] = {}
+        for k in ("id", "count", "href", "number"):
+            if k in result:
+                summary[k] = result[k]
+        return summary or {"_keys": list(result.keys())[:5]}
+    except Exception as e:  # noqa: BLE001
+        return {"_resumen_fallido": str(e)[:200]}
 
 
 # Singleton global

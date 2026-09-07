@@ -372,11 +372,18 @@ def snapshot_details(
         use = cand.document_type_use or 0
 
         try:
-            resp = client.get(
+            # Paginado: un GET suelto traia solo 50 lineas y, como el documento
+            # quedaba marcado como procesado, el resto se perdia para siempre.
+            # Las facturas institucionales son justo las de muchas lineas.
+            fetch = client.paginated_fetch(
                 f"/v1/documents/{doc_id}/details.json",
                 params={"limit": 50, "expand": "[variant]"},
-                use_cache=False,
+                max_items=2000,
             )
+            resp = {"items": fetch["items"]}
+            if fetch["truncated"]:
+                errors += 1
+                continue  # no insertar parcial: se reintenta en la proxima corrida
         except Exception:  # noqa: BLE001
             errors += 1
             continue
@@ -448,13 +455,16 @@ def nightly_snapshot() -> dict[str, Any]:
         results["documents_error"] = str(e)
 
     try:
-        results["stock"] = snapshot_stock()
+        # 6000 paginas = 300.000 filas. Con el default de 500 el nocturno
+        # guardaba una foto del 10% que, por ser la mas reciente, GANABA sobre
+        # la completa del sync incremental (verificado 07-sep-2026).
+        results["stock"] = snapshot_stock(max_pages=6000)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_stock: %s", e)
         results["stock_error"] = str(e)
 
     try:
-        results["variants"] = snapshot_variants()
+        results["variants"] = snapshot_variants(max_pages=2000)  # 5.000 cortaba el catalogo
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_variants: %s", e)
         results["variants_error"] = str(e)
@@ -462,7 +472,7 @@ def nightly_snapshot() -> dict[str, Any]:
     # Details para docs recientes. Ahora corre en el Cron Job dedicado (no compite
     # con el web service), por lo que se puede subir el batch para mejor cobertura.
     try:
-        results["details"] = snapshot_details(batch_size=400, max_docs=400, only_recent_days=3)
+        results["details"] = snapshot_details(batch_size=400, max_docs=400, only_recent_days=90)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_details: %s", e)
         results["details_error"] = str(e)

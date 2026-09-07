@@ -21,7 +21,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, desc, func, not_, select, text
+from sqlalchemy import and_, desc, exists, func, not_, select, text
 
 from bsale_client import get_client
 from db import (
@@ -58,6 +58,31 @@ def _coverage_category(days: float) -> str:
     if days < 60:
         return "alto"
     return "sobrestockeo"
+
+
+def _detalle_de_venta_oficial():
+    """El detalle hereda las reglas de venta oficial de su documento cabecera.
+
+    `document_details_snapshot` no guarda `document_type_id` ni `state`, asi que
+    el filtro `document_type_use != 2` que habia aca era letra muerta: las guias
+    de despacho nunca entran al snapshot (snapshot.py ya las descarta), pero SI
+    entraban las notas de venta, los pedidos web, las cotizaciones y los
+    documentos anulados. Como un pedido web genera PRIMERO un "PEDIDO WEB" y
+    DESPUES la boleta, y ambos tienen lineas, **cada unidad vendida por el canal
+    web se contaba dos veces**: velocity inflada, quiebres anticipados y
+    proyeccion de compras sobre-pedida. Verificado el 07-sep-2026 contra el
+    export de Bsale (el GORRO 2506 daba 291 unidades contra 286 reales, y los
+    primeros lugares del ranking eran servicios y glosas).
+
+    Un EXISTS correlacionado por clave primaria contra las ~152k filas de
+    cabecera es despreciable frente al costo de agregar las lineas.
+    """
+    return exists().where(
+        and_(
+            documents_snapshot.c.document_id == document_details_snapshot.c.document_id,
+            *official_sale_conditions(documents_snapshot),
+        )
+    )
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -111,7 +136,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id)
@@ -179,7 +204,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "office_id": office_id,
             "min_velocity": min_velocity,
             "checked_variants": len(vel_rows),
-            "total_at_risk": len(risks),
+            "en_riesgo_en_los_revisados": len(risks),
             "risks": risks,
         }
 
@@ -222,7 +247,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 and_(
                     document_details_snapshot.c.variant_id == variant_id,
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                 )
             ).group_by(document_details_snapshot.c.office_id)
 
@@ -318,7 +343,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).having(
@@ -372,7 +397,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "min_velocity": min_velocity,
             "checked_variants": len(vel_rows),
-            "total_recommendations": len(recs),
+            "recomendaciones_en_los_revisados": len(recs),
             "recommendations": recs,
         }
 
@@ -424,7 +449,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).having(
@@ -514,7 +539,8 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "checked_variants": len(vel_rows),
             "total_sobrestockeos": len(sobrestockeos),
-            "total_capital_tied_clp": total_capital_tied,
+            "capital_inmovilizado_en_los_revisados_clp": total_capital_tied,
+            "nota_cobertura": "Calculado solo sobre las variantes revisadas (ver checked_variants), no sobre todo el catalogo.",
             "sobrestockeos": sobrestockeos,
         }
 
@@ -545,9 +571,11 @@ def register(mcp) -> None:  # noqa: ANN001
                 func.max(documents_snapshot.c.office_name).label("office_name"),
                 func.sum(amt).label("revenue"),
                 func.count().filter(documents_snapshot.c.document_type_use != 1).label("doc_count"),
-                func.avg(amt).label("avg_ticket"),
-                func.max(amt).label("max_ticket"),
-                func.min(amt).label("min_ticket"),
+                # sin el filter, avg promediaba tambien las NC (negativas) y
+                # min_ticket era siempre la nota de credito mas grande
+                func.avg(amt).filter(documents_snapshot.c.document_type_use != 1).label("avg_ticket"),
+                func.max(amt).filter(documents_snapshot.c.document_type_use != 1).label("max_ticket"),
+                func.min(amt).filter(documents_snapshot.c.document_type_use != 1).label("min_ticket"),
             ).where(
                 and_(
                     documents_snapshot.c.emission_date >= cutoff,
@@ -606,9 +634,9 @@ def register(mcp) -> None:  # noqa: ANN001
                 func.max(documents_snapshot.c.emission_date).label("last_purchase"),
                 func.count().filter(documents_snapshot.c.document_type_use != 1).label("frequency"),
                 func.sum(amt).label("monetary"),
-                func.max(documents_snapshot.c.raw["firstName"].astext).label("first_name"),
-                func.max(documents_snapshot.c.raw["lastName"].astext).label("last_name"),
-                func.max(documents_snapshot.c.raw["company"].astext).label("company"),
+                func.max(documents_snapshot.c.raw["client"]["firstName"].astext).label("first_name"),
+                func.max(documents_snapshot.c.raw["client"]["lastName"].astext).label("last_name"),
+                func.max(documents_snapshot.c.raw["client"]["company"].astext).label("company"),
             ).where(
                 and_(
                     documents_snapshot.c.emission_date >= cutoff,
@@ -738,7 +766,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= week_dt,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).order_by(desc("units")).limit(5)).fetchall()
@@ -751,7 +779,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date >= lookback30_cutoff,
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id).order_by(desc("units")).limit(30)).fetchall()
@@ -861,7 +889,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     document_details_snapshot.c.emission_date.between(start_dt, end_dt),
-                    document_details_snapshot.c.document_type_use != 2,
+                    _detalle_de_venta_oficial(),
                     document_details_snapshot.c.variant_id.isnot(None),
                 )
             ).group_by(document_details_snapshot.c.variant_id)

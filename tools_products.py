@@ -17,7 +17,7 @@ def register(mcp) -> None:  # noqa: ANN001
         code: str | None = None,
         state: int | None = None,
         producttypeid: int | None = None,
-        expand: str = "[product_type,variants]",
+        expand: str = "[product_type]"  # variants aparte: 20-40 por producto,
     ) -> dict[str, Any]:
         """Lista productos de Bsale con filtros opcionales.
 

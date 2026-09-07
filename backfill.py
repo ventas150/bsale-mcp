@@ -115,7 +115,9 @@ def backfill_documents(desde: date, hasta: date | None = None) -> dict[str, Any]
             "emissiondaterange": iso_to_epoch_range(start_iso, end_iso),
             "expand": "[document_type,office,client]",
         }
-        docs = client.paginated_get("/v1/documents.json", params=params, max_pages=80)
+        # 400 paginas = 20.000 docs/mes. Con 80 (4.000) cortaba cada mes a la
+        # mitad en silencio: el promedio real de MyScrubs es ~7.200 docs/mes.
+        docs = client.paginated_get("/v1/documents.json", params=params, max_pages=400)
         rows = []
         for doc in docs:
             if not is_sales_doc(doc):  # excluye guías (use=2)

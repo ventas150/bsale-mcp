@@ -25,3 +25,45 @@ services:
         value: INFO
       - key: PYTHON_VERSION
         value: "3.11.9"
+
+      # --- Autenticacion del endpoint MCP -------------------------------
+      # Mientras este vacio, el servidor acepta llamadas SIN credenciales:
+      # cualquiera con la URL puede usar los tools de escritura. Al setear un
+      # valor aca, todo (incluido /mcp) exige `Authorization: Bearer <valor>`
+      # y hay que agregar ese header en la configuracion del cliente MCP.
+      - key: MCP_AUTH_TOKEN
+        sync: false
+
+      # --- Candados de escritura ----------------------------------------
+      # Regla permanente de MyScrubs: los precios no los cambia un agente.
+      # Para un cambio autorizado: poner "1", declarar la lista en
+      # BSALE_WRITABLE_PRICE_LISTS, aplicar, y volver a "0".
+      - key: BSALE_PRICE_WRITES_ENABLED
+        value: "0"
+      - key: BSALE_WRITABLE_PRICE_LISTS
+        value: ""
+      - key: BSALE_STOCK_WRITES_ENABLED
+        value: "1"
+
+      # --- Ajustes que el codigo ya leia pero no estaban declarados -------
+      - key: BSALE_MAX_RETRIES
+        value: "3"
+      - key: BSALE_CACHE_TTL_SECONDS
+        value: "86400"   # catalogos casi estaticos; con 900s el cache no servia de nada
+      - key: BSALE_PAGE_WORKERS
+        value: "4"
+      - key: AUDIT_DIR
+        value: /var/data/bsale_audit   # NO /tmp: se borra en cada deploy
+      - key: CACHE_DIR
+        value: /var/data/bsale_cache
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: STOCK_DAILY_RETENTION_DAYS
+        value: "7"   # eran 30: ~7,1M de 7,4M filas que ninguna query lee
+      - key: VARIANTS_KEEP_SNAPSHOTS
+        value: "3"
+
+    disk:
+      name: bsale-mcp-data
+      mountPath: /var/data
+      sizeGB: 1

@@ -40,5 +40,11 @@ def register(mcp) -> None:  # noqa: ANN001
     def bsale_contar_clientes() -> dict[str, Any]:
         """Cuenta total de clientes activos en Bsale."""
         client = get_client()
-        result = client.get("/v1/clients.json", params={"limit": 1})
-        return {"count": result.get("count", 0)}
+        activos = client.get("/v1/clients.json", params={"limit": 1, "state": 0})
+        todos = client.get("/v1/clients.json", params={"limit": 1})
+        return {
+            "count": activos.get("count", 0),
+            "activos": activos.get("count", 0),
+            "total_incluyendo_inactivos": todos.get("count", 0),
+            "nota": "count = activos (state=0). Antes devolvia el padron completo rotulado como activos.",
+        }

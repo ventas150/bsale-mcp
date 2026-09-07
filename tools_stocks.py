@@ -33,7 +33,7 @@ def register(mcp) -> None:  # noqa: ANN001
     @mcp.tool()
     def bsale_stock_agregado(
         officeid: int | None = None,
-        max_pages: int = 20,
+        max_items: int = 40000,
     ) -> dict[str, Any]:
         """Stock agregado por sucursal y por producto. Util para allocacion."""
         client = get_client()
@@ -42,7 +42,8 @@ def register(mcp) -> None:  # noqa: ANN001
             "officeid": officeid,
             "expand": "[variant,office]",
         }
-        items = client.paginated_get("/v1/stocks.json", params=params, max_pages=max_pages)
+        fetch = client.paginated_fetch("/v1/stocks.json", params=params, max_items=max_items)
+        items = fetch["items"]
 
         by_office: dict[int, dict[str, Any]] = defaultdict(
             lambda: {"office_name": "", "total_units": 0, "sku_count": 0}
@@ -69,13 +70,23 @@ def register(mcp) -> None:  # noqa: ANN001
                 "office_name": office.get("name"),
                 "quantity": quantity,
             }
-            if quantity == 0:
+            if quantity <= 0:
+                # Bsale permite cantidades negativas (sobreventa, ajustes
+                # pendientes). Con `== 0` un SKU en -3 caia en "poco stock" en
+                # vez de "quebrado", que es al reves de lo que hay que priorizar.
                 out_of_stock.append(entry)
             elif quantity <= 5:
                 low_stock.append(entry)
 
         return {
             "total_items": len(items),
+            "filas_en_bsale": fetch["total_count"],
+            "truncado": fetch["truncated"],
+            "advertencia": (
+                "RESULTADO PARCIAL: no se leyo todo el stock, los conteos son "
+                "menores a la realidad. Subir max_items."
+                if fetch["truncated"] else None
+            ),
             "by_office": dict(by_office),
             "low_stock_count": len(low_stock),
             "out_of_stock_count": len(out_of_stock),

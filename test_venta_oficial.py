@@ -110,3 +110,107 @@ def test_paginated_get_sigue_funcionando():
     c = _client_con_paginas(total=130)
     items = c.paginated_get("/v1/documents.json", params={"limit": 50}, max_pages=2)
     assert len(items) == 100  # 2 paginas x 50, compatibilidad con el comportamiento viejo
+
+
+# --- Candados de escritura (guardrails.py) ----------------------------------
+import guardrails  # noqa: E402
+
+
+def _reset_flags(price="0", listas=""):
+    os.environ["BSALE_PRICE_WRITES_ENABLED"] = price
+    os.environ["BSALE_WRITABLE_PRICE_LISTS"] = listas
+
+
+def test_precios_bloqueados_por_default():
+    _reset_flags()
+    try:
+        guardrails.guard_price_write(6)
+    except guardrails.GuardrailError as e:
+        assert "DESHABILITADA" in str(e)
+        return
+    raise AssertionError("La escritura de precios NO debe estar permitida por default")
+
+
+def test_precios_exigen_allowlist():
+    _reset_flags(price="1", listas="")
+    try:
+        guardrails.guard_price_write(6)
+    except guardrails.GuardrailError as e:
+        assert "allowlist" in str(e).lower() or "BSALE_WRITABLE" in str(e)
+        return
+    raise AssertionError("Sin allowlist no se debe poder escribir")
+
+
+def test_precios_rechazan_lista_no_declarada():
+    _reset_flags(price="1", listas="6")
+    guardrails.guard_price_write(6)  # permitida
+    try:
+        guardrails.guard_price_write(1)  # otra lista
+    except guardrails.GuardrailError:
+        _reset_flags()
+        return
+    raise AssertionError("Una lista fuera de la allowlist debe rechazarse")
+
+
+def test_precio_cero_o_negativo_aborta_todo():
+    for malo in (0, -100):
+        try:
+            guardrails.validate_price_updates(
+                [{"variant_id": 1, "new_price": 10000}, {"variant_id": 2, "new_price": malo}],
+                current={1: 10000, 2: 9000},
+            )
+        except guardrails.GuardrailError as e:
+            assert "no se escribio nada" in str(e).lower()
+            continue
+        raise AssertionError(f"precio {malo} debe abortar la operacion completa")
+
+
+def test_bajada_grande_aborta():
+    try:
+        guardrails.validate_price_updates(
+            [{"variant_id": 1, "new_price": 5000}], current={1: 10000}, max_delta_pct=5.0
+        )
+    except guardrails.GuardrailError as e:
+        assert "superan" in str(e)
+        return
+    raise AssertionError("una bajada de 50% debe abortar con el umbral en 5%")
+
+
+def test_sin_precio_anterior_no_se_escribe():
+    try:
+        guardrails.validate_price_updates([{"variant_id": 99, "new_price": 10000}], current={})
+    except guardrails.GuardrailError as e:
+        assert "revertir" in str(e)
+        return
+    raise AssertionError("sin precio anterior no hay rollback posible: debe abortar")
+
+
+def test_confirm_token_es_de_un_solo_uso_y_atado_al_payload():
+    payload = {"price_list_id": 6, "tabla": [{"variant_id": 1, "precio_nuevo": 10000}]}
+    tok = guardrails.issue_confirm_token(payload)
+    guardrails.consume_confirm_token(tok, payload)  # primera vez: pasa
+    try:
+        guardrails.consume_confirm_token(tok, payload)  # segunda: no
+    except guardrails.GuardrailError:
+        pass
+    else:
+        raise AssertionError("el confirm_token debe ser de un solo uso")
+
+    tok2 = guardrails.issue_confirm_token(payload)
+    otro = {"price_list_id": 6, "tabla": [{"variant_id": 1, "precio_nuevo": 999}]}
+    try:
+        guardrails.consume_confirm_token(tok2, otro)
+    except guardrails.GuardrailError as e:
+        assert "no corresponde" in str(e)
+        return
+    raise AssertionError("el token no debe validar un payload distinto al que lo genero")
+
+
+def test_tope_de_cantidad_de_cambios():
+    muchos = [{"variant_id": i, "new_price": 1000} for i in range(60)]
+    try:
+        guardrails.validate_price_updates(muchos, current={i: 1000 for i in range(60)})
+    except guardrails.GuardrailError as e:
+        assert "tope" in str(e)
+        return
+    raise AssertionError("60 cambios en una llamada debe superar el tope de 50")
