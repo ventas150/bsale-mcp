@@ -416,3 +416,185 @@ def test_rango_utc_cubre_el_dia_completo():
     desde, hasta = tidb._rango_utc("2026-08-01", "2026-08-31")
     assert desde.day == 1 and desde.hour == 0
     assert hasta.day == 31 and (hasta.hour, hasta.minute) == (23, 59)
+
+
+# ============================================================
+# El cliente no se puede colgar contando errores
+# ============================================================
+# _bump se llamaba a si misma DENTRO de su propio `with self._stats_lock`.
+# threading.Lock no es reentrante: el primer timeout / 429 / 5xx de Bsale
+# colgaba el hilo para siempre CON el lock tomado, y de ahi todo hilo que
+# tocara _bump se colgaba igual. Con el threadpool de uvicorn acotado, unos
+# pocos errores de Bsale dejaban el servicio sin responder, /health incluido.
+#
+# No lo agarro ningun test porque solo se dispara con Bsale FALLANDO.
+
+def test_bump_no_se_cuelga_y_no_pierde_incrementos():
+    import threading
+
+    from bsale_client import BsaleClient
+
+    c = BsaleClient.__new__(BsaleClient)
+    c._stats_lock = threading.Lock()
+    c._total_requests = 0
+    c._total_retries = 0
+    c._last_error = None
+    c._last_success_ts = None
+
+    def machacar():
+        for _ in range(200):
+            c._bump("retries")
+            c._bump("requests")
+
+    hilos = [threading.Thread(target=machacar) for _ in range(8)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join(timeout=10)
+
+    vivos = [h for h in hilos if h.is_alive()]
+    assert not vivos, f"{len(vivos)} hilos colgados: _bump volvio a bloquearse"
+    # Exacto, no aproximado: si se pierden incrementos el lock no esta sirviendo
+    assert c._total_retries == 1600
+    assert c._total_requests == 1600
+    assert not c._stats_lock.locked()
+
+
+def test_bump_registra_error_y_lo_limpia_al_exito():
+    import threading
+
+    from bsale_client import BsaleClient
+
+    c = BsaleClient.__new__(BsaleClient)
+    c._stats_lock = threading.Lock()
+    c._total_requests = 0
+    c._total_retries = 0
+    c._last_error = None
+    c._last_success_ts = None
+
+    c._bump("noop", error="RATE_LIMIT")
+    assert c._last_error == "RATE_LIMIT"
+    c._bump("noop", success=True)
+    assert c._last_error is None
+    assert c._last_success_ts is not None
+
+
+# ============================================================
+# La zona horaria va sobre now(), no sobre emission_date
+# ============================================================
+# Bsale entrega emissionDate como medianoche UTC exacta: es una FECHA
+# disfrazada de timestamp. Convertirla a America/Santiago la corre un dia
+# hacia atras, asi que el filtro "emitido hoy" no calzaba nunca y el digest
+# ventas_hoy devolvia $0 todos los dias — con _generated_at fresco, que es
+# lo que lo hacia creible.
+
+def test_dia_hoy_no_convierte_emission_date_a_santiago():
+    import digests
+
+    sql = digests._dia_hoy()
+    assert "emission_date AT TIME ZONE 'UTC'" in sql, (
+        "emission_date debe quedar en UTC: es medianoche UTC, no una hora real"
+    )
+    assert f"emission_date AT TIME ZONE '{digests.TZ_NEGOCIO}'" not in sql, (
+        "convertir emission_date a Santiago la corre un dia atras"
+    )
+    # y el 'hoy' del negocio SI tiene que estar en Santiago
+    assert digests.TZ_NEGOCIO in sql
+    assert digests._dia_hoy("d").startswith("(d.emission_date")
+
+
+def test_un_documento_de_hoy_calza_con_hoy_en_chile():
+    """Reproduce en Python lo que hace el SQL, para el caso que fallaba.
+
+    Documento emitido hoy -> Bsale lo entrega como medianoche UTC de hoy.
+    El filtro tiene que dar True mientras en Chile siga siendo hoy.
+    """
+    from datetime import datetime, time, timezone
+    from zoneinfo import ZoneInfo
+
+    scl = ZoneInfo("America/Santiago")
+    hoy_chile = datetime.now(scl).date()
+
+    # como lo guarda snapshot.py: medianoche UTC del dia de emision
+    emitido = datetime.combine(hoy_chile, time.min, tzinfo=timezone.utc)
+
+    # lo que hace el SQL corregido
+    bien = emitido.astimezone(timezone.utc).date() == hoy_chile
+    assert bien, "un documento emitido hoy tiene que contar como de hoy"
+
+    # y lo que hacia el SQL roto
+    mal = emitido.astimezone(scl).date() == hoy_chile
+    assert not mal, (
+        "si esto pasa, el offset de Chile cambio de signo y el test ya no "
+        "prueba nada"
+    )
+
+
+# ============================================================
+# Nada pesado puede correr dentro del web service
+# ============================================================
+# El 07-sep-2026 un backfill de 46.738 documentos dejo sin responder /health y
+# Render reinicio la instancia. Se topo el backfill a 31 dias, pero
+# bsale_snapshot_run_now seguia abierto — y su default, target="all", corre la
+# nocturna COMPLETA (stock ~6.000 paginas, ~2 horas). Bastaba llamarlo sin
+# argumentos para reproducir el incidente multiplicado.
+
+def _tools_de(modulo):
+    """Registra los tools de un modulo en un FastMCP limpio y los devuelve."""
+    fastmcp = pytest.importorskip("fastmcp")
+    mcp = fastmcp.FastMCP(name="t")
+    registrados = {}
+
+    class Espia:
+        def tool(self, *a, **kw):
+            def deco(fn):
+                registrados[fn.__name__] = fn
+                return fn
+            return deco
+
+    modulo.register(Espia())
+    return registrados
+
+
+def test_run_now_rechaza_los_targets_pesados():
+    tools = _tools_de(pytest.importorskip("tools_snapshot"))
+    run_now = tools["bsale_snapshot_run_now"]
+
+    for target in ("all", "stock", "variants"):
+        r = run_now(target=target)
+        assert r.get("aplicado") is False, f"target={target} deberia rechazarse"
+        assert "health" in str(r).lower()
+
+    # el default es el caso peligroso: llamarlo sin argumentos
+    assert run_now().get("aplicado") is False
+
+
+def test_run_now_topa_la_ventana_de_documentos():
+    tools = _tools_de(pytest.importorskip("tools_snapshot"))
+    run_now = tools["bsale_snapshot_run_now"]
+    r = run_now(target="documents", days_back=365)
+    assert r.get("aplicado") is False
+    assert "backfill_rango" in str(r)
+
+
+def test_backfill_rango_topa_a_31_dias():
+    tools = _tools_de(pytest.importorskip("tools_snapshot"))
+    bf = tools["bsale_snapshot_backfill_rango"]
+    r = bf(date_from="2025-01-01", date_to="2025-04-30")
+    assert r.get("aplicado") is False
+    assert "31" in str(r)
+
+
+def test_el_cache_degrada_en_vez_de_tumbar_el_arranque():
+    """cache.py tenia el mismo mkdir sin fallback que ya se arreglo en audit.py.
+
+    Sin fallback: OSError -> BsaleClient.__init__ falla -> todos los tools
+    fallan -> /health devuelve 503 -> Render reinicia -> se repite.
+    """
+    import cache as cache_mod
+
+    c = cache_mod.FileCache(cache_dir="/proc/no-se-puede-escribir-aca")
+    assert c.cache_dir == cache_mod.FileCache._FALLBACK
+    # y sigue siendo un cache usable, no un objeto a medio construir
+    c.set("k", {"v": 1}, 900)
+    assert c.get("k") == {"v": 1}

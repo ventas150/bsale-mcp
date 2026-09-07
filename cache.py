@@ -25,15 +25,49 @@ logger = logging.getLogger(__name__)
 class FileCache:
     """Cache simple basado en archivo JSON con TTL."""
 
+    # Mismo fallback que audit.py, y por la misma razon. CACHE_DIR apunta al
+    # disco persistente de Render, que solo existe si el volumen quedo montado.
+    # Sin fallback, este mkdir lanza OSError -> BsaleClient.__init__ no se
+    # construye (llama get_cache) -> TODOS los tools fallan y /health devuelve
+    # 503, con lo que Render reinicia... y vuelve a pasar lo mismo. Bucle de
+    # reinicio por un problema de CACHE.
+    #
+    # El 07-sep-2026 se arreglo este patron en audit.py y no se miro este
+    # archivo, que lo tenia igual.
+    _FALLBACK = Path("/tmp/bsale_cache")  # noqa: S108
+
     def __init__(self, cache_dir: str | None = None) -> None:
-        # En Render, /tmp es ephemeral pero persiste durante el proceso
-        # Si hay disco persistente, usarlo
-        self.cache_dir = Path(cache_dir or os.getenv("CACHE_DIR", "/tmp/bsale_cache"))
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        preferido = Path(cache_dir or os.getenv("CACHE_DIR", str(self._FALLBACK)))
+        self.cache_dir = self._resolver_dir(preferido)
         self.cache_file = self.cache_dir / "cache.json"
         self._lock = threading.Lock()
         self._data: dict[str, dict[str, Any]] = {}
         self._load()
+
+    @classmethod
+    def _resolver_dir(cls, preferido: Path) -> Path:
+        for candidato in (preferido, cls._FALLBACK):
+            try:
+                candidato.mkdir(parents=True, exist_ok=True)
+                probe = candidato / ".probe"
+                probe.touch()
+                probe.unlink(missing_ok=True)
+            except OSError as e:
+                logger.error(
+                    "CACHE_DIR %s no es escribible (%s). El cache no persiste.",
+                    candidato, e,
+                )
+                continue
+            if candidato != preferido:
+                logger.error(
+                    "Cache degradado a %s: se pierde en cada deploy. Revisar que "
+                    "el disco de Render este montado en %s.", candidato, preferido,
+                )
+            return candidato
+        # Sin ningun directorio escribible: seguir en memoria antes que tumbar
+        # el ERP por no poder cachear.
+        logger.error("Ningun directorio de cache escribible; cache solo en memoria.")
+        return preferido
 
     def _load(self) -> None:
         """Carga cache de disco si existe."""

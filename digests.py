@@ -114,8 +114,19 @@ HOY_NEGOCIO = f"(now() AT TIME ZONE '{TZ_NEGOCIO}')::date"
 
 
 def _dia_hoy(alias: str = "") -> str:
+    """Filtro 'emitido hoy', con hoy medido en Chile.
+
+    La conversion de zona va sobre now(), NO sobre emission_date. Bsale entrega
+    emissionDate como medianoche UTC exacta: es una FECHA disfrazada de
+    timestamp, no lleva hora real. Al hacerle AT TIME ZONE 'America/Santiago' se
+    corria un dia hacia atras (2026-09-07 00:00 UTC -> 2026-09-06 20:00 en
+    Chile), nunca calzaba con la fecha de hoy y el digest ventas_hoy devolvia
+    $0 TODOS los dias, con _generated_at fresco que daba confianza falsa.
+    Verificado el 07-sep-2026: el digest decia 0 y ese dia iban $6.259.460 en
+    147 documentos.
+    """
     pre = f"{alias}." if alias else ""
-    return f"({pre}emission_date AT TIME ZONE '{TZ_NEGOCIO}')::date = {HOY_NEGOCIO}"
+    return f"({pre}emission_date AT TIME ZONE 'UTC')::date = {HOY_NEGOCIO}"
 
 
 def _official_sale_sql(alias: str = "") -> str:

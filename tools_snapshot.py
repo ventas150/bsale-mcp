@@ -39,19 +39,62 @@ def register(mcp) -> None:  # noqa: ANN001
     ) -> dict[str, Any]:
         """Corre snapshot ahora mismo (manual). WRITE OP (a DB local).
 
+        Solo acepta los targets LIVIANOS. 'all', 'stock' y 'variants' corren en
+        el cron nocturno (cron_snapshot.py), que es un proceso aparte.
+
+        Por que: este tool corre DENTRO del web service, el mismo proceso que
+        responde /health. snapshot_stock pagina secuencialmente ~6.000 paginas y
+        tarda cerca de 2 horas; 'all' hace ademas variants y details. Con eso el
+        healthcheck no responde en 5 segundos, Render marca el servicio caido y
+        reinicia la instancia a mitad de la carga. Ya paso el 07-sep-2026 con un
+        backfill de 46.738 documentos, que es una fraccion de esto — y 'all' era
+        el DEFAULT de este tool, o sea que bastaba llamarlo sin argumentos.
+
         Args:
-            target: 'all', 'documents', 'stock', 'variants', 'details'.
-            days_back: Solo aplica para 'documents'. Para backfill usar 30, 60, 90.
+            target: 'documents' (por days_back) o 'details' (lote acotado).
+            days_back: Ventana para 'documents'. Maximo 31; para tramos viejos
+                usar bsale_snapshot_backfill_rango.
         """
+        PESADOS = {
+            "all": "la corrida nocturna completa (stock + variants + details)",
+            "stock": "la foto de stock (~6.000 paginas, ~2 horas)",
+            "variants": "el catalogo completo de variantes (~2.000 paginas)",
+        }
+        if target in PESADOS:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    f"'{target}' es {PESADOS[target]} y corre DENTRO del web "
+                    "service, que es el mismo proceso que responde /health. "
+                    "Lanzarlo desde aca deja sin responder el healthcheck y "
+                    "Render reinicia la instancia a mitad de la carga."
+                ),
+                "donde_corre": "cron_snapshot.py, como Render Cron Job aparte",
+                "alternativas": {
+                    "documents": "bsale_snapshot_run_now(target='documents', days_back<=31)",
+                    "rango_viejo": "bsale_snapshot_backfill_rango(date_from, date_to)",
+                    "details": "bsale_snapshot_details_batch(...)",
+                },
+            }
         if target == "documents":
+            if days_back > 31:
+                return {
+                    "aplicado": False,
+                    "motivo": (
+                        f"days_back={days_back}. El tope es 31 por la misma razon "
+                        "que el backfill: una ventana larga satura el proceso que "
+                        "sirve el healthcheck."
+                    ),
+                    "alternativa": "bsale_snapshot_backfill_rango(date_from, date_to)",
+                }
             return snapshot_documents(days_back=days_back)
-        if target == "stock":
-            return snapshot_stock()
-        if target == "variants":
-            return snapshot_variants()
         if target == "details":
             return snapshot_details(batch_size=100, max_docs=500)
-        return nightly_snapshot()
+        return {
+            "aplicado": False,
+            "motivo": f"target '{target}' no reconocido.",
+            "validos": ["documents", "details"],
+        }
 
     @mcp.tool()
     def bsale_snapshot_backfill_rango(

@@ -214,11 +214,26 @@ class BsaleClient:
         self._stats_lock = threading.Lock()
 
     def _bump(self, what: str, error: str | None = None, success: bool = False) -> None:
+        """Actualiza los contadores y el ultimo estado, bajo lock.
+
+        OJO con la version anterior: en vez de incrementar el contador se
+        llamaba a si misma (`self._bump("requests")`) DENTRO del `with`.
+        threading.Lock no es reentrante, asi que el primer timeout, corte de red,
+        429 o 5xx de Bsale colgaba el hilo para siempre — y encima con el lock
+        tomado, con lo que todo hilo posterior que tocara _bump se colgaba
+        tambien. Como uvicorn corre los tools sincronicos en un threadpool
+        acotado, bastaban unos pocos errores de Bsale para que el servicio
+        dejara de responder, /health incluido.
+
+        No se noto antes porque la rama "requests" nunca se llamaba (el contador
+        se subia inline) y las ramas "noop" no recursan: solo reventaba con
+        Bsale fallando, que es justo cuando uno necesita el healthcheck.
+        """
         with self._stats_lock:
             if what == "requests":
-                self._bump("requests")
+                self._total_requests += 1
             elif what == "retries":
-                self._bump("retries")
+                self._total_retries += 1
             if error is not None:
                 self._last_error = error
             if success:
@@ -259,7 +274,9 @@ class BsaleClient:
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                self._total_requests += 1
+                # Por _bump y no `+= 1` suelto: paginated_fetch baja paginas en
+                # paralelo y sin lock se pierden incrementos.
+                self._bump("requests")
                 response = self._client.request(method, url, params=params, json=json_body)
             except httpx.TimeoutException as e:
                 last_exc = BsaleError(
@@ -338,8 +355,9 @@ class BsaleClient:
                 self._bump("noop", error="INVALID_JSON")
                 raise BsaleError(f"Bsale devolvio JSON invalido: {e}") from e
 
-            self._last_success_ts = time.time()
-            self._last_error = None
+            # Tambien bajo lock: escribir _last_error suelto desde varios hilos
+            # dejaba el healthcheck reportando "sin errores" en plena tanda de 429.
+            self._bump("noop", success=True)
             return payload
 
         # Si salimos del loop sin return, todos los retries fallaron
