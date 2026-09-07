@@ -7,5 +7,5 @@
 # quedo caido 8 horas. test_no_hay_nombres_indefinidos_en_el_repo lo cubre,
 # pero se salta solo si pyflakes no esta instalado.
 -r requirements.txt
-pytest==8.3.4
-pyflakes==3.2.0
+pytest==9.1.1
+pyflakes==3.4.0
