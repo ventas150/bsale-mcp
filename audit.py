@@ -21,8 +21,41 @@ from typing import Any
 logger = logging.getLogger("audit")
 _lock = threading.Lock()
 
-AUDIT_DIR = Path(os.getenv("AUDIT_DIR", "/tmp/bsale_audit"))
-AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+# El directorio se resuelve con fallback a proposito. AUDIT_DIR apunta al disco
+# persistente de Render (/var/data/...), que solo existe si el disco quedo
+# efectivamente montado. Si no esta, este mkdir corria en tiempo de import y
+# tumbaba el server entero: el proceso no arrancaba y el deploy quedaba caido
+# por un problema de LOGGING. El audit es importante, pero no vale tirar abajo
+# el ERP; si el disco no esta, se degrada a /tmp y se avisa fuerte.
+_AUDIT_FALLBACK = Path("/tmp/bsale_audit")  # noqa: S108
+
+
+def _resolver_audit_dir() -> Path:
+    preferido = Path(os.getenv("AUDIT_DIR", str(_AUDIT_FALLBACK)))
+    for candidato in (preferido, _AUDIT_FALLBACK):
+        try:
+            candidato.mkdir(parents=True, exist_ok=True)
+            probe = candidato / ".probe"
+            probe.touch()
+            probe.unlink(missing_ok=True)
+        except OSError as e:
+            logger.error(
+                "AUDIT_DIR %s no es escribible (%s). El audit log NO es persistente.",
+                candidato, e,
+            )
+            continue
+        if candidato != preferido:
+            logger.error(
+                "Audit log degradado a %s: se pierde en cada deploy. "
+                "Revisar que el disco de Render este montado en %s.",
+                candidato, preferido,
+            )
+        return candidato
+    logger.error("Ningun directorio de audit escribible; solo queda el log a stdout.")
+    return preferido
+
+
+AUDIT_DIR = _resolver_audit_dir()
 AUDIT_FILE = AUDIT_DIR / "writes.jsonl"
 
 
