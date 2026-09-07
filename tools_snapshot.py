@@ -73,14 +73,52 @@ def register(mcp) -> None:  # noqa: ANN001
         Despues de correrlo, verificar con bsale_conciliacion_venta sobre el
         mismo rango: tiene que dar diferencia 0.
 
+        Maximo 31 dias por llamada: corre dentro del web service y un tramo
+        largo deja sin responder el healthcheck de Render (ver comentario en el
+        cuerpo). Para reparar varios meses, una llamada por mes.
+
         Args:
             date_from: YYYY-MM-DD inicio (inclusive).
             date_to: YYYY-MM-DD fin (inclusive).
             max_documentos: Tope de documentos a leer. Si se alcanza, la
                 respuesta lo declara en `truncado` y el rango queda INCOMPLETO.
         """
+        # Tope de tramo. El 07-sep-2026 lance este tool sobre 4 meses (46.738
+        # documentos) y saturo el proceso: el web service es el MISMO que
+        # responde /health, Render no obtuvo respuesta en 5 segundos, marco el
+        # servicio caido y reinicio la instancia a mitad del backfill. Tramos de
+        # ~10.000 documentos (un mes, o media quincena cargada) pasan limpios.
+        #
+        # El upsert es idempotente, asi que cortar y reintentar no rompe nada;
+        # lo que hay que evitar es tumbar el MCP en horario de operacion.
+        from datetime import date
+
+        d1 = date.fromisoformat(date_from)
+        d2 = date.fromisoformat(date_to)
+        dias = (d2 - d1).days + 1
+        if dias > 31:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    f"Rango de {dias} dias. El tope es 31 porque este backfill corre "
+                    "DENTRO del web service, y un tramo largo deja sin responder el "
+                    "healthcheck de Render, que reinicia la instancia a mitad de "
+                    "camino. Partirlo en tramos mensuales o quincenales."
+                ),
+                "sugerencia": "un mes por llamada; si el mes es pesado, dos quincenas",
+            }
+        if dias > 15:
+            aviso = (
+                "Tramo de mas de 15 dias: si Render reporta healthcheck fallido, "
+                "partirlo en quincenas. El upsert es idempotente, se puede reintentar."
+            )
+        else:
+            aviso = None
+
         paginas = max(1, int(max_documentos) // 50)
         res = snapshot_documents_range(date_from, date_to, max_pages=paginas)
+        if aviso:
+            res["nota"] = aviso
         res["idempotente"] = "upsert por document_id; correrlo de nuevo no duplica"
         res["siguiente_paso"] = (
             f"bsale_conciliacion_venta(start_date='{date_from}', "
