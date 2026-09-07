@@ -21,7 +21,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, case, desc, exists, func, not_, select, text
+from sqlalchemy import and_, desc, exists, func, not_, select, text
 
 from bsale_client import get_client
 from db import (
@@ -918,6 +918,64 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
 
+def _rango_utc(date_from: str, date_to: str):
+    """[desde 00:00, hasta 23:59:59] en UTC a partir de dos fechas ISO."""
+    desde = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+    hasta = datetime.fromisoformat(date_to).replace(
+        hour=23, minute=59, second=59, tzinfo=timezone.utc
+    )
+    return desde, hasta
+
+
+def _stmt_cabecera_por_sucursal(desde, hasta):
+    """SELECT de pesos y documentos por sucursal. Extraido para poder compilarlo
+    en un test sin base: la primera version llamaba signed_amount(tabla) en vez
+    de signed_amount(columna, columna) y el TypeError solo aparecio al ejecutar
+    el tool contra Postgres."""
+    d = documents_snapshot.c
+    return (
+        select(
+            d.office_id,
+            func.max(d.office_name).label("sucursal"),
+            func.sum(
+                signed_amount(d.total_amount, d.document_type_use)
+            ).label("venta"),
+            func.count().filter(d.document_type_use != 1).label("docs"),
+            func.count().filter(d.document_type_use == 1).label("nc"),
+        )
+        .where(
+            and_(
+                d.emission_date >= desde,
+                d.emission_date <= hasta,
+                *official_sale_conditions(documents_snapshot),
+            )
+        )
+        .group_by(d.office_id)
+    )
+
+
+def _stmt_unidades_por_sucursal(desde, hasta):
+    """SELECT de unidades por sucursal, desde el detalle de linea."""
+    det = document_details_snapshot.c
+    return (
+        select(
+            det.office_id,
+            func.sum(
+                signed_amount(det.quantity, det.document_type_use)
+            ).label("unidades"),
+            func.count(func.distinct(det.document_id)).label("docs_con_detalle"),
+        )
+        .where(
+            and_(
+                det.emission_date >= desde,
+                det.emission_date <= hasta,
+                _detalle_de_venta_oficial(),
+            )
+        )
+        .group_by(det.office_id)
+    )
+
+
 def register_venta_por_sucursal(mcp) -> None:  # noqa: ANN001
     """Registra bsale_venta_por_sucursal. Se llama desde register()."""
 
@@ -946,45 +1004,11 @@ def register_venta_por_sucursal(mcp) -> None:  # noqa: ANN001
             date_from: YYYY-MM-DD inicio (inclusive).
             date_to: YYYY-MM-DD fin (inclusive).
         """
-        desde = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
-        hasta = datetime.fromisoformat(date_to).replace(
-            hour=23, minute=59, second=59, tzinfo=timezone.utc
-        )
-        d = documents_snapshot.c
-        en_rango = and_(d.emission_date >= desde, d.emission_date <= hasta)
-        oficial = and_(*official_sale_conditions(documents_snapshot))
+        desde, hasta = _rango_utc(date_from, date_to)
 
         with db_session() as s:
-            cab = s.execute(
-                select(
-                    d.office_id,
-                    func.max(d.office_name).label("sucursal"),
-                    func.sum(signed_amount(documents_snapshot)).label("venta"),
-                    func.count().filter(d.document_type_use != 1).label("docs"),
-                    func.count().filter(d.document_type_use == 1).label("nc"),
-                )
-                .where(and_(en_rango, oficial))
-                .group_by(d.office_id)
-            ).fetchall()
-
-            det = document_details_snapshot.c
-            filas_det = s.execute(
-                select(
-                    det.office_id,
-                    func.sum(
-                        case((det.document_type_use == 1, -det.quantity), else_=det.quantity)
-                    ).label("unidades"),
-                    func.count(func.distinct(det.document_id)).label("docs_con_detalle"),
-                )
-                .where(
-                    and_(
-                        det.emission_date >= desde,
-                        det.emission_date <= hasta,
-                        _detalle_de_venta_oficial(),
-                    )
-                )
-                .group_by(det.office_id)
-            ).fetchall()
+            cab = s.execute(_stmt_cabecera_por_sucursal(desde, hasta)).fetchall()
+            filas_det = s.execute(_stmt_unidades_por_sucursal(desde, hasta)).fetchall()
 
         unidades = {r.office_id: float(r.unidades or 0) for r in filas_det}
         con_det = {r.office_id: int(r.docs_con_detalle or 0) for r in filas_det}

@@ -360,3 +360,59 @@ def test_no_hay_nombres_indefinidos_en_el_repo():
         "Hay nombres usados sin importar/definir. Esto NO lo agarra un "
         "smoke test de imports:\n  " + "\n  ".join(indefinidos)
     )
+
+
+# ============================================================
+# Los queries tienen que COMPILAR, no solo importar
+# ============================================================
+# bsale_venta_por_sucursal se desplego llamando signed_amount(tabla) en vez de
+# signed_amount(columna, columna). Import OK, registro OK, pyflakes OK: el
+# TypeError solo aparecio al ejecutar el tool contra Postgres, en produccion.
+#
+# Compilar el statement a SQL no necesita base ni red y habria reventado en el
+# acto. Por eso los queries viven en funciones aparte, fuera del closure del
+# tool: para poder compilarlos aca.
+
+def _compilar(stmt):
+    from sqlalchemy.dialects import postgresql
+
+    return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+def test_los_queries_de_venta_por_sucursal_compilan(monkeypatch):
+    """Compilar NO debe tocar la red.
+
+    official_sale_conditions resuelve los ids de nota de venta llamando a
+    Bsale. En un test eso reventaba con 401 y tapaba lo que se queria probar,
+    asi que aca se fija el fallback conocido (3, 23, 24, 26, 27).
+    """
+    from datetime import datetime, timezone
+
+    import bsale_client
+
+    monkeypatch.setattr(
+        bsale_client, "sales_note_type_ids", lambda: frozenset({3, 23, 24, 26, 27})
+    )
+    tidb = pytest.importorskip("tools_intelligence_db")
+    desde = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    hasta = datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
+
+    sql_cab = _compilar(tidb._stmt_cabecera_por_sucursal(desde, hasta))
+    assert "documents_snapshot" in sql_cab
+    assert "office_id" in sql_cab
+    # las NC tienen que restar: el CASE de signed_amount
+    assert "CASE" in sql_cab.upper()
+
+    sql_det = _compilar(tidb._stmt_unidades_por_sucursal(desde, hasta))
+    assert "document_details_snapshot" in sql_det
+    assert "quantity" in sql_det
+    assert "CASE" in sql_det.upper()
+    # y tiene que heredar la regla de venta oficial del documento cabecera
+    assert "EXISTS" in sql_det.upper()
+
+
+def test_rango_utc_cubre_el_dia_completo():
+    tidb = pytest.importorskip("tools_intelligence_db")
+    desde, hasta = tidb._rango_utc("2026-08-01", "2026-08-31")
+    assert desde.day == 1 and desde.hour == 0
+    assert hasta.day == 31 and (hasta.hour, hasta.minute) == (23, 59)
