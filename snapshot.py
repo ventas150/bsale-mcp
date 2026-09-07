@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
+from bsale_client import get_client, is_sales_doc, iso_to_epoch_range
 from db import (
     document_details_snapshot,
     documents_snapshot,

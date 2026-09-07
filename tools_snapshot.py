@@ -19,13 +19,15 @@ from db import (
     stock_snapshot,
     variants_snapshot,
 )
+# OJO: nightly_snapshot, snapshot_stock y snapshot_variants NO se importan
+# aca a proposito. Corren solo en el cron nocturno (cron_snapshot.py), que es
+# un proceso aparte. Tenerlos importados en el web service invita a volver a
+# llamarlos desde un tool, que es exactamente lo que tumbo el servicio el
+# 07-sep-2026.
 from snapshot import (
-    nightly_snapshot,
     snapshot_details,
     snapshot_documents,
     snapshot_documents_range,
-    snapshot_stock,
-    snapshot_variants,
 )
 
 
@@ -34,7 +36,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
     @mcp.tool()
     def bsale_snapshot_run_now(
-        target: str = "all",
+        target: str = "documents",
         days_back: int = 1,
     ) -> dict[str, Any]:
         """Corre snapshot ahora mismo (manual). WRITE OP (a DB local).

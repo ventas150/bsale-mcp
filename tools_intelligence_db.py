@@ -32,7 +32,6 @@ from db import (
     session as db_session,
     official_sale_conditions,
     signed_amount,
-    stock_snapshot,
     variants_snapshot,
 )
 

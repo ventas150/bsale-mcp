@@ -83,8 +83,8 @@ def exactitud() -> int:
         print(f"  [{_ok(cond)}] {nombre}")
     print(f"  medido: venta {venta:,.0f} | docs {len(oficial)} | "
           f"notas de venta {notas:,.0f} | guias {guias} | anulados {anulados}")
-    print(f"  (si la referencia ya no aplica porque cambiaron documentos de esas "
-          f"fechas, actualizar las constantes REF_* de este archivo)")
+    print("  (si la referencia ya no aplica porque cambiaron documentos de esas "
+          "fechas, actualizar las constantes REF_* de este archivo)")
     return fallas
 
 

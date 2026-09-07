@@ -541,8 +541,7 @@ def test_un_documento_de_hoy_calza_con_hoy_en_chile():
 
 def _tools_de(modulo):
     """Registra los tools de un modulo en un FastMCP limpio y los devuelve."""
-    fastmcp = pytest.importorskip("fastmcp")
-    mcp = fastmcp.FastMCP(name="t")
+    pytest.importorskip("fastmcp")
     registrados = {}
 
     class Espia:
@@ -565,8 +564,16 @@ def test_run_now_rechaza_los_targets_pesados():
         assert r.get("aplicado") is False, f"target={target} deberia rechazarse"
         assert "health" in str(r).lower()
 
-    # el default es el caso peligroso: llamarlo sin argumentos
-    assert run_now().get("aplicado") is False
+    # El default era el caso peligroso: target="all" corria la nocturna
+    # completa con solo llamar al tool sin argumentos. Ahora el default tiene
+    # que ser un target liviano. No se invoca run_now() de verdad aca porque
+    # eso pegaria contra Bsale y contra la base.
+    import inspect
+
+    default = inspect.signature(run_now).parameters["target"].default
+    assert default not in ("all", "stock", "variants"), (
+        f"el default de bsale_snapshot_run_now no puede ser pesado: {default}"
+    )
 
 
 def test_run_now_topa_la_ventana_de_documentos():
@@ -693,6 +700,27 @@ def test_health_no_bloquea_el_event_loop():
 
     src = inspect.getsource(server.health_check)
     assert "_con_limite" in src, "health debe usar el wrapper con timeout"
+
+    # OJO: hay que mirar el CODIGO, no los comentarios. El docstring de
+    # health_check nombra las claves que se sacaron para explicar por que se
+    # sacaron; si se escanea el fuente crudo, el propio comentario hace fallar
+    # el test. Se descartan lineas de comentario y el docstring.
+    lineas = []
+    en_docstring = False
+    for linea in src.splitlines():
+        limpia = linea.strip()
+        if limpia.startswith('"""') or limpia.startswith("'''"):
+            comillas = limpia[:3]
+            # docstring de una sola linea
+            if len(limpia) > 3 and limpia.endswith(comillas):
+                continue
+            en_docstring = not en_docstring
+            continue
+        if en_docstring or limpia.startswith("#"):
+            continue
+        lineas.append(linea)
+    codigo = "\n".join(lineas)
+
     # y no debe filtrar internals
     for prohibido in ("cache_file", "db_error", "escritura_precios"):
-        assert prohibido not in src, f"/health no debe exponer {prohibido}"
+        assert prohibido not in codigo, f"/health no debe exponer {prohibido}"
