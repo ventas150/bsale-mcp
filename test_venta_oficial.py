@@ -585,16 +585,38 @@ def test_backfill_rango_topa_a_31_dias():
     assert "31" in str(r)
 
 
-def test_el_cache_degrada_en_vez_de_tumbar_el_arranque():
+def test_el_cache_degrada_en_vez_de_tumbar_el_arranque(monkeypatch, tmp_path):
     """cache.py tenia el mismo mkdir sin fallback que ya se arreglo en audit.py.
 
     Sin fallback: OSError -> BsaleClient.__init__ falla -> todos los tools
     fallan -> /health devuelve 503 -> Render reinicia -> se repite.
+
+    El fallo se simula parcheando mkdir, no pasando una ruta "imposible": la
+    primera version de este test usaba /proc/..., que en Linux falla pero en
+    Windows resuelve a C:\\proc\\... y se crea sin problema. El test pasaba en
+    Render y fallaba en la maquina de Roberto, probando el sistema operativo en
+    vez de la logica.
     """
+    import pathlib
+
     import cache as cache_mod
 
-    c = cache_mod.FileCache(cache_dir="/proc/no-se-puede-escribir-aca")
-    assert c.cache_dir == cache_mod.FileCache._FALLBACK
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr(cache_mod.FileCache, "_FALLBACK", fallback)
+
+    preferido = tmp_path / "disco-que-no-monto"
+    mkdir_real = pathlib.Path.mkdir
+
+    def mkdir_que_falla(self, *a, **kw):
+        if self == preferido:
+            raise OSError(30, "Read-only file system")
+        return mkdir_real(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", mkdir_que_falla)
+
+    c = cache_mod.FileCache(cache_dir=str(preferido))
+    assert c.cache_dir == fallback, "deberia degradar al fallback, no reventar"
     # y sigue siendo un cache usable, no un objeto a medio construir
     c.set("k", {"v": 1}, 900)
     assert c.get("k") == {"v": 1}
+    assert hasattr(c, "_lock") and hasattr(c, "_data")
