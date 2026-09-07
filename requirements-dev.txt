@@ -1,0 +1,11 @@
+# Dependencias solo para desarrollo y verificacion. NO se instalan en Render:
+# el buildCommand de render.yaml usa requirements.txt.
+#
+# pyflakes no es opcional: el 07-sep-2026 se desplego bsale_listar_documentos
+# usando cinco nombres sin importar. Un smoke test de imports lo dejo pasar
+# (un nombre faltante dentro de una funcion solo falla al LLAMARLA) y el tool
+# quedo caido 8 horas. test_no_hay_nombres_indefinidos_en_el_repo lo cubre,
+# pero se salta solo si pyflakes no esta instalado.
+-r requirements.txt
+pytest==8.3.4
+pyflakes==3.2.0

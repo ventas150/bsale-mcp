@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 os.environ.setdefault("BSALE_ACCESS_TOKEN", "test-token")
 
 from bsale_client import (  # noqa: E402
@@ -318,3 +320,43 @@ def test_health_no_filtra_el_secreto(monkeypatch):
     monkeypatch.setenv("MCP_URL_SECRET", "secreto-que-no-debe-salir")
     assert "secreto-que-no-debe-salir" not in server._describir_auth()
     assert server._describir_auth() == "url-secreta"
+
+
+# ============================================================
+# Red de seguridad contra el bug del 07-sep-2026
+# ============================================================
+# `bsale_listar_documentos` se desplego usando cinco nombres que nunca se
+# importaron. No exploto al importar el modulo ni al registrar los tools:
+# un nombre faltante dentro de una funcion solo falla cuando la funcion se
+# LLAMA. El smoke test de ese dia solo importaba y listaba, asi que paso
+# limpio y el tool quedo caido 8 horas en produccion.
+#
+# pyflakes lo detecta en dos segundos. Este test existe para que ese chequeo
+# no dependa de que alguien se acuerde de correrlo.
+
+def test_no_hay_nombres_indefinidos_en_el_repo():
+    import pathlib
+    pyflakes_api = pytest.importorskip("pyflakes.api")
+    from pyflakes import reporter as pyflakes_reporter
+    import io
+
+    raiz = pathlib.Path(__file__).parent
+    archivos = sorted(
+        p for p in raiz.glob("*.py")
+        if not p.name.startswith("_")
+    )
+    assert archivos, "no se encontraron modulos que analizar"
+
+    salida, errores = io.StringIO(), io.StringIO()
+    rep = pyflakes_reporter.Reporter(salida, errores)
+    for f in archivos:
+        pyflakes_api.checkPath(str(f), reporter=rep)
+
+    indefinidos = [
+        linea for linea in salida.getvalue().splitlines()
+        if "undefined name" in linea
+    ]
+    assert not indefinidos, (
+        "Hay nombres usados sin importar/definir. Esto NO lo agarra un "
+        "smoke test de imports:\n  " + "\n  ".join(indefinidos)
+    )
