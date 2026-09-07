@@ -72,14 +72,45 @@ def _auth_token() -> str | None:
     return tok or None
 
 
+# El cliente MCP de Cowork no permite configurar headers: el conector solo
+# expone la URL. Un candado que solo entiende `Authorization: Bearer` deja
+# fuera al unico consumidor legitimo, asi que se acepta tambien el secreto
+# como segmento de la URL: /mcp/<secreto> en vez de /mcp.
+#
+# Es mas debil que un header — una URL puede quedar en logs, historial o
+# referers — pero es la unica forma que este cliente soporta, y la
+# alternativa real no es "header", es "abierto a internet".
+def _url_secret() -> str | None:
+    sec = os.getenv("MCP_URL_SECRET", "").strip()
+    return sec or None
+
+
+def _mcp_path() -> str:
+    """Ruta donde se monta el MCP. Con secreto: /mcp/<secreto>."""
+    sec = _url_secret()
+    return f"/mcp/{sec}" if sec else "/mcp"
+
+
+def _credenciales_validas() -> set[str]:
+    """Secretos aceptados como bearer. El de la URL sirve tambien como token,
+    para que Roberto administre UNA sola variable y no dos."""
+    return {c for c in (_auth_token(), _url_secret()) if c}
+
+
+def _con_candado() -> bool:
+    return bool(_credenciales_validas())
+
+
 def _auth_ok(request) -> bool:  # noqa: ANN001
-    expected = _auth_token()
-    if not expected:
-        return True  # sin token configurado, no se exige (ver nota de arriba)
+    validas = _credenciales_validas()
+    if not validas:
+        return True  # sin candado configurado, no se exige (ver nota de arriba)
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         return False
-    return secrets.compare_digest(header[7:].strip(), expected)
+    presentado = header[7:].strip()
+    # compare_digest contra cada una: comparacion en tiempo constante.
+    return any(secrets.compare_digest(presentado, v) for v in validas)
 
 
 def _unauthorized():
@@ -92,14 +123,36 @@ def _unauthorized():
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Exige bearer token en todo, salvo /health (que Render necesita libre)."""
+    """Exige credencial en todo, con dos excepciones:
+
+    - /health: Render lo necesita libre para el healthcheck del deploy.
+    - La ruta del MCP cuando lleva el secreto embebido: ahi la credencial ya
+      viaja en la URL y exigir ademas un header dejaria fuera al conector.
+    """
 
     async def dispatch(self, request, call_next):  # noqa: ANN001
-        if request.url.path == "/health" or not _auth_token():
+        path = request.url.path
+        if path == "/health" or not _con_candado():
             return await call_next(request)
+        sec = _url_secret()
+        if sec:
+            esperado = _mcp_path()
+            if path == esperado or path.startswith(esperado + "/"):
+                return await call_next(request)
         if not _auth_ok(request):
             return _unauthorized()
         return await call_next(request)
+
+
+def _describir_auth() -> str:
+    """Describe el modo de autenticacion SIN filtrar el secreto."""
+    if _url_secret() and _auth_token():
+        return "url-secreta + bearer"
+    if _url_secret():
+        return "url-secreta"
+    if _auth_token():
+        return "bearer"
+    return "ABIERTO — definir MCP_URL_SECRET en Render"
 
 
 # ============================
@@ -115,7 +168,7 @@ async def health_check(request):  # noqa: ARG001
         "status": "ok",
         "service": "bsale-mcp-myscrubs",
         "version": "0.3.0",
-        "auth": "bearer" if _auth_token() else "ABIERTO — definir MCP_AUTH_TOKEN en Render",
+        "auth": _describir_auth(),
         "escritura_precios": "habilitada" if os.getenv("BSALE_PRICE_WRITES_ENABLED", "0") in ("1","true","yes","on") else "bloqueada por politica",
     }
     code = 200
@@ -280,8 +333,11 @@ def main() -> None:
     logger.info("Starting bsale-mcp-myscrubs v0.3.0 on %s:%d", host, port)
     logger.info("Sentry: %s", "enabled" if SENTRY_DSN else "disabled")
     logger.info("DB: %s", "configured" if os.getenv("DATABASE_URL") else "not configured")
-    if _auth_token():
-        logger.info("Auth: bearer token exigido")
+    if _con_candado():
+        # Nunca loguear el secreto: los logs de Render los ve cualquiera con
+        # acceso al dashboard, y el secreto de la URL es la credencial entera.
+        logger.info("Auth: %s (MCP montado en /mcp/<secreto>)"
+                    if _url_secret() else "Auth: %s", _describir_auth())
     else:
         logger.warning(
             "Auth: NO HAY MCP_AUTH_TOKEN — el servidor acepta llamadas sin credenciales. "
@@ -304,7 +360,7 @@ def main() -> None:
     from starlette.middleware import Middleware
 
     app = mcp.http_app(
-        path="/mcp",
+        path=_mcp_path(),
         transport="streamable-http",
         middleware=[Middleware(BearerAuthMiddleware)],
     )

@@ -33,6 +33,11 @@ services:
       # y hay que agregar ese header en la configuracion del cliente MCP.
       - key: MCP_AUTH_TOKEN
         sync: false
+      # Secreto embebido en la URL del MCP (/mcp/<secreto>). Existe porque el
+      # conector de Cowork no permite configurar headers: solo acepta una URL.
+      # Sirve tambien como bearer para /audit. Se define a mano en Render.
+      - key: MCP_URL_SECRET
+        sync: false
 
       # --- Candados de escritura ----------------------------------------
       # Regla permanente de MyScrubs: los precios no los cambia un agente.

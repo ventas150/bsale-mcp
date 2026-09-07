@@ -214,3 +214,107 @@ def test_tope_de_cantidad_de_cambios():
         assert "tope" in str(e)
         return
     raise AssertionError("60 cambios en una llamada debe superar el tope de 50")
+
+
+# ============================================================
+# Candado por URL (el conector de Cowork no soporta headers)
+# ============================================================
+
+class _Req:
+    def __init__(self, headers=None, path="/mcp"):
+        self.headers = headers or {}
+        self.url = type("U", (), {"path": path})()
+
+
+def _limpiar_candado(monkeypatch):
+    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MCP_URL_SECRET", raising=False)
+
+
+def test_sin_candado_todo_pasa(monkeypatch):
+    import server
+    _limpiar_candado(monkeypatch)
+    assert not server._con_candado()
+    assert server._mcp_path() == "/mcp"
+    assert server._auth_ok(_Req())
+
+
+def test_url_secreta_cambia_la_ruta_del_mcp(monkeypatch):
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    assert server._mcp_path() == "/mcp/abc123"
+    assert server._con_candado()
+
+
+def test_el_secreto_de_la_url_sirve_como_bearer(monkeypatch):
+    """Asi Roberto administra UNA variable y /audit sigue siendo alcanzable."""
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    assert server._auth_ok(_Req({"authorization": "Bearer abc123"}))
+    assert not server._auth_ok(_Req({"authorization": "Bearer otro"}))
+    assert not server._auth_ok(_Req())
+
+
+def test_ambas_credenciales_conviven(monkeypatch):
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "por-url")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "por-header")
+    assert server._auth_ok(_Req({"authorization": "Bearer por-url"}))
+    assert server._auth_ok(_Req({"authorization": "Bearer por-header"}))
+    assert not server._auth_ok(_Req({"authorization": "Bearer nada"}))
+
+
+def test_health_nunca_se_bloquea(monkeypatch):
+    """Render usa /health para el deploy: si lo cerramos, hace rollback."""
+    import asyncio
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    mw = server.BearerAuthMiddleware(app=None)
+
+    async def _next(req):
+        return "PASO"
+
+    assert asyncio.run(mw.dispatch(_Req(path="/health"), _next)) == "PASO"
+
+
+def test_la_ruta_secreta_del_mcp_pasa_sin_header(monkeypatch):
+    import asyncio
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    mw = server.BearerAuthMiddleware(app=None)
+
+    async def _next(req):
+        return "PASO"
+
+    assert asyncio.run(mw.dispatch(_Req(path="/mcp/abc123"), _next)) == "PASO"
+    assert asyncio.run(mw.dispatch(_Req(path="/mcp/abc123/messages"), _next)) == "PASO"
+
+
+def test_la_ruta_vieja_y_una_adivinada_no_pasan(monkeypatch):
+    """El punto entero: /mcp a secas y /mcp/<otro> tienen que quedar fuera."""
+    import asyncio
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    mw = server.BearerAuthMiddleware(app=None)
+
+    async def _next(req):
+        return "PASO"
+
+    for ruta in ("/mcp", "/mcp/adivinado", "/audit"):
+        r = asyncio.run(mw.dispatch(_Req(path=ruta), _next))
+        assert r != "PASO", f"{ruta} no deberia pasar sin credencial"
+        assert getattr(r, "status_code", None) == 401
+
+
+def test_health_no_filtra_el_secreto(monkeypatch):
+    import server
+    _limpiar_candado(monkeypatch)
+    monkeypatch.setenv("MCP_URL_SECRET", "secreto-que-no-debe-salir")
+    assert "secreto-que-no-debe-salir" not in server._describir_auth()
+    assert server._describir_auth() == "url-secreta"
