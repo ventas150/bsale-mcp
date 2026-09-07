@@ -274,6 +274,12 @@ def register(mcp) -> None:  # noqa: ANN001
         d = documents_snapshot.c
         amt = signed_amount(d.total_amount, d.document_type_use)
         net = signed_amount(d.net_amount, d.document_type_use)
+        # count(*) contaba tambien las notas de credito, asi que
+        # documentos_de_venta salia inflado y cualquier ticket promedio
+        # calculado sobre el quedaba ~14% bajo. Se separan, como ya hacia
+        # bsale_venta_por_sucursal.
+        n_venta = func.count().filter(d.document_type_use != 1)
+        n_nc = func.count().filter(d.document_type_use == 1)
 
         where = [d.emission_date.between(start_dt, end_dt)]
         where += official_sale_conditions(documents_snapshot)
@@ -284,7 +290,8 @@ def register(mcp) -> None:  # noqa: ANN001
         with db_session() as s:
             total_row = s.execute(
                 select(
-                    func.count().label("docs"),
+                    n_venta.label("docs"),
+                    n_nc.label("nc"),
                     func.coalesce(func.sum(amt), 0.0).label("total"),
                     func.coalesce(func.sum(net), 0.0).label("neto"),
                 ).where(cond)
@@ -295,13 +302,15 @@ def register(mcp) -> None:  # noqa: ANN001
                     "office_id": r.office_id,
                     "office_name": (r.office_name or "").strip(),
                     "count": r.docs,
+                    "notas_de_credito": r.nc,
                     "amount": float(r.total or 0),
                 }
                 for r in s.execute(
                     select(
                         d.office_id,
                         d.office_name,
-                        func.count().label("docs"),
+                        n_venta.label("docs"),
+                        n_nc.label("nc"),
                         func.sum(amt).label("total"),
                     )
                     .where(cond)
@@ -339,7 +348,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 for r in s.execute(
                     select(
                         day.label("day"),
-                        func.count().label("docs"),
+                        n_venta.label("docs"),
                         func.sum(amt).label("total"),
                     )
                     .where(cond)
@@ -392,13 +401,34 @@ def register(mcp) -> None:  # noqa: ANN001
                     for r in rows
                 ]
 
+        # Frescura: un tool que lee el snapshot sin decir hasta cuando llega la
+        # carga puede devolver un mes corto con cara de completo si el cron
+        # murio. snapshot_lag_hours ya existia y solo la usaba /health.
+        try:
+            from db import snapshot_lag_hours
+
+            lag = snapshot_lag_hours()
+        except Exception:  # noqa: BLE001
+            lag = None
+
         return {
             "source": "snapshot",
+            "snapshot_lag_horas": round(lag, 1) if lag is not None else None,
+            "snapshot_advertencia": (
+                f"El snapshot tiene {round(lag, 1)}h de atraso: el periodo "
+                "reciente puede estar incompleto."
+                if lag is not None and lag > 26 else None
+            ),
             "period": {"start": start_date, "end": end_date},
             "office_id": office_id,
             "regla": "venta oficial = Boletas + Facturas + ND - NC (sin notas de venta, sin guias, sin anulados)",
             "reglas_aplicadas": official_sale_supported(documents_snapshot),
             "documentos_de_venta": total_row.docs,
+            "notas_de_credito": total_row.nc,
+            "ticket_promedio": (
+                round(float(total_row.total or 0) / total_row.docs)
+                if total_row.docs else None
+            ),
             "venta_oficial": float(total_row.total or 0),
             "venta_oficial_neta": float(total_row.neto or 0),
             "excluidos": {
@@ -431,12 +461,22 @@ def register(mcp) -> None:  # noqa: ANN001
         de por que difieren (documentos que faltan en el snapshot, documentos
         que sobran, montos distintos).
 
+        Maximo 92 dias por llamada: lee Bsale en vivo dentro del web service,
+        que es el mismo proceso que responde el healthcheck.
+
         Args:
             start_date: YYYY-MM-DD inicio.
             end_date: YYYY-MM-DD fin.
             office_id: Filtrar por sucursal.
             max_documents: Tope de documentos a leer de Bsale en vivo.
         """
+        from tools_analytics import _tope_de_rango
+
+        tope = _tope_de_rango(
+            start_date, end_date, 92, "conciliar mes a mes",
+        )
+        if tope:
+            return tope
         from bsale_client import doc_revenue_signed, get_client, is_official_sale
 
         start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)

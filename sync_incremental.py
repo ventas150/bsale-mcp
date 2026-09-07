@@ -122,7 +122,25 @@ def backfill_historico_step() -> dict[str, Any]:
         return {"hist": "completo", "cursor": cur}
     from snapshot import snapshot_documents_range
     start, nxt, nxt_ym = _month_bounds(cur)
-    res = snapshot_documents_range(start, nxt, max_pages=200)
+    # 200 paginas eran 10.000 documentos, y los meses de MyScrubs llegan a
+    # 14.400 (marzo-2025). snapshot_documents_range SI declara el truncado; el
+    # que lo ignoraba era este llamador, que avanzaba el cursor igual. Como
+    # HIST_END cierra el recorrido, el mes quedaba con un hueco PERMANENTE que
+    # nadie volvia a mirar: asi se perdieron 4.101 documentos de marzo-2025
+    # ($239,6 millones, el 45,9% del mes).
+    res = snapshot_documents_range(start, nxt, max_pages=1200)
+    if res.get("truncado"):
+        # No avanzar: dejar el cursor donde esta para reintentar este mes.
+        return {
+            "hist_mes": cur,
+            "rows": res.get("rows"),
+            "next_cursor": cur,
+            "hist_error": (
+                f"{cur} quedo TRUNCADO ({res.get('documentos_leidos')} de "
+                f"{res.get('documentos_en_bsale')} documentos). El cursor NO "
+                "avanza: se reintenta el mismo mes en la proxima corrida."
+            ),
+        }
     _hist_cursor_set(nxt_ym)
     return {"hist_mes": cur, "rows": res.get("rows"), "next_cursor": nxt_ym}
 

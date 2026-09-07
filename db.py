@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -205,30 +206,64 @@ _engine: Engine | None = None
 _SessionMaker = None
 
 
+_engine_lock = threading.Lock()
+_sessionmaker_lock = threading.Lock()
+
+
 def get_engine() -> Engine:
-    """Lazy init del engine."""
+    """Lazy init del engine, con timeouts y bajo lock.
+
+    Timeouts: sin ellos, si Postgres deja de responder a nivel de red (agujero
+    negro, no RST), engine.connect() se cuelga en el TCP connect del sistema
+    operativo — minutos. Como /health llama esto de forma SINCRONA dentro de
+    una corrutina, ese cuelgue bloquea el event loop entero de uvicorn: deja de
+    responder TODO, /health incluido, y Render reinicia. Al arrancar vuelve a
+    pasar lo mismo. Con connect_timeout la base caida degrada en vez de tumbar.
+
+    Lock: el `if _engine is None` era check-then-act. Varios tools llegando en
+    paralelo en frio (lo normal tras cada redeploy) podian crear dos Engine, y
+    el huerfano se quedaba con su pool de hasta 15 conexiones abiertas y sin
+    dispose(): una fuga silenciosa contra el limite de conexiones de Render.
+    """
     global _engine
-    if _engine is None:
+    if _engine is not None:
+        return _engine
+    with _engine_lock:
+        if _engine is not None:
+            return _engine
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL no esta configurado")
         # Render Postgres viene con postgres:// pero SQLAlchemy quiere postgresql://
         url = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "20000"))
         _engine = create_engine(
             url,
             pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
             pool_pre_ping=True,
+            # Esperar por una conexion del pool tampoco puede ser infinito.
+            pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "8")),
+            pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
+            connect_args={
+                "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
+                # Una consulta pesada no puede ocupar una de las 5 conexiones
+                # para siempre (un count(*) sobre 7,4M filas, por ejemplo).
+                "options": f"-c statement_timeout={statement_timeout_ms}",
+            },
         )
     return _engine
 
 
 def get_session_maker():
-    """Devuelve el sessionmaker."""
+    """Devuelve el sessionmaker (bajo lock, misma razon que get_engine)."""
     global _SessionMaker
-    if _SessionMaker is None:
-        _SessionMaker = sessionmaker(bind=get_engine(), expire_on_commit=False)
+    if _SessionMaker is not None:
+        return _SessionMaker
+    with _sessionmaker_lock:
+        if _SessionMaker is None:
+            _SessionMaker = sessionmaker(bind=get_engine(), expire_on_commit=False)
     return _SessionMaker
 
 

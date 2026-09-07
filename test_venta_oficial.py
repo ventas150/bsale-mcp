@@ -620,3 +620,79 @@ def test_el_cache_degrada_en_vez_de_tumbar_el_arranque(monkeypatch, tmp_path):
     c.set("k", {"v": 1}, 900)
     assert c.get("k") == {"v": 1}
     assert hasattr(c, "_lock") and hasattr(c, "_data")
+
+
+# ============================================================
+# Lote de la auditoria: cada arreglo con su regresion
+# ============================================================
+
+def test_redact_censura_en_estructuras_anidadas():
+    """Antes solo miraba el primer nivel, y los bodies de escritura son
+    anidados. El audit va a stdout -> logs de Render -> Sentry."""
+    import audit
+
+    r = audit._redact(
+        {"ok": 1, "body": {"token": "x", "items": [{"secret": "y", "n": 2}]}}
+    )
+    assert r["body"]["token"] == "***REDACTED***"
+    assert r["body"]["items"][0]["secret"] == "***REDACTED***"
+    assert r["body"]["items"][0]["n"] == 2
+    assert r["ok"] == 1
+
+
+def test_audit_rota_y_no_lee_el_archivo_entero(tmp_path, monkeypatch):
+    import audit
+
+    monkeypatch.setattr(audit, "AUDIT_DIR", tmp_path)
+    monkeypatch.setattr(audit, "AUDIT_FILE", tmp_path / "writes.jsonl")
+    monkeypatch.setattr(audit, "MAX_BYTES", 2000)
+
+    for i in range(400):
+        audit.audit_log("POST", f"/v1/x/{i}.json", body={"n": i})
+
+    # rotó: existe el .1 y el activo no crecio sin control
+    assert (tmp_path / "writes.jsonl.1").exists()
+    assert (tmp_path / "writes.jsonl").stat().st_size <= 2000 * 3
+
+    ev = audit.read_recent(limit=5)
+    assert len(ev) <= 5
+    assert all("method" in e for e in ev)
+    # limite absurdo: no debe reventar ni devolver todo
+    assert len(audit.read_recent(limit=-5)) <= 1000
+
+
+def test_tope_de_rango_rechaza_periodos_largos():
+    ta = pytest.importorskip("tools_analytics")
+
+    assert ta._tope_de_rango("2025-01-01", "2025-12-31", 92) is not None
+    assert ta._tope_de_rango("2026-08-01", "2026-08-31", 92) is None
+    # fechas invertidas
+    malo = ta._tope_de_rango("2026-08-31", "2026-08-01", 92)
+    assert malo is not None and "anterior" in str(malo)
+
+
+def test_engine_tiene_timeouts_configurados():
+    """Sin timeouts, una base que no responde a nivel de red cuelga el event
+    loop de uvicorn y Render reinicia en bucle."""
+    import inspect
+
+    import db
+
+    src = inspect.getsource(db.get_engine)
+    for esperado in ("connect_timeout", "pool_timeout", "statement_timeout"):
+        assert esperado in src, f"falta {esperado} en get_engine"
+    # y la creacion tiene que estar bajo lock (era check-then-act)
+    assert "_engine_lock" in src
+
+
+def test_health_no_bloquea_el_event_loop():
+    """Las llamadas sincronas a la base tienen que ir a un hilo con tope."""
+    import inspect
+
+    import server
+
+    src = inspect.getsource(server.health_check)
+    assert "_con_limite" in src, "health debe usar el wrapper con timeout"
+    # y no debe filtrar internals
+    for prohibido in ("cache_file", "db_error", "escritura_precios"):
+        assert prohibido not in src, f"/health no debe exponer {prohibido}"

@@ -159,9 +159,35 @@ def _describir_auth() -> str:
 # Health & Diagnostics
 # ============================
 
+async def _con_limite(fn, segundos: float):
+    """Corre una funcion SINCRONA en un hilo, con tope de tiempo.
+
+    /health es una corrutina, pero db_health(), snapshot_lag_hours() y
+    get_cache().stats() son sincronas y hacen I/O. Llamarlas directo bloquea el
+    event loop de uvicorn: si Postgres deja de responder a nivel de red, no se
+    atiende NADA, /health incluido, y Render reinicia en bucle. Aca el hilo
+    puede quedarse colgado, pero el event loop sigue vivo y el healthcheck
+    responde igual.
+    """
+    import asyncio
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn), timeout=segundos)
+    except Exception:  # noqa: BLE001  (incluye TimeoutError)
+        return None
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):  # noqa: ARG001
-    """Healthcheck profundo. Render lo usa para autoDeploy."""
+    """Healthcheck para Render. Liviano y sin detalles internos a proposito.
+
+    Lo que se saco del body y por que: `escritura_precios` le decia a cualquiera
+    en internet CUANDO esta abierta la ventana de escritura de precios — justo
+    el momento a atacar. `cache_file` exponia rutas del filesystem, y los
+    str(e) de la conexion a Postgres traen host, puerto y usuario. Todo ese
+    detalle sigue disponible en /health/deep y /health/data, que estan detras
+    del candado.
+    """
     from starlette.responses import JSONResponse
 
     status: dict = {
@@ -169,49 +195,36 @@ async def health_check(request):  # noqa: ARG001
         "service": "bsale-mcp-myscrubs",
         "version": "0.3.0",
         "auth": _describir_auth(),
-        "escritura_precios": "habilitada" if os.getenv("BSALE_PRICE_WRITES_ENABLED", "0") in ("1","true","yes","on") else "bloqueada por politica",
     }
-    code = 200
 
-    # Verifica que el cliente Bsale arranca (no requiere golpear API)
-    try:
+    # Que el cliente Bsale se pueda construir (no golpea la API)
+    def _cliente_ok():
         from bsale_client import get_client
 
-        client = get_client()
-        status["bsale_client"] = client.health_status()
-    except Exception as e:  # noqa: BLE001
+        get_client()
+        return True
+
+    if await _con_limite(_cliente_ok, 3) is not True:
         status["status"] = "degraded"
-        status["bsale_client_error"] = str(e)[:200]
-        code = 503
+        status["motivo"] = "no se pudo inicializar el cliente de Bsale"
+        # 200 igual: un 503 aca hace que Render reinicie el servicio, y si el
+        # problema es Bsale o la base, reiniciar no arregla nada y solo agrega
+        # una caida. El detalle esta en /health/deep.
+        return JSONResponse(status, status_code=200)
 
-    # Cache stats
-    try:
-        from cache import get_cache
-
-        status["cache"] = get_cache().stats()
-    except Exception as e:  # noqa: BLE001
-        status["cache_error"] = str(e)[:200]
-
-    # DB + frescura del snapshot si aplica
     if os.getenv("DATABASE_URL"):
-        try:
-            from db import db_health, snapshot_lag_hours
+        def _lag():
+            from db import snapshot_lag_hours
 
-            status["db"] = db_health()
-            lag = snapshot_lag_hours()
-            status["snapshot_lag_hours"] = round(lag, 1) if lag is not None else None
-            # Si el snapshot quedo viejo (>26h), marcar degraded para alertar.
-            if lag is not None and lag > 26:
-                # degraded en el body, pero 200: `healthCheckPath: /health` en
-                # render.yaml interpreta un 503 como "servicio caido" y hace
-                # rollback del deploy o reinicia el servicio por un problema de
-                # DATOS. La alerta va en el body y en /health/data.
-                status["status"] = "degraded"
-                status["motivo"] = f"snapshot con {round(lag,1)}h de atraso"
-        except Exception as e:  # noqa: BLE001
-            status["db_error"] = str(e)[:200]
+            return snapshot_lag_hours()
 
-    return JSONResponse(status, status_code=code)
+        lag = await _con_limite(_lag, 3)
+        status["snapshot_lag_hours"] = round(lag, 1) if lag is not None else None
+        if lag is not None and lag > 26:
+            status["status"] = "degraded"
+            status["motivo"] = f"snapshot con {round(lag,1)}h de atraso"
+
+    return JSONResponse(status, status_code=200)
 
 @mcp.custom_route("/health/data", methods=["GET"])
 async def health_data(request):  # noqa: ARG001
@@ -244,11 +257,34 @@ async def health_check_deep(request):  # noqa: ARG001
 
     client = get_client()
     bsale_ok = client.ping()
-    return JSONResponse({
+    out = {
         "status": "ok" if bsale_ok else "degraded",
         "bsale_reachable": bsale_ok,
         "bsale_client": client.health_status(),
-    }, status_code=200 if bsale_ok else 503)
+        "escritura_precios": (
+            "habilitada"
+            if os.getenv("BSALE_PRICE_WRITES_ENABLED", "0") in ("1", "true", "yes", "on")
+            else "bloqueada por politica"
+        ),
+    }
+    # Detalle que antes vivia en /health y ahora vive aca, detras del candado:
+    # rutas del filesystem y errores de conexion con host/puerto/usuario.
+    try:
+        from cache import get_cache
+
+        out["cache"] = get_cache().stats()
+    except Exception as e:  # noqa: BLE001
+        out["cache_error"] = str(e)[:200]
+    if os.getenv("DATABASE_URL"):
+        try:
+            from db import db_health, snapshot_lag_hours
+
+            out["db"] = db_health()
+            lag = snapshot_lag_hours()
+            out["snapshot_lag_hours"] = round(lag, 1) if lag is not None else None
+        except Exception as e:  # noqa: BLE001
+            out["db_error"] = str(e)[:200]
+    return JSONResponse(out, status_code=200 if bsale_ok else 503)
 
 @mcp.custom_route("/audit", methods=["GET"])
 async def audit_endpoint(request):  # noqa: ARG001

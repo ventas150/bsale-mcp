@@ -362,7 +362,11 @@ class BsaleClient:
 
         # Si salimos del loop sin return, todos los retries fallaron
         if last_exc:
-            self._last_error = "EXHAUSTED_RETRIES"
+            # Bajo lock, como el resto: escribirlo suelto desde varios hilos
+            # dejaba que un _bump(success=True) de otro worker lo pisara con
+            # None, y el healthcheck reportaba "sin errores" justo durante la
+            # tanda de 429 que agoto los reintentos.
+            self._bump("noop", error="EXHAUSTED_RETRIES")
             raise last_exc
         raise BsaleError("Request fallo sin razon determinada")
 

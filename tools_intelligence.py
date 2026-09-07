@@ -18,11 +18,117 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from bsale_client import doc_revenue_signed, get_client, is_sales_doc, iso_to_epoch_range
+from bsale_client import (
+    doc_revenue_signed,
+    get_client,
+    is_official_sale,
+    is_sales_doc,
+    is_sales_note,
+    iso_to_epoch_range,
+)
 
 logger = logging.getLogger(__name__)
 
 _USE_DB = bool(os.getenv("DATABASE_URL"))
+
+
+# ============================================================
+# Helper compartido de velocity (tools EN VIVO)
+# ============================================================
+# Los tres tools que calculan velocity leyendo Bsale documento por documento
+# (quiebres, allocation, proyeccion de compras) repetian los mismos tres
+# errores. Se centralizan aca para que no vuelvan a divergir:
+#
+#   1. Filtraban con is_sales_doc, que solo saca las guias. Las NOTAS DE VENTA
+#      seguian entrando y el canal web se contaba dos veces (PEDIDO WEB +
+#      boleta del mismo pedido).
+#   2. `if qty > 0` hacia que las lineas de NOTA DE CREDITO sumaran en
+#      POSITIVO: una devolucion aumentaba la velocity del producto devuelto.
+#   3. Leian una muestra (docs[:500]) pero dividian por lookback_days completo,
+#      sin declarar el muestreo. Con ~4.500 documentos en 30 dias eso subestima
+#      la velocity ~9x, y nadie se enteraba.
+#
+# El (3) no se puede "arreglar" leyendo mas: es 1 request por documento. Lo que
+# se hace es DECLARARLO y escalar la velocity por la cobertura real, con la
+# advertencia de que asume uniformidad. Para numeros exactos estan las
+# versiones _fast, que leen el snapshot.
+
+CAP_DOCS_DETALLE = 500
+"""Cuantos documentos se abren para leer sus lineas. Es 1 request HTTP por
+documento: subirlo alarga el bloqueo del hilo y acerca el 429."""
+
+
+def _velocity_en_vivo(client, docs, cap=CAP_DOCS_DETALLE, por_sucursal=False,
+                      variant_id=None):
+    """Suma unidades por variante leyendo el detalle de una MUESTRA de docs.
+
+    Devuelve (velocity, cobertura). `velocity` es {variant_id: unidades} o,
+    con por_sucursal=True, {office_id: unidades} para `variant_id`.
+    Las notas de credito RESTAN.
+    """
+    from collections import defaultdict as _dd
+
+    oficiales = [d for d in docs if is_official_sale(d)]
+    notas_de_venta = sum(1 for d in docs if is_sales_doc(d) and is_sales_note(d))
+    muestra = oficiales[:cap]
+
+    velocity = _dd(float)
+    analizados = 0
+    fallidos = 0
+    for doc in muestra:
+        doc_id = doc.get("id")
+        if not doc_id:
+            continue
+        oid = (doc.get("office") or {}).get("id", 0)
+        if por_sucursal and not oid:
+            continue
+        es_nc = (doc.get("document_type") or {}).get("use") == 1
+        signo = -1.0 if es_nc else 1.0
+        try:
+            detalle = client.paginated_fetch(
+                f"/v1/documents/{doc_id}/details.json",
+                params={"limit": 50, "expand": "[variant]"},
+                max_items=1000,
+            )
+        except Exception:  # noqa: BLE001
+            fallidos += 1
+            continue
+        for d in detalle["items"]:
+            v = d.get("variant") or {}
+            vid = v.get("id")
+            if not vid:
+                continue
+            qty = float(d.get("quantity", 0) or 0) * signo
+            if por_sucursal:
+                if vid == variant_id:
+                    velocity[oid] += qty
+            else:
+                velocity[vid] += qty
+        analizados += 1
+
+    cobertura = {
+        "documentos_de_venta_en_el_periodo": len(oficiales),
+        "documentos_analizados": analizados,
+        "documentos_que_fallaron": fallidos,
+        "excluidos_notas_de_venta": notas_de_venta,
+        "cobertura_pct": (
+            round(100 * analizados / len(oficiales), 1) if oficiales else 0.0
+        ),
+        "muestreado": analizados < len(oficiales),
+    }
+    factor = (len(oficiales) / analizados) if analizados else 1.0
+    if cobertura["muestreado"]:
+        cobertura["factor_de_escala_aplicado"] = round(factor, 2)
+        cobertura["advertencia"] = (
+            f"Solo se leyo el detalle de {analizados} de "
+            f"{len(oficiales)} documentos ({cobertura['cobertura_pct']}%). La "
+            "velocity se escalo por la cobertura, lo que ASUME que los "
+            "documentos no leidos se parecen a los leidos. Para numeros "
+            "exactos usar la version _fast, que lee el snapshot."
+        )
+        for k in list(velocity):
+            velocity[k] *= factor
+    return velocity, cobertura
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -92,33 +198,14 @@ def register(mcp) -> None:  # noqa: ANN001
         if office_id:
             sales_params["officeid"] = office_id
 
-        docs = client.paginated_get("/v1/documents.json", params=sales_params, max_pages=100)
+        fetch_docs = client.paginated_fetch(
+            "/v1/documents.json", params=sales_params, max_items=40000
+        )
+        docs = fetch_docs["items"]
 
-        # Por cada doc, leer details
-        velocity: dict[int, float] = defaultdict(float)  # variant_id -> total_units
-        analyzed_docs = 0
-        for doc in docs[:500]:  # cap razonable
-            doc_id = doc.get("id")
-            if not doc_id:
-                continue
-            # Excluir guias de despacho (no son ventas reales)
-            if not is_sales_doc(doc):
-                continue
-            try:
-                details = client.get(
-                    f"/v1/documents/{doc_id}/details.json",
-                    params={"limit": 50, "expand": "[variant]"},
-                    use_cache=False,
-                )
-                for d in details.get("items", []):
-                    v = d.get("variant") or {}
-                    vid = v.get("id")
-                    qty = float(d.get("quantity", 0) or 0)
-                    if vid and qty > 0:
-                        velocity[vid] += qty
-                analyzed_docs += 1
-            except Exception:  # noqa: BLE001
-                continue
+        velocity, cobertura_velocity = _velocity_en_vivo(client, docs)
+        cobertura_velocity["documentos_truncados"] = bool(fetch_docs.get("truncated"))
+        analyzed_docs = cobertura_velocity["documentos_analizados"]
 
         # 3. Proyeccion
         risks = []
@@ -147,6 +234,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "office_id": office_id,
             "analyzed_documents": analyzed_docs,
+            "cobertura_velocity": cobertura_velocity,
             "total_at_risk": len(risks),
             "risks": risks,
         }
@@ -206,27 +294,11 @@ def register(mcp) -> None:  # noqa: ANN001
             max_pages=100,
         )
 
-        for doc in docs[:500]:
-            doc_id = doc.get("id")
-            office = doc.get("office") or {}
-            oid = office.get("id", 0)
-            if not doc_id or not oid:
-                continue
-            # Excluir guias de despacho
-            if not is_sales_doc(doc):
-                continue
-            try:
-                details = client.get(
-                    f"/v1/documents/{doc_id}/details.json",
-                    params={"limit": 50, "expand": "[variant]"},
-                    use_cache=False,
-                )
-                for d in details.get("items", []):
-                    v = d.get("variant") or {}
-                    if v.get("id") == variant_id:
-                        velocity_by_office[oid] += float(d.get("quantity", 0) or 0)
-            except Exception:  # noqa: BLE001
-                continue
+        vel_por_oficina, cobertura_velocity = _velocity_en_vivo(
+            client, docs, por_sucursal=True, variant_id=variant_id
+        )
+        for _oid, _q in vel_por_oficina.items():
+            velocity_by_office[_oid] += _q
 
         # 3. Dias de cobertura por sucursal
         rows = []
@@ -279,6 +351,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "variant_id": variant_id,
             "lookback_days": lookback_days,
             "current_state": rows,
+            "cobertura_velocity": cobertura_velocity,
             "suggestions": suggestions,
         }
 
@@ -333,30 +406,13 @@ def register(mcp) -> None:  # noqa: ANN001
             "state": 0,
             "expand": "[document_type]",
         }
-        docs = client.paginated_get("/v1/documents.json", params=sales_params, max_pages=150)
+        fetch_docs = client.paginated_fetch(
+            "/v1/documents.json", params=sales_params, max_items=40000
+        )
+        docs = fetch_docs["items"]
 
-        velocity: dict[int, float] = defaultdict(float)
-        for doc in docs[:1000]:
-            doc_id = doc.get("id")
-            if not doc_id:
-                continue
-            # Excluir guias de despacho
-            if not is_sales_doc(doc):
-                continue
-            try:
-                details = client.get(
-                    f"/v1/documents/{doc_id}/details.json",
-                    params={"limit": 50, "expand": "[variant]"},
-                    use_cache=False,
-                )
-                for d in details.get("items", []):
-                    v = d.get("variant") or {}
-                    vid = v.get("id")
-                    qty = float(d.get("quantity", 0) or 0)
-                    if vid and qty > 0:
-                        velocity[vid] += qty
-            except Exception:  # noqa: BLE001
-                continue
+        velocity, cobertura_velocity = _velocity_en_vivo(client, docs)
+        cobertura_velocity["documentos_truncados"] = bool(fetch_docs.get("truncated"))
 
         # 3. Proyeccion
         recommendations = []
@@ -386,6 +442,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "producttypeid": producttypeid,
             "total_recommendations": len(recommendations),
+            "cobertura_velocity": cobertura_velocity,
             "recommendations": recommendations[:100],
         }
 
@@ -396,11 +453,21 @@ def register(mcp) -> None:  # noqa: ANN001
     @mcp.tool()
     def bsale_ranking_sucursales(
         days_back: int = 30,
+        max_documents: int = 40000,
     ) -> dict[str, Any]:
         """Ranking de sucursales por revenue, ticket promedio, y volumen de docs.
 
+        Lee Bsale EN VIVO. Para periodos largos preferir
+        bsale_ranking_sucursales_fast, que lee el snapshot y es sub-segundo.
+
+        Venta oficial = Boletas + Facturas + ND - NC. Excluye guias, notas de
+        venta / pedidos web / cotizaciones y anulados. `doc_count` cuenta solo
+        documentos de venta; las notas de credito van aparte.
+
         Args:
             days_back: Ventana de analisis (default 30d).
+            max_documents: Tope de documentos a leer. Si se alcanza, la
+                respuesta lo declara en `truncado`.
         """
         client = get_client()
         end_date = datetime.now(timezone.utc).date()
@@ -412,33 +479,54 @@ def register(mcp) -> None:  # noqa: ANN001
             "state": 0,
             "expand": "[office,document_type]",
         }
-        docs = client.paginated_get("/v1/documents.json", params=params, max_pages=100)
+        # paginated_fetch, no paginated_get: este ultimo topaba en 100 paginas
+        # (5.000 documentos) y devolvia el parcial sin avisar. Con ~4.500
+        # documentos mensuales, cualquier ventana de mas de 30 dias se cortaba.
+        fetch = client.paginated_fetch(
+            "/v1/documents.json", params=params, max_items=max_documents
+        )
+        docs = fetch["items"]
 
         by_office: dict[int, dict[str, Any]] = defaultdict(
-            lambda: {"office_name": "", "revenue": 0.0, "doc_count": 0, "tickets": []}
+            lambda: {"office_name": "", "revenue": 0.0, "doc_count": 0,
+                     "nc_count": 0, "tickets": []}
         )
+        excluidas_notas_de_venta = 0
 
         for doc in docs:
-            # Excluir guias de despacho - no son ventas
-            if not is_sales_doc(doc):
+            # Antes filtraba con is_sales_doc, que solo saca las guias: las
+            # NOTAS DE VENTA seguian entrando y el canal web se contaba dos
+            # veces (PEDIDO WEB + boleta del mismo pedido). Contra la version
+            # _fast daban $24,8 millones de diferencia sobre 30 dias.
+            if is_sales_doc(doc) and is_sales_note(doc):
+                excluidas_notas_de_venta += 1
+            if not is_official_sale(doc):
                 continue
             o = doc.get("office") or {}
             oid = o.get("id", 0)
             amount = doc_revenue_signed(doc)  # notas credito = negativo
             by_office[oid]["office_name"] = o.get("name", "?")
             by_office[oid]["revenue"] += amount
-            by_office[oid]["doc_count"] += 1
-            by_office[oid]["tickets"].append(amount)
+            if amount < 0:
+                by_office[oid]["nc_count"] += 1
+            else:
+                by_office[oid]["doc_count"] += 1
+                by_office[oid]["tickets"].append(amount)
 
         ranking = []
         for oid, data in by_office.items():
+            # tickets solo trae documentos de venta: antes incluia las notas de
+            # credito, asi que `min_ticket` era siempre la devolucion mas grande
+            # (un numero negativo) presentada como "ticket minimo".
             tickets = data["tickets"]
+            docs_venta = data["doc_count"]
             ranking.append({
                 "office_id": oid,
                 "office_name": data["office_name"],
                 "revenue": data["revenue"],
-                "doc_count": data["doc_count"],
-                "avg_ticket": data["revenue"] / data["doc_count"] if data["doc_count"] else 0,
+                "doc_count": docs_venta,
+                "notas_de_credito": data["nc_count"],
+                "avg_ticket": data["revenue"] / docs_venta if docs_venta else 0,
                 "max_ticket": max(tickets) if tickets else 0,
                 "min_ticket": min(tickets) if tickets else 0,
             })
@@ -450,11 +538,23 @@ def register(mcp) -> None:  # noqa: ANN001
         for r in ranking:
             r["share_pct"] = round(r["revenue"] / total_rev * 100, 2) if total_rev else 0
 
-        return {
+        out = {
             "period_days": days_back,
+            "regla": "venta oficial = Boletas + Facturas + ND - NC",
             "total_revenue": total_rev,
             "ranking": ranking,
+            "documentos_leidos": fetch.get("fetched"),
+            "documentos_en_bsale": fetch.get("total_count"),
+            "excluidos": {"notas_de_venta": excluidas_notas_de_venta},
+            "truncado": bool(fetch.get("truncated")),
         }
+        if out["truncado"]:
+            out["advertencia"] = (
+                "TRUNCADO: no se leyeron todos los documentos del periodo, el "
+                "ranking esta INCOMPLETO. Subir max_documents o usar "
+                "bsale_ranking_sucursales_fast, que lee el snapshot."
+            )
+        return out
 
     # ============================
     # SEGMENTACION RFM

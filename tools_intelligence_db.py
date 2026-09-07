@@ -19,11 +19,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from sqlalchemy import and_, desc, exists, func, not_, select, text
 
 from bsale_client import get_client
+from digests import TZ_NEGOCIO
 from db import (
     document_details_snapshot,
     documents_snapshot,
@@ -83,6 +85,48 @@ def _detalle_de_venta_oficial():
             *official_sale_conditions(documents_snapshot),
         )
     )
+
+
+def cobertura_de_detalle(desde, hasta, office_id=None) -> dict[str, Any]:
+    """Que porcentaje de los documentos del periodo tiene detalle de linea.
+
+    document_details_snapshot se llena documento por documento y NO cubre todo
+    el historico: 2025 completo tiene cero lineas. Sin esto, un tool que agrega
+    lineas devuelve lista VACIA para un periodo sin detalle, que se lee como
+    "no se vendio nada" en vez de "no tengo el dato". Verificado el
+    07-sep-2026: top_productos_fast devolvia [] para marzo-2025, un mes de
+    $521 millones.
+    """
+    d = documents_snapshot.c
+    det = document_details_snapshot.c
+    cond_doc = [d.emission_date.between(desde, hasta), *official_sale_conditions(documents_snapshot)]
+    cond_det = [det.emission_date.between(desde, hasta)]
+    if office_id:
+        cond_doc.append(d.office_id == office_id)
+        cond_det.append(det.office_id == office_id)
+    with db_session() as s:
+        total = s.execute(
+            select(func.count()).select_from(documents_snapshot).where(and_(*cond_doc))
+        ).scalar() or 0
+        con_det = s.execute(
+            select(func.count(func.distinct(det.document_id)))
+            .select_from(document_details_snapshot)
+            .where(and_(*cond_det))
+        ).scalar() or 0
+    pct = round(100 * con_det / total, 1) if total else 0.0
+    out = {
+        "documentos_del_periodo": total,
+        "documentos_con_detalle": con_det,
+        "pct": pct,
+    }
+    if pct < 99:
+        out["advertencia"] = (
+            f"Solo el {pct}% de los documentos del periodo tiene detalle de "
+            "linea cargado. Las UNIDADES estan subestimadas y NO sirven para "
+            "comparar con otro periodo. Los PESOS a nivel de documento si son "
+            "completos. Para corregir: bsale_snapshot_details_batch."
+        )
+    return out
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -713,7 +757,11 @@ def register(mcp) -> None:  # noqa: ANN001
             lookback_days: Ventana para top_sellers y ranking (default 7d).
         """
         now = datetime.now(timezone.utc)
-        yesterday = now.date() - timedelta(days=1)
+        # "Ayer" es ayer EN CHILE, no en UTC. Entre las 21:00 y la medianoche
+        # de Santiago ya es el dia siguiente en UTC, asi que el briefing
+        # mostraba las ventas de HOY (parciales) rotuladas como las de ayer.
+        # Mismo criterio que digests.TZ_NEGOCIO.
+        yesterday = now.astimezone(ZoneInfo(TZ_NEGOCIO)).date() - timedelta(days=1)
         week_ago = now.date() - timedelta(days=lookback_days)
         lookback30_cutoff = now - timedelta(days=30)
 
@@ -914,6 +962,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "source": "snapshot",
             "period": {"from": date_from, "to": date_to},
             "office_id": office_id,
+            "cobertura_detalle": cobertura_de_detalle(start_dt, end_dt, office_id),
             "top_products": top,
         }
 

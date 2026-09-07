@@ -99,34 +99,80 @@ def audit_log(
     # Tambien a disco
     with _lock:
         try:
+            _rotar_si_hace_falta()
             with AUDIT_FILE.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError as e:
             logger.warning("No se pudo escribir audit log a disco: %s", e)
 
 
-def _redact(data: dict[str, Any]) -> dict[str, Any]:
-    """Censura campos sensibles del log."""
-    sensitive_keys = {"password", "token", "access_token", "secret", "api_key"}
-    redacted = {}
-    for k, v in data.items():
-        if k.lower() in sensitive_keys:
-            redacted[k] = "***REDACTED***"
-        else:
-            redacted[k] = v
-    return redacted
+_SENSIBLES = {
+    "password", "token", "access_token", "secret", "api_key",
+    "authorization", "apikey", "clientsecret", "client_secret",
+    "mcp_auth_token", "mcp_url_secret",
+}
+
+
+def _redact(data: Any, _prof: int = 0) -> Any:
+    """Censura campos sensibles, TAMBIEN dentro de estructuras anidadas.
+
+    Antes solo recorria el primer nivel, y los bodies de escritura son
+    anidados ({"details": [...]}). El audit va tambien a stdout y de ahi a los
+    logs de Render y a Sentry, asi que cualquier campo sensible enterrado
+    quedaba en claro.
+    """
+    if _prof > 8:
+        return "***PROFUNDIDAD_MAXIMA***"
+    if isinstance(data, dict):
+        return {
+            k: ("***REDACTED***" if str(k).lower() in _SENSIBLES
+                else _redact(v, _prof + 1))
+            for k, v in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_redact(v, _prof + 1) for v in data]
+    return data
+
+
+MAX_BYTES = int(os.getenv("AUDIT_MAX_BYTES", str(20 * 1024 * 1024)))
+"""Tamano al que se rota el audit log. El disco de Render es de 1 GB y lo
+comparte con el cache."""
+
+_COLA_BYTES = 2 * 1024 * 1024
+"""Cuanto se lee desde el final en read_recent. Antes se hacia f.readlines()
+del archivo COMPLETO y se descartaba todo menos las ultimas N lineas: con un
+log de cientos de MB, un GET /audit intentaba cargarlo entero en 512 MB de
+RAM."""
+
+
+def _rotar_si_hace_falta() -> None:
+    """Rota el log cuando pasa MAX_BYTES. Sin esto crecia sin limite."""
+    try:
+        if AUDIT_FILE.exists() and AUDIT_FILE.stat().st_size > MAX_BYTES:
+            previo = AUDIT_FILE.with_suffix(".jsonl.1")
+            previo.unlink(missing_ok=True)
+            AUDIT_FILE.rename(previo)
+            logger.info("Audit log rotado a %s", previo)
+    except OSError as e:
+        logger.warning("No se pudo rotar el audit log: %s", e)
 
 
 def read_recent(limit: int = 50) -> list[dict[str, Any]]:
-    """Lee los ultimos N eventos del audit log."""
+    """Lee los ultimos N eventos del audit log, sin cargarlo entero."""
+    limit = max(1, min(int(limit), 1000))
     if not AUDIT_FILE.exists():
         return []
     with _lock:
         try:
-            with AUDIT_FILE.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
+            tam = AUDIT_FILE.stat().st_size
+            with AUDIT_FILE.open("rb") as f:
+                if tam > _COLA_BYTES:
+                    f.seek(tam - _COLA_BYTES)
+                    f.readline()  # descartar la linea partida por el seek
+                crudo = f.read()
         except OSError:
             return []
+    lines = crudo.decode("utf-8", errors="replace").splitlines()
     events = []
     for line in lines[-limit:]:
         try:

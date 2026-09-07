@@ -46,6 +46,39 @@ def _truncation_note(fetch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _tope_de_rango(start_date: str, end_date: str, max_dias: int = 92,
+                   alternativa: str = "") -> dict | None:
+    """Rechaza rangos largos. Devuelve el dict de error, o None si esta OK.
+
+    Estos tools leen Bsale EN VIVO desde el web service, que es el mismo
+    proceso que responde /health. El 07-sep-2026 un backfill de 46.738
+    documentos dejo sin responder el healthcheck y Render reinicio la
+    instancia. Ademas 40.000 documentos parseados son 150-250 MB de dicts
+    vivos a la vez, en una instancia de 512 MB.
+    """
+    from datetime import date
+
+    try:
+        d1 = date.fromisoformat(start_date)
+        d2 = date.fromisoformat(end_date)
+    except ValueError:
+        return {"error": "Fechas invalidas, usar YYYY-MM-DD."}
+    if d2 < d1:
+        return {"error": f"end_date ({end_date}) es anterior a start_date ({start_date})."}
+    dias = (d2 - d1).days + 1
+    if dias > max_dias:
+        return {
+            "aplicado": False,
+            "motivo": (
+                f"Rango de {dias} dias. El tope es {max_dias} porque este tool "
+                "lee Bsale en vivo DENTRO del web service, el mismo proceso que "
+                "responde el healthcheck de Render."
+            ),
+            "alternativa": alternativa or "partirlo en tramos mas cortos",
+        }
+    return None
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de analitica."""
 
@@ -69,7 +102,16 @@ def register(mcp) -> None:  # noqa: ANN001
                 respuesta lo declara en `truncado`.
             incluir_notas_de_venta: Solo para diagnostico. La venta oficial
                 NUNCA las incluye; esto agrega un bloque aparte con su monto.
+
+        Maximo 92 dias por llamada (ver _tope_de_rango). Para periodos largos
+        usar bsale_ventas_fast, que lee el snapshot y no toca Bsale.
         """
+        tope = _tope_de_rango(
+            start_date, end_date, 92,
+            "bsale_ventas_fast(start_date, end_date), que lee el snapshot",
+        )
+        if tope:
+            return tope
         client = get_client()
 
         params = {

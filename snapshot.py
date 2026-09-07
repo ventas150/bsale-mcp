@@ -56,7 +56,14 @@ def snapshot_documents(days_back: int = 14, max_pages: int = 600) -> dict[str, A
         "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
         "expand": "[document_type,office,client]",
     }
-    docs = client.paginated_get("/v1/documents.json", params=params, max_pages=max_pages)
+    # paginated_get tira el flag de truncado y devuelve el parcial como si
+    # fuera completo: es el mismo modo de falla que dejo huecos permanentes en
+    # el historico. Aca la ventana es corta (14 dias) y hay margen de sobra,
+    # pero el tool bsale_snapshot_run_now deja pedir days_back grandes.
+    _f = client.paginated_fetch(
+        "/v1/documents.json", params=params, max_items=max_pages * 50
+    )
+    docs = _f["items"]
 
     rows = []
     for doc in docs:
@@ -119,7 +126,20 @@ def snapshot_documents(days_back: int = 14, max_pages: int = 600) -> dict[str, A
                 )
                 s.execute(stmt)
 
-    return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
+    out = {
+        "snapshot_ts": snapshot_ts.isoformat(),
+        "rows": len(rows),
+        "days_back": days_back,
+        "documentos_leidos": _f.get("fetched"),
+        "documentos_en_bsale": _f.get("total_count"),
+        "truncado": bool(_f.get("truncated")),
+    }
+    if out["truncado"]:
+        out["documents_error"] = (
+            f"TRUNCADO: se leyeron {_f.get('fetched')} de "
+            f"{_f.get('total_count')} documentos. La ventana quedo INCOMPLETA."
+        )
+    return out
 
 
 def snapshot_documents_range(
@@ -248,6 +268,10 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
             s.execute(stmt)
         return len(buffer)
 
+    error: str | None = None
+    incompleto = False
+    completo = False
+    page = -1
     for page in range(max_pages):
         try:
             data = client.get(
@@ -255,10 +279,21 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
                 params={"limit": 50, "offset": page * 50, "expand": "[variant,office]"},
                 use_cache=False,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Antes esto era `break` a secas: un 5xx o un 429 en la pagina 300
+            # de ~6.000 cortaba en silencio, se hacia flush de lo que llevaba y
+            # se devolvia un dict SIN ninguna marca de error. cron_snapshot.py
+            # busca claves *_error para marcar la corrida como fallida, no
+            # encontraba ninguna, y la daba por exitosa. Peor: como
+            # build_stock_resumen y la vista stock_current usan
+            # max(snapshot_date), esa foto del 5% GANABA sobre la completa.
+            error = f"{type(e).__name__}: {str(e)[:200]}"
+            incompleto = True
+            logger.error("snapshot_stock corto en la pagina %d: %s", page, error)
             break
         items = data.get("items", []) or []
         if not items:
+            completo = True
             break
 
         for item in items:
@@ -287,17 +322,57 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
             rows = []
 
         if len(items) < 50:
+            completo = True
             break
+    else:
+        # Se agotaron las max_pages sin llegar al final del listado.
+        incompleto = True
+        error = error or f"se alcanzo el tope de {max_pages} paginas"
 
     # Flush remaining
     if rows:
         total_persisted += _flush(rows)
 
-    return {
+    out = {
         "snapshot_ts": snapshot_ts.isoformat(),
         "rows": total_persisted,
         "max_pages_attempted": max_pages,
+        "paginas_leidas": page + 1,
+        "completo": bool(completo and not incompleto),
     }
+    if incompleto or not completo:
+        # La clave *_error es la que hace que cron_snapshot marque la corrida
+        # como fallida y dispare la notificacion de Render.
+        out["stock_error"] = error or "la corrida no llego al final del listado"
+        out["advertencia"] = (
+            "FOTO DE STOCK INCOMPLETA. Como los lectores usan "
+            "max(snapshot_date), esta foto parcial taparia a la ultima completa. "
+            "Volver a correr snapshot_stock antes de confiar en el stock."
+        )
+        _marcar_stock_incompleto(snapshot_ts)
+    return out
+
+
+def _marcar_stock_incompleto(snapshot_ts) -> None:
+    """Borra una foto de stock que quedo a medias.
+
+    Es preferible quedarse con la foto completa de ayer que con una parcial de
+    hoy: los lectores toman max(snapshot_date) y no tienen forma de saber que
+    la mas reciente cubre el 5% del inventario.
+    """
+    try:
+        with db_session() as s:
+            n = s.execute(
+                stock_snapshot.delete().where(
+                    stock_snapshot.c.snapshot_date == snapshot_ts
+                )
+            ).rowcount
+        logger.error(
+            "Foto de stock incompleta descartada (%s filas). Queda vigente la "
+            "ultima completa.", n,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("No se pudo descartar la foto parcial de stock: %s", e)
 
 
 def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
@@ -506,4 +581,14 @@ def nightly_snapshot() -> dict[str, Any]:
         results["details_error"] = str(e)
 
     logger.info("Snapshot nocturno completado: %s", results)
+    # La retencion solo se llamaba desde sync_incremental.run(). Si el unico
+    # cron configurado es el nocturno, no corria NUNCA y stock_snapshot volvia
+    # a crecer hasta los 13 GB del incidente de agosto. Ahora corre en ambos.
+    try:
+        from retention import apply_retention
+
+        results["retention"] = apply_retention()
+    except Exception as e:  # noqa: BLE001
+        results["retention_error"] = str(e)[:200]
+
     return results
