@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,6 +69,60 @@ def is_sales_doc(doc: dict) -> bool:
     """
     doctype = doc.get("document_type") or {}
     return doctype.get("use") != 2
+
+
+# Tipos de documento que Bsale marca isSalesNote=1 (NOTA VENTA, NOTA VENTA T,
+# PEDIDO WEB, BETA PEDIDOS WEB, Cotizacion). NO son venta oficial.
+# Es fallback: la fuente de verdad es /v1/document_types.json (endpoint cacheado).
+SALES_NOTE_TYPE_IDS_FALLBACK = frozenset({3, 23, 24, 26, 27})
+
+_sales_note_ids_cache: frozenset[int] | None = None
+
+
+def sales_note_type_ids(refresh: bool = False) -> frozenset[int]:
+    """Ids de document_type con isSalesNote=1, leidos de Bsale y memoizados.
+
+    Si la API no responde, devuelve la lista fallback en vez de fallar: es
+    preferible excluir los tipos conocidos a contar notas de venta como venta.
+    """
+    global _sales_note_ids_cache
+    if _sales_note_ids_cache is not None and not refresh:
+        return _sales_note_ids_cache
+    try:
+        data = get_client().get("/v1/document_types.json", params={"limit": 50})
+        ids = {
+            int(t["id"])
+            for t in (data.get("items") or [])
+            if int(t.get("isSalesNote") or 0) == 1 and t.get("id") is not None
+        }
+        _sales_note_ids_cache = frozenset(ids) if ids else SALES_NOTE_TYPE_IDS_FALLBACK
+    except Exception:  # noqa: BLE001
+        logger.warning("No se pudo leer document_types.json; uso lista fallback de notas de venta")
+        _sales_note_ids_cache = SALES_NOTE_TYPE_IDS_FALLBACK
+    return _sales_note_ids_cache
+
+
+def is_sales_note(doc: dict) -> bool:
+    """True si el documento es nota de venta / pedido web / cotizacion."""
+    doctype = doc.get("document_type") or {}
+    if doctype.get("isSalesNote") is not None:
+        return int(doctype.get("isSalesNote") or 0) == 1
+    doc_type_id = doctype.get("id")
+    return doc_type_id is not None and int(doc_type_id) in sales_note_type_ids()
+
+
+def is_annulled(doc: dict) -> bool:
+    """True si el documento esta anulado (state != 0)."""
+    return int(doc.get("state", 0) or 0) != 0
+
+
+def is_official_sale(doc: dict) -> bool:
+    """Venta oficial = Boletas + Facturas + Notas de Debito - Notas de Credito.
+
+    Regla permanente de MyScrubs (22-jul-2026): las NOTAS DE VENTA de Bsale NO
+    cuentan como venta. Ademas excluye guias de despacho (use=2) y anulados.
+    """
+    return is_sales_doc(doc) and not is_sales_note(doc) and not is_annulled(doc)
 
 
 def doc_revenue_signed(doc: dict) -> float:
@@ -131,7 +186,7 @@ class BsaleClient:
             headers={
                 "access_token": self.token,
                 "Accept": "application/json",
-                "User-Agent": "myscrubs-bsale-mcp/0.2.0",
+                "User-Agent": "myscrubs-bsale-mcp/0.3.0",
             },
             timeout=self.timeout,
         )
@@ -289,28 +344,85 @@ class BsaleClient:
         audit_log("DELETE", path, params=None, body=None, result_summary=_summarize_result(result))
         return result
 
+    def paginated_fetch(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        max_items: int = 20000,
+        workers: int | None = None,
+    ) -> dict[str, Any]:
+        """Trae un listado completo y DECLARA si quedo truncado.
+
+        Dos diferencias con el paginado viejo:
+          1. Lee el campo `count` que Bsale devuelve en la primera pagina, asi
+             sabe el total real ANTES de pedir el resto. Nunca mas un total
+             silenciosamente parcial.
+          2. Baja las paginas restantes en paralelo. Bsale aguanta concurrencia
+             5 sin protestar (verificado en la app de sync, ago-2026).
+
+        Devuelve {items, total_count, fetched, truncated, pages}.
+        """
+        params = dict(params or {})
+        limit = int(params.get("limit") or self.default_limit)
+        limit = max(1, min(limit, 50))  # 50 es el maximo que acepta Bsale
+        params["limit"] = limit
+
+        first = self.get(path, params={**params, "offset": 0}, use_cache=False)
+        items: list[dict[str, Any]] = list(first.get("items") or [])
+        total_count = int(first.get("count") or len(items))
+
+        target = min(total_count, max_items)
+        if len(items) >= target or len(items) < limit:
+            return {
+                "items": items[:target] if target else items,
+                "total_count": total_count,
+                "fetched": min(len(items), target) if target else len(items),
+                "truncated": total_count > max_items,
+                "pages": 1,
+            }
+
+        offsets = list(range(limit, target, limit))
+        n_workers = workers or int(os.getenv("BSALE_PAGE_WORKERS", "4"))
+        n_workers = max(1, min(n_workers, 8))
+
+        pages: dict[int, list[dict[str, Any]]] = {0: items}
+
+        def _fetch(off: int) -> tuple[int, list[dict[str, Any]]]:
+            data = self.get(path, params={**params, "offset": off}, use_cache=False)
+            return off, list(data.get("items") or [])
+
+        if offsets:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                for off, page_items in pool.map(_fetch, offsets):
+                    pages[off] = page_items
+
+        merged: list[dict[str, Any]] = []
+        for off in sorted(pages):
+            merged.extend(pages[off])
+
+        return {
+            "items": merged[:target],
+            "total_count": total_count,
+            "fetched": min(len(merged), target),
+            "truncated": total_count > max_items,
+            "pages": len(pages),
+        }
+
     def paginated_get(
         self,
         path: str,
         params: dict[str, Any] | None = None,
         max_pages: int = 10,
     ) -> list[dict[str, Any]]:
-        """Junta multiples paginas en una lista."""
-        params = dict(params or {})
-        limit = params.get("limit", self.default_limit)
-        params["limit"] = limit
+        """Compatibilidad: junta multiples paginas en una lista.
 
-        results: list[dict[str, Any]] = []
-        for page in range(max_pages):
-            params["offset"] = page * limit
-            data = self.get(path, params=params, use_cache=False)
-            items = data.get("items", [])
-            if not items:
-                break
-            results.extend(items)
-            if len(items) < limit:
-                break
-        return results
+        Preferir paginated_fetch(), que ademas dice si el resultado esta truncado.
+        """
+        limit = int((params or {}).get("limit") or self.default_limit)
+        limit = max(1, min(limit, 50))
+        return self.paginated_fetch(
+            path, params=params, max_items=max_pages * limit
+        )["items"]
 
     def health_status(self) -> dict[str, Any]:
         """Diagnostico para healthcheck profundo. NO golpea Bsale."""

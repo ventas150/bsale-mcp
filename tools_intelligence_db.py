@@ -28,6 +28,7 @@ from db import (
     document_details_snapshot,
     documents_snapshot,
     session as db_session,
+    official_sale_conditions,
     signed_amount,
     stock_snapshot,
     variants_snapshot,
@@ -550,7 +551,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     documents_snapshot.c.emission_date >= cutoff,
-                    documents_snapshot.c.document_type_use != 2,
+                    *official_sale_conditions(documents_snapshot),
                 )
             ).group_by(documents_snapshot.c.office_id)
 
@@ -612,7 +613,7 @@ def register(mcp) -> None:  # noqa: ANN001
                 and_(
                     documents_snapshot.c.emission_date >= cutoff,
                     documents_snapshot.c.client_id.isnot(None),
-                    documents_snapshot.c.document_type_use != 2,
+                    *official_sale_conditions(documents_snapshot),
                 )
             ).group_by(documents_snapshot.c.client_id)
 
@@ -710,7 +711,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     documents_snapshot.c.emission_date.between(yesterday_dt_start, yesterday_dt_end),
-                    documents_snapshot.c.document_type_use != 2,
+                    *official_sale_conditions(documents_snapshot),
                 )
             )).first()
 
@@ -724,7 +725,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ).where(
                 and_(
                     documents_snapshot.c.emission_date >= week_dt,
-                    documents_snapshot.c.document_type_use != 2,
+                    *official_sale_conditions(documents_snapshot),
                 )
             ).group_by(documents_snapshot.c.office_id).order_by(desc("rev")).limit(5)).fetchall()
 

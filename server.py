@@ -1,6 +1,6 @@
 """MCP server principal de Bsale.
 
-v0.2.0 — production grade:
+v0.3.0 — production grade:
 - Healthcheck profundo (token vigente, ultima request, errores, lag de snapshot)
 - Sentry SDK opcional (via env var SENTRY_DSN)
 - Audit log endpoint (/audit) para revisar writes recientes
@@ -25,7 +25,7 @@ if SENTRY_DSN:
             dsn=SENTRY_DSN,
             traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE", "0.1")),
             environment=os.getenv("ENVIRONMENT", "production"),
-            release=os.getenv("RELEASE_VERSION", "0.2.0"),
+            release=os.getenv("RELEASE_VERSION", "0.3.0"),
         )
     except ImportError:
         pass  # sentry-sdk no instalado, seguir sin
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="bsale-mcp-myscrubs",
     instructions=(
-        "MCP de Bsale para MyScrubs Uniformes Clinicos (v0.2.0). "
+        "MCP de Bsale para MyScrubs Uniformes Clinicos (v0.3.0). "
         "Expone tools para consultar y MODIFICAR datos en Bsale: productos, stock, "
         "ventas, documentos, sucursales, clientes, precios, traspasos. "
         "Para analisis usa los tools de lectura (top sellers, quiebres, allocacion). "
@@ -61,7 +61,7 @@ async def health_check(request):  # noqa: ARG001
     """Healthcheck profundo. Render lo usa para autoDeploy."""
     from starlette.responses import JSONResponse
 
-    status: dict = {"status": "ok", "service": "bsale-mcp-myscrubs", "version": "0.2.0"}
+    status: dict = {"status": "ok", "service": "bsale-mcp-myscrubs", "version": "0.3.0"}
     code = 200
 
     # Verifica que el cliente Bsale arranca (no requiere golpear API)
@@ -193,7 +193,7 @@ def main() -> None:
     """Entry point. Render llama esto via startCommand."""
     port = int(os.getenv("PORT", "8000"))
     host = "0.0.0.0"  # noqa: S104 (necesario para Render)
-    logger.info("Starting bsale-mcp-myscrubs v0.2.0 on %s:%d", host, port)
+    logger.info("Starting bsale-mcp-myscrubs v0.3.0 on %s:%d", host, port)
     logger.info("Sentry: %s", "enabled" if SENTRY_DSN else "disabled")
     logger.info("DB: %s", "configured" if os.getenv("DATABASE_URL") else "not configured")
 

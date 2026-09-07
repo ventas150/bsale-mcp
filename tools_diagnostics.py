@@ -20,7 +20,7 @@ def register(mcp) -> None:  # noqa: ANN001
         client = get_client()
         return {
             "status": "ok",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "client": client.health_status(),
             "cache": get_cache().stats(),
         }

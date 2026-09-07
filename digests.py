@@ -105,6 +105,23 @@ def list_digests() -> list[dict[str, Any]]:
 
 
 # ============================
+def _official_sale_sql(alias: str = "") -> str:
+    """Filtro SQL de venta oficial para documents_snapshot.
+
+    Excluye guias (use=2), notas de venta / pedidos web / cotizaciones
+    (isSalesNote=1) y anulados (state != 0).
+    """
+    from bsale_client import sales_note_type_ids
+
+    pre = f"{alias}." if alias else ""
+    ids = ", ".join(str(int(i)) for i in sorted(sales_note_type_ids()))
+    cond = [f"{pre}document_type_use <> 2"]
+    if ids:
+        cond.append(f"({pre}document_type_id IS NULL OR {pre}document_type_id NOT IN ({ids}))")
+    cond.append(f"({pre}state IS NULL OR {pre}state = 0)")
+    return " AND ".join(cond)
+
+
 # Cálculo de cada digest
 # ============================
 
@@ -122,10 +139,10 @@ def build_ventas_hoy() -> dict[str, Any]:
                             ELSE net_amount END)                                 AS neto
             FROM documents_snapshot
             WHERE emission_date::date = current_date
-              AND document_type_use <> 2
+              AND {OFICIAL}
             GROUP BY office_id
             ORDER BY total DESC NULLS LAST
-            """
+            """.format(OFICIAL=_official_sale_sql())
         )).fetchall()
 
         top_sku = s.execute(text(
@@ -180,8 +197,8 @@ def build_ventas_periodo(dias: int) -> dict[str, Any]:
                             ELSE total_amount END)                AS total
             FROM documents_snapshot
             WHERE emission_date >= now() - make_interval(days => :d)
-              AND document_type_use <> 2
-            """
+              AND {OFICIAL}
+            """.format(OFICIAL=_official_sale_sql())
         ), {"d": dias}).first()
 
         top = s.execute(text(

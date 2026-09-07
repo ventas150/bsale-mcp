@@ -145,6 +145,50 @@ mapping_audit = Table(
 # Helpers de agregacion
 # ============================
 
+def official_sale_conditions(tbl, sales_note_ids=None) -> list:
+    """Condiciones para quedarse solo con VENTA OFICIAL en una tabla snapshot.
+
+    Venta oficial = Boletas + Facturas + Notas de Debito - Notas de Credito.
+    Excluye: guias de despacho (use=2), notas de venta / pedidos web /
+    cotizaciones (document_type_id en la lista de isSalesNote) y anulados
+    (state != 0).
+
+    Degrada con elegancia: si la tabla no tiene la columna (por ejemplo
+    document_details_snapshot no guarda document_type_id ni state), esa
+    condicion simplemente no se aplica. Los tools que dependan de eso deben
+    declararlo en su respuesta.
+    """
+    from sqlalchemy import or_
+
+    conds = []
+    cols = tbl.c
+    if "document_type_use" in cols:
+        conds.append(cols.document_type_use != 2)
+    if "document_type_id" in cols:
+        if sales_note_ids is None:
+            from bsale_client import sales_note_type_ids
+
+            sales_note_ids = sales_note_type_ids()
+        ids = list(sales_note_ids)
+        if ids:
+            conds.append(
+                or_(cols.document_type_id.is_(None), cols.document_type_id.notin_(ids))
+            )
+    if "state" in cols:
+        conds.append(or_(cols.state.is_(None), cols.state == 0))
+    return conds
+
+
+def official_sale_supported(tbl) -> dict:
+    """Que partes de la regla de venta oficial puede aplicar esta tabla."""
+    cols = tbl.c
+    return {
+        "excluye_guias": "document_type_use" in cols,
+        "excluye_notas_de_venta": "document_type_id" in cols,
+        "excluye_anulados": "state" in cols,
+    }
+
+
 def signed_amount(amount_col, use_col):
     """Monto con notas de credito (use=1) en negativo; el resto suma.
 
