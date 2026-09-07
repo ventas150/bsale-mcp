@@ -49,3 +49,31 @@ def register(mcp) -> None:  # noqa: ANN001
         from digests import list_digests
 
         return {"digests": list_digests()}
+
+    @mcp.tool()
+    def bsale_digests_regenerar() -> dict[str, Any]:
+        """Recalcula los 4 digests contra el snapshot. WRITE OP (a DB local).
+
+        Hasta ahora los digests solo se rehacían al final de cada corrida de
+        sync_incremental. Si el cron no corría, o si se arreglaba un bug en el
+        cálculo, el digest viejo seguía sirviéndose con su `_generated_at`
+        original y no había manera de forzar el recálculo.
+
+        Eso paso el 07-sep-2026: se corrigió el filtro de fecha de `ventas_hoy`
+        (devolvía $0 todos los días) y el arreglo quedó desplegado pero invisible,
+        porque el valor almacenado seguía siendo el anterior.
+
+        Es SQL sobre el snapshot, no toca Bsale. Son cuatro consultas agregadas:
+        segundos, no el tipo de carga que satura el healthcheck.
+        """
+        from digests import build_all, list_digests
+
+        resultado = build_all()
+        return {
+            "regenerado": resultado,
+            "frescura": list_digests(),
+            "nota": (
+                "Si algun digest quedo en 'error', el detalle esta en el valor "
+                "de esa clave."
+            ),
+        }
