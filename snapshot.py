@@ -122,11 +122,22 @@ def snapshot_documents(days_back: int = 14, max_pages: int = 600) -> dict[str, A
     return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows), "days_back": days_back}
 
 
-def snapshot_documents_range(date_from: str, date_to: str, max_pages: int = 120) -> dict[str, Any]:
+def snapshot_documents_range(
+    date_from: str, date_to: str, max_pages: int = 1200
+) -> dict[str, Any]:
     """Como snapshot_documents pero para un rango de fechas EXPLICITO [date_from, date_to] (ISO).
 
-    Pensado para backfill historico por tramos (un mes por corrida del cron).
-    Upsert idempotente con dedupe por document_id (re-cargar un mes parcial lo completa).
+    Pensado para backfill historico por tramos. Upsert idempotente con dedupe
+    por document_id (re-cargar un mes parcial lo completa).
+
+    Usa paginated_fetch, no paginated_get: este ultimo TIRA el aviso de truncado
+    y devuelve la lista parcial como si estuviera completa. Es exactamente el bug
+    que dejo el snapshot de 2025 con 4.101 documentos menos en marzo (-45,9% del
+    mes) sin que nada lo dijera. Aca el truncado se devuelve al llamador y el
+    tool lo declara.
+
+    max_pages por defecto 1200 (60.000 documentos): un mes de MyScrubs son
+    ~14.000, asi que un trimestre entra holgado.
     """
     client = get_client()
     snapshot_ts = datetime.now(timezone.utc)
@@ -136,7 +147,10 @@ def snapshot_documents_range(date_from: str, date_to: str, max_pages: int = 120)
         "emissiondaterange": iso_to_epoch_range(date_from, date_to),
         "expand": "[document_type,office,client]",
     }
-    docs = client.paginated_get("/v1/documents.json", params=params, max_pages=max_pages)
+    fetched = client.paginated_fetch(
+        "/v1/documents.json", params=params, max_items=max_pages * 50
+    )
+    docs = fetched["items"]
 
     rows = []
     for doc in docs:
@@ -193,7 +207,21 @@ def snapshot_documents_range(date_from: str, date_to: str, max_pages: int = 120)
                 )
                 s.execute(stmt)
 
-    return {"date_from": date_from, "date_to": date_to, "rows": len(rows)}
+    out = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "rows": len(rows),
+        "documentos_leidos": fetched.get("fetched"),
+        "documentos_en_bsale": fetched.get("total_count"),
+        "truncado": bool(fetched.get("truncated")),
+    }
+    if out["truncado"]:
+        out["advertencia"] = (
+            "TRUNCADO: no se leyeron todos los documentos del rango. El snapshot "
+            "queda incompleto para este periodo. Repetir por tramos mas cortos o "
+            "subir max_pages."
+        )
+    return out
 
 
 def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:

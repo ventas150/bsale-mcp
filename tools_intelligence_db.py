@@ -21,7 +21,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, desc, exists, func, not_, select, text
+from sqlalchemy import and_, case, desc, exists, func, not_, select, text
 
 from bsale_client import get_client
 from db import (
@@ -87,6 +87,8 @@ def _detalle_de_venta_oficial():
 
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools SQL-powered."""
+
+    register_venta_por_sucursal(mcp)
 
     # ============================
     # 1. QUIEBRES PROYECTADOS (FAST)
@@ -914,3 +916,134 @@ def register(mcp) -> None:  # noqa: ANN001
             "office_id": office_id,
             "top_products": top,
         }
+
+
+def register_venta_por_sucursal(mcp) -> None:  # noqa: ANN001
+    """Registra bsale_venta_por_sucursal. Se llama desde register()."""
+
+    @mcp.tool()
+    def bsale_venta_por_sucursal(
+        date_from: str,
+        date_to: str,
+    ) -> dict[str, Any]:
+        """Venta por sucursal en PESOS y UNIDADES para un periodo. SQL sobre snapshot.
+
+        Venta oficial = Boletas + Facturas + ND - NC. Sin guias, sin notas de
+        venta / pedidos web / cotizaciones, sin anulados.
+
+        Dos advertencias que vienen en la respuesta y hay que leer:
+
+        1. `unidades` sale de document_details_snapshot, que se llena documento
+           por documento y NO cubre todo el historico. La respuesta trae
+           `cobertura_detalle_pct`: si no es ~100, las unidades estan
+           SUBESTIMADAS y no sirven para comparar periodos. Con 0% no hay
+           detalle en absoluto (es el caso de 2025 completo).
+        2. `documentos` cuenta solo documentos de venta; las notas de credito
+           van aparte en `notas_de_credito`. Asi el ticket promedio no queda
+           diluido, que es lo que pasaba al dividir por el total de documentos.
+
+        Args:
+            date_from: YYYY-MM-DD inicio (inclusive).
+            date_to: YYYY-MM-DD fin (inclusive).
+        """
+        desde = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+        hasta = datetime.fromisoformat(date_to).replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+        d = documents_snapshot.c
+        en_rango = and_(d.emission_date >= desde, d.emission_date <= hasta)
+        oficial = and_(*official_sale_conditions(documents_snapshot))
+
+        with db_session() as s:
+            cab = s.execute(
+                select(
+                    d.office_id,
+                    func.max(d.office_name).label("sucursal"),
+                    func.sum(signed_amount(documents_snapshot)).label("venta"),
+                    func.count().filter(d.document_type_use != 1).label("docs"),
+                    func.count().filter(d.document_type_use == 1).label("nc"),
+                )
+                .where(and_(en_rango, oficial))
+                .group_by(d.office_id)
+            ).fetchall()
+
+            det = document_details_snapshot.c
+            filas_det = s.execute(
+                select(
+                    det.office_id,
+                    func.sum(
+                        case((det.document_type_use == 1, -det.quantity), else_=det.quantity)
+                    ).label("unidades"),
+                    func.count(func.distinct(det.document_id)).label("docs_con_detalle"),
+                )
+                .where(
+                    and_(
+                        det.emission_date >= desde,
+                        det.emission_date <= hasta,
+                        _detalle_de_venta_oficial(),
+                    )
+                )
+                .group_by(det.office_id)
+            ).fetchall()
+
+        unidades = {r.office_id: float(r.unidades or 0) for r in filas_det}
+        con_det = {r.office_id: int(r.docs_con_detalle or 0) for r in filas_det}
+
+        salida = []
+        for r in cab:
+            docs = int(r.docs or 0)
+            nc = int(r.nc or 0)
+            venta = float(r.venta or 0)
+            cubiertos = con_det.get(r.office_id, 0)
+            total_docs = docs + nc
+            cob = round(100 * cubiertos / total_docs, 1) if total_docs else 0.0
+            u = unidades.get(r.office_id)
+            salida.append({
+                "office_id": r.office_id,
+                "sucursal": (r.sucursal or "").strip(),
+                "venta": round(venta),
+                "documentos": docs,
+                "notas_de_credito": nc,
+                "ticket_promedio": round(venta / docs) if docs else None,
+                "unidades": round(u) if u is not None and cob > 0 else None,
+                "cobertura_detalle_pct": cob,
+            })
+        salida.sort(key=lambda x: x["venta"], reverse=True)
+
+        tot_docs = sum(x["documentos"] for x in salida)
+        tot_nc = sum(x["notas_de_credito"] for x in salida)
+        tot_cub = sum(con_det.values())
+        cob_global = round(100 * tot_cub / (tot_docs + tot_nc), 1) if (tot_docs + tot_nc) else 0.0
+        hay_unidades = cob_global > 0
+
+        out: dict[str, Any] = {
+            "source": "snapshot",
+            "period": {"from": date_from, "to": date_to},
+            "regla": "venta oficial = Boletas + Facturas + ND - NC",
+            "por_sucursal": salida,
+            "totales": {
+                "venta": sum(x["venta"] for x in salida),
+                "documentos": tot_docs,
+                "notas_de_credito": tot_nc,
+                "unidades": (
+                    sum(x["unidades"] or 0 for x in salida) if hay_unidades else None
+                ),
+            },
+            "cobertura_detalle": {
+                "documentos_del_periodo": tot_docs + tot_nc,
+                "documentos_con_detalle": tot_cub,
+                "pct": cob_global,
+            },
+        }
+        if cob_global < 99:
+            out["cobertura_detalle"]["advertencia"] = (
+                f"Solo el {cob_global}% de los documentos del periodo tiene detalle "
+                "de linea cargado. Las UNIDADES estan subestimadas y NO sirven para "
+                "comparar con otro periodo. Los PESOS si son completos (salen de la "
+                "cabecera). Para corregir: bsale_snapshot_details_batch."
+            )
+        out["nota_pesos"] = (
+            "Los pesos salen de documents_snapshot. Si el snapshot tiene huecos en "
+            "el periodo tambien lo estaran: confirmar con bsale_conciliacion_venta."
+        )
+        return out

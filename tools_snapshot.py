@@ -23,6 +23,7 @@ from snapshot import (
     nightly_snapshot,
     snapshot_details,
     snapshot_documents,
+    snapshot_documents_range,
     snapshot_stock,
     snapshot_variants,
 )
@@ -51,6 +52,41 @@ def register(mcp) -> None:  # noqa: ANN001
         if target == "details":
             return snapshot_details(batch_size=100, max_docs=500)
         return nightly_snapshot()
+
+    @mcp.tool()
+    def bsale_snapshot_backfill_rango(
+        date_from: str,
+        date_to: str,
+        max_documentos: int = 60000,
+    ) -> dict[str, Any]:
+        """Rellena el snapshot de documentos para un RANGO de fechas. WRITE OP (a DB local).
+
+        Existe porque bsale_snapshot_run_now solo acepta `days_back`, o sea una
+        ventana que siempre termina hoy. Para tapar un hueco viejo habia que
+        traerse todo desde ese hueco hasta hoy, que se truncaba antes de llegar.
+        Asi quedo el snapshot de marzo-2025 con 4.101 documentos menos (-45,9%
+        del mes) y marzo-2026 con 37 menos.
+
+        Es idempotente: hace upsert por document_id, no borra nada. Correrlo dos
+        veces sobre el mismo rango no duplica ni pierde datos.
+
+        Despues de correrlo, verificar con bsale_conciliacion_venta sobre el
+        mismo rango: tiene que dar diferencia 0.
+
+        Args:
+            date_from: YYYY-MM-DD inicio (inclusive).
+            date_to: YYYY-MM-DD fin (inclusive).
+            max_documentos: Tope de documentos a leer. Si se alcanza, la
+                respuesta lo declara en `truncado` y el rango queda INCOMPLETO.
+        """
+        paginas = max(1, int(max_documentos) // 50)
+        res = snapshot_documents_range(date_from, date_to, max_pages=paginas)
+        res["idempotente"] = "upsert por document_id; correrlo de nuevo no duplica"
+        res["siguiente_paso"] = (
+            f"bsale_conciliacion_venta(start_date='{date_from}', "
+            f"end_date='{date_to}') para confirmar diferencia 0"
+        )
+        return res
 
     @mcp.tool()
     def bsale_snapshot_details_batch(
