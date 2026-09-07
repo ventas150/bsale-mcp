@@ -3,7 +3,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from bsale_client import emission_range_from_iso, get_client
+from bsale_client import (
+    doc_revenue_signed,
+    emission_range_from_iso,
+    get_client,
+    is_official_sale,
+    is_sales_doc,
+    is_sales_note,
+    iso_to_epoch_range,
+)
 
 
 def register(mcp) -> None:  # noqa: ANN001
@@ -47,12 +55,10 @@ def register(mcp) -> None:  # noqa: ANN001
         if start_date and end_date:
             rango = iso_to_epoch_range(start_date, end_date)
         elif emissiondate_range:
-            partes = emissiondate_range.split(",", 1)
-            rango = (
-                iso_to_epoch_range(partes[0].strip(), partes[1].strip())
-                if len(partes) == 2 and not partes[0].strip().isdigit()
-                else emissiondate_range
-            )
+            # emission_range_from_iso ya acepta "YYYY-MM-DD,YYYY-MM-DD" y
+            # "EPOCH,EPOCH" y siempre devuelve epochs. Antes esto estaba
+            # duplicado aca a mano.
+            rango = emission_range_from_iso(emissiondate_range)
         expand = "[document_type,office,client]" if incluir_cliente else "[document_type,office]"
         params = {
             "limit": max(1, min(limit, 50)),
