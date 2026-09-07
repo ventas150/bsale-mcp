@@ -37,10 +37,13 @@ def _ts_to_dt(ts: Any) -> datetime | None:
         return None
 
 
-def snapshot_documents(days_back: int = 1, max_pages: int = 200) -> dict[str, Any]:
+def snapshot_documents(days_back: int = 14, max_pages: int = 600) -> dict[str, Any]:
     """Snapshot de documents emitidos en los ultimos N dias.
 
-    Default 1 dia (para snapshot nocturno).
+    Default 14 dias (para snapshot nocturno). NO bajar a 1: Bsale permite
+    fechas de emision retroactivas y un documento generado despues de la
+    ventana se pierde para siempre. max_pages=600 = 30.000 documentos, con
+    margen para backfills largos sin truncar.
     Para backfill historico, llamar con days_back grande.
     """
     client = get_client()
@@ -430,7 +433,16 @@ def nightly_snapshot() -> dict[str, Any]:
     logger.info("Iniciando snapshot nocturno")
     results = {}
     try:
-        results["documents"] = snapshot_documents(days_back=1)
+        # Ventana de 14 dias, no de 1. Bsale permite generar un documento con
+        # fecha de emision retroactiva: la boleta 1273799 tiene emissionDate
+        # 18-jul-2026 y generationDate 05-ago-2026, 18 dias despues. Con
+        # days_back=1 la corrida del 19-jul buscaba por fecha de emision y ese
+        # documento todavia no existia; ninguna corrida posterior vuelve a
+        # mirar esa fecha, asi que se perdia para siempre. Verificado el
+        # 07-sep-2026: faltaban 126 documentos ($3.889.808) en jun-sep por
+        # este motivo. El upsert es por document_id, releer dias ya cargados
+        # no duplica nada.
+        results["documents"] = snapshot_documents(days_back=14)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_documents: %s", e)
         results["documents_error"] = str(e)
