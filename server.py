@@ -400,7 +400,20 @@ def main() -> None:
         transport="streamable-http",
         middleware=[Middleware(BearerAuthMiddleware)],
     )
-    uvicorn.run(app, host=host, port=port, log_level=os.getenv("LOG_LEVEL", "info").lower())
+    # access_log=False NO es cosmetico. La autenticacion va como segmento de
+    # la URL (/mcp/<secreto>), asi que el log de acceso de uvicorn escribe la
+    # credencial completa del ERP en stdout -> logs de Render -> Sentry, en
+    # CADA request. Verificado el 08-sep-2026: uvicorn 0.52.4 trae
+    # Config.access_log=True por defecto. Mas abajo en este mismo archivo se
+    # evita loguear el secreto al arrancar, por esta misma razon; faltaba
+    # cerrar la otra puerta, que es la que se usa cientos de veces al dia.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        access_log=False,
+    )
 
 if __name__ == "__main__":
     main()

@@ -109,8 +109,23 @@ def _variants_empty() -> bool:
 # (exclusivo). Tras el incidente de storage ago-2026 la base se reconstruye
 # desde cero, por lo que el rango cubre hasta hoy.
 HIST_START = "2024-12"
-HIST_END = "2026-09"
 HIST_MESES_POR_CORRIDA = 4
+
+
+def hist_end() -> str:
+    """Mes actual: el backfill recorre hasta el mes anterior, inclusive.
+
+    Antes esto era la constante "2026-09". Al llegar ahi el paso devolvia
+    {"hist": "completo"} PARA SIEMPRE y ningun mes posterior se volvia a leer
+    jamas. Combinado con la ventana corta de documentos, cualquier documento
+    con fecha de emision retroactiva que se escapara de esa ventana quedaba
+    fuera del snapshot de forma permanente.
+
+    Movil, el cursor vuelve a moverse cuando cambia el mes: al entrar octubre,
+    septiembre pasa a ser < hist_end() y se relee entero, recogiendo todo lo
+    que se haya emitido con fecha retroactiva durante el mes.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 def _month_bounds(ym: str):
@@ -143,17 +158,62 @@ def _hist_cursor_set(ym: str) -> None:
         ), {"d": _json.dumps({"cursor": ym})})
 
 
+def recolectar_errores(obj: Any, _ruta: str = "", _prof: int = 0) -> list[str]:
+    """Todas las senales de error de una corrida, a CUALQUIER nivel del dict.
+
+    El chequeo era `[k for k in results if k.endswith("_error")]`, o sea solo
+    el primer nivel. Pero ningun paso pone su error ahi: snapshot_stock
+    devuelve {"stock": {..., "stock_error": ...}}, apply_retention devuelve
+    {"retention": {..., "hubo_error": True}}, y el backfill historico deja
+    "hist_error" dentro de una LISTA. Ninguno llegaba al chequeo.
+
+    Consecuencia medida el 08-sep-2026: una corrida de stock que se detecta a
+    si misma como incompleta escribe stock_error, no borra nada (bien) y
+    despues sale con codigo 0. Render la marca verde y no llega ninguna
+    notificacion. Es el mismo modo de falla por el que la retencion fallo cada
+    30 minutos durante meses sin que nadie se enterara.
+
+    `errors` (el contador de snapshot_details) NO cuenta por si solo: que
+    fallen algunos documentos de un lote de 2.000 es normal. Solo cuenta
+    cuando fallaron TODOS los que se procesaron, que si es una falla sistemica
+    (token vencido, Bsale caido).
+    """
+    hallazgos: list[str] = []
+    if _prof > 6:
+        return hallazgos
+    if isinstance(obj, dict):
+        errs, proc = obj.get("errors"), obj.get("docs_processed")
+        if (
+            isinstance(errs, int)
+            and isinstance(proc, int)
+            and errs > 0
+            and proc > 0
+            and errs >= proc
+        ):
+            hallazgos.append(("%s.errors" % _ruta) if _ruta else "errors")
+        for k, v in obj.items():
+            ruta = ("%s.%s" % (_ruta, k)) if _ruta else str(k)
+            if isinstance(k, str) and v and (k.endswith("_error") or k == "hubo_error"):
+                hallazgos.append(ruta)
+                continue
+            hallazgos.extend(recolectar_errores(v, ruta, _prof + 1))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            hallazgos.extend(recolectar_errores(v, "%s[%d]" % (_ruta, i), _prof + 1))
+    return hallazgos
+
+
 def backfill_historico_step() -> dict[str, Any]:
     """Carga UN mes histórico de documentos y avanza el cursor. Idempotente."""
     cur = _hist_cursor_get()
-    if cur >= HIST_END:
-        return {"hist": "completo", "cursor": cur}
+    if cur >= hist_end():
+        return {"hist": "al dia", "cursor": cur}
     from snapshot import snapshot_documents_range
     start, nxt, nxt_ym = _month_bounds(cur)
     # 200 paginas eran 10.000 documentos, y los meses de MyScrubs llegan a
     # 14.400 (marzo-2025). snapshot_documents_range SI declara el truncado; el
     # que lo ignoraba era este llamador, que avanzaba el cursor igual. Como
-    # HIST_END cierra el recorrido, el mes quedaba con un hueco PERMANENTE que
+    # hist_end() cierra el recorrido, el mes quedaba con un hueco PERMANENTE que
     # nadie volvia a mirar: asi se perdieron 4.101 documentos de marzo-2025
     # ($239,6 millones, el 45,9% del mes).
     res = snapshot_documents_range(start, nxt, max_pages=1200)
@@ -178,8 +238,18 @@ def sync_ventas() -> dict[str, Any]:
     from snapshot import snapshot_documents, snapshot_details
 
     out: dict[str, Any] = {}
-    # days_back=2 cubre documentos de ayer que entran tarde; upsert evita duplicar.
-    out["documents"] = snapshot_documents(days_back=2, max_pages=200)
+    # days_back=14, NO 2. Bsale permite emitir con fecha retroactiva: la
+    # boleta 1280257 tiene emissionDate 03-sep-2026 y generationDate
+    # 07-sep-2026, cuatro dias despues. Con la ventana de 2 dias nunca entro al
+    # snapshot, y como el backfill historico ya se habia declarado completo,
+    # ninguna corrida iba a volver a mirar el 3 de septiembre: $101.970
+    # perdidos de forma permanente. Verificado con bsale_conciliacion_venta
+    # sobre 1-7 sep (1.174 documentos en Bsale, 1.173 en el snapshot).
+    #
+    # El docstring de snapshot_documents ya decia "NO bajar a 1"; el arreglo de
+    # los 14 dias se habia aplicado a nightly_snapshot(), que ningun cron corre.
+    # El upsert es por document_id, asi que releer dias ya cargados no duplica.
+    out["documents"] = snapshot_documents(days_back=14, max_pages=600)
     # Ventana de 90 dias: cada corrida procesa hasta 400 documentos sin detalle,
     # asi el cron va completando el backlog historico de ~90 dias por si solo
     # (de lo mas reciente a lo mas viejo). Cuando esta al dia, solo mantiene lo nuevo.
@@ -255,7 +325,7 @@ def run(modo: str) -> int:
             for _ in range(HIST_MESES_POR_CORRIDA):
                 paso = backfill_historico_step()
                 pasos.append(paso)
-                if paso.get("hist") == "completo":
+                if paso.get("hist") == "al dia":
                     break
             results["historico"] = pasos
         except Exception as e:  # noqa: BLE001
@@ -328,7 +398,7 @@ def run(modo: str) -> int:
     logger.info("Sync (%s) terminado [stock=%s variants=%s]: %s",
                 modo, do_stock, do_variants, results)
 
-    failed = [k for k in results if k.endswith("_error")]
+    failed = recolectar_errores(results)
     if failed:
         logger.error("Pasos con error: %s", failed)
         return 1

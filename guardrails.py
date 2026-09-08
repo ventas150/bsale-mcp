@@ -48,6 +48,63 @@ def stock_writes_enabled() -> bool:
     return _flag("BSALE_STOCK_WRITES_ENABLED", "1")
 
 
+def guard_variant_write(descripcion: str = "") -> None:
+    """Mismo kill-switch que el stock, para las escrituras de catalogo.
+
+    activar/desactivar/actualizar variante y actualizar producto escribian en
+    Bsale sin ningun candado: ni kill-switch, ni dry_run, ni validacion. La mas
+    peligrosa es actualizar el `code` de una variante, que es el SKU: es la
+    llave que une Bsale con Shopify y con Mercado Libre a traves de sku_mapping.
+    Cambiarlo rompe el sync de los tres canales SIN lanzar ningun error - los
+    productos simplemente dejan de coincidir.
+    """
+    if not _flag("BSALE_CATALOG_WRITES_ENABLED", "1"):
+        raise GuardrailError(
+            "Escritura de catalogo BLOQUEADA por politica "
+            "(BSALE_CATALOG_WRITES_ENABLED=0). " + descripcion
+        )
+
+
+def validar_cantidad(quantity, campo: str = "quantity") -> float:
+    """Cantidad de un movimiento de stock: numerica, finita y > 0.
+
+    bsale_crear_traspaso_stock ya validaba esto; ajustar, consumir y
+    recepcionar no. Que una lo hiciera y las otras tres no era el hallazgo: una
+    cantidad negativa en un "consumo" invierte el sentido de la operacion, y un
+    0 deja un movimiento vacio en el historial de Bsale que despues hay que ir
+    a explicar.
+    """
+    try:
+        q = float(quantity)
+    except (TypeError, ValueError):
+        raise GuardrailError(f"{campo} no es numerico: {quantity!r}. No se escribio nada.")
+    if q != q or q in (float("inf"), float("-inf")):
+        raise GuardrailError(f"{campo} no es un numero valido: {quantity!r}. No se escribio nada.")
+    if q <= 0:
+        raise GuardrailError(
+            f"{campo} debe ser mayor que 0 (llego {q}). Un movimiento de stock "
+            "negativo invierte la operacion y uno en cero no hace nada pero "
+            "queda en el historial. No se escribio nada."
+        )
+    return q
+
+
+def validar_costo(cost) -> float:
+    """Costo de una recepcion: numerico y >= 0.
+
+    Un costo negativo o con la coma corrida contamina el costo promedio de la
+    variante en Bsale, y de ahi todos los reportes de margen. No rompe nada
+    visible: solo deja el margen mal para siempre.
+    """
+    try:
+        c = float(cost)
+    except (TypeError, ValueError):
+        raise GuardrailError(f"cost no es numerico: {cost!r}. No se escribio nada.")
+    if c != c or c < 0:
+        raise GuardrailError(f"cost no puede ser negativo (llego {cost!r}). No se escribio nada.")
+    return c
+
+
 def writable_price_lists() -> set[int]:
     """Listas de precio en las que se permite escribir. Vacio = ninguna."""
     raw = os.getenv("BSALE_WRITABLE_PRICE_LISTS", "").strip()
@@ -148,7 +205,11 @@ def validate_price_updates(
 
         antes = current.get(vid)
         delta_pct = None
-        if antes:
+        # `if antes:` dejaba pasar el precio actual 0, que es falsy: delta_pct
+        # quedaba None, excede_umbral en False, y el filtro de mas abajo era
+        # `is None`, que 0.0 no cumple. O sea que una variante que hoy vale 0
+        # podia recibir CUALQUIER precio sin pasar por el tope de delta.
+        if antes is not None and antes > 0:
             delta_pct = round((price - antes) / antes * 100, 2)
         fila = {
             "variant_id": vid,
@@ -173,7 +234,13 @@ def validate_price_updates(
             f"explicitamente en la llamada."
         )
 
-    sin_precio_actual = [f["variant_id"] for f in tabla if f["precio_actual"] is None]
+    # Un precio actual de 0 cuenta como "sin precio anterior": no se puede
+    # calcular un delta contra cero, y sin delta no hay control. Abortar es la
+    # direccion segura.
+    sin_precio_actual = [
+        f["variant_id"] for f in tabla
+        if f["precio_actual"] is None or f["precio_actual"] <= 0
+    ]
     if sin_precio_actual:
         raise GuardrailError(
             f"No se pudo leer el precio actual de {len(sin_precio_actual)} variante(s) "

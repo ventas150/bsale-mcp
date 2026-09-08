@@ -14,8 +14,11 @@ from guardrails import (
     GuardrailError,
     guard_price_write,
     guard_stock_write,
+    guard_variant_write,
     issue_confirm_token,
     consume_confirm_token,
+    validar_cantidad,
+    validar_costo,
     validate_price_updates,
 )
 
@@ -49,6 +52,7 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         try:
             guard_stock_write()
+            quantity = validar_cantidad(quantity)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
@@ -63,7 +67,13 @@ def register(mcp) -> None:  # noqa: ANN001
                 }
             ],
         }
-        return client.post("/v1/stocks/adjustments.json", json_body=body)
+        # "aplicado": True explicito. Antes el camino de exito devolvia el JSON
+        # crudo de Bsale, que no trae esa clave, mientras el camino BLOQUEADO si
+        # devolvia {"aplicado": False}. Un llamador que escribiera el chequeo
+        # obvio -- if not r.get("aplicado"): reintentar -- reintentaba sobre una
+        # escritura EXITOSA. Con Bsale sin claves de idempotencia, eso es un
+        # ajuste de stock aplicado dos veces.
+        return {"aplicado": True, "bsale": client.post("/v1/stocks/adjustments.json", json_body=body)}
 
     @mcp.tool()
     def bsale_consumir_stock(
@@ -78,6 +88,7 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         try:
             guard_stock_write()
+            quantity = validar_cantidad(quantity)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
@@ -87,7 +98,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "note": note,
             "details": [{"variantId": variant_id, "quantity": quantity}],
         }
-        return client.post("/v1/stocks/consumptions.json", json_body=body)
+        return {"aplicado": True, "bsale": client.post("/v1/stocks/consumptions.json", json_body=body)}
 
     @mcp.tool()
     def bsale_recepcionar_stock(
@@ -103,6 +114,9 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         try:
             guard_stock_write()
+            quantity = validar_cantidad(quantity)
+            if cost is not None:
+                cost = validar_costo(cost)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
@@ -115,7 +129,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "note": note,
             "details": [detail],
         }
-        return client.post("/v1/stocks/receptions.json", json_body=body)
+        return {"aplicado": True, "bsale": client.post("/v1/stocks/receptions.json", json_body=body)}
 
     @mcp.tool()
     def bsale_crear_traspaso_stock(
@@ -405,14 +419,28 @@ def register(mcp) -> None:  # noqa: ANN001
     @mcp.tool()
     def bsale_activar_variante(variant_id: int) -> dict[str, Any]:
         """Activa una variante (state=0). WRITE OPERATION."""
+        try:
+            guard_variant_write(f"activar variante {variant_id}")
+        except GuardrailError as e:
+            return {"aplicado": False, "bloqueado_por": str(e)}
         client = get_client()
-        return client.put(f"/v1/variants/{variant_id}.json", json_body={"state": 0})
+        return {"aplicado": True, "bsale": client.put(
+            f"/v1/variants/{variant_id}.json", json_body={"state": 0})}
 
     @mcp.tool()
     def bsale_desactivar_variante(variant_id: int) -> dict[str, Any]:
-        """Desactiva una variante (state=1). WRITE OPERATION."""
+        """Desactiva una variante (state=1). WRITE OPERATION.
+
+        Una variante desactivada desaparece del catalogo activo en las 9
+        tiendas y en cualquier integracion que filtre por state.
+        """
+        try:
+            guard_variant_write(f"desactivar variante {variant_id}")
+        except GuardrailError as e:
+            return {"aplicado": False, "bloqueado_por": str(e)}
         client = get_client()
-        return client.put(f"/v1/variants/{variant_id}.json", json_body={"state": 1})
+        return {"aplicado": True, "bsale": client.put(
+            f"/v1/variants/{variant_id}.json", json_body={"state": 1})}
 
     @mcp.tool()
     def bsale_actualizar_variante(
@@ -424,7 +452,16 @@ def register(mcp) -> None:  # noqa: ANN001
         """Actualiza campos de una variante. WRITE OPERATION.
 
         Solo se actualizan los campos que se pasan.
+
+        OJO CON `code`: es el SKU, y es la llave que une Bsale con Shopify y
+        con Mercado Libre en la tabla sku_mapping. Cambiarlo deja el mapping
+        huerfano en silencio y el sync de los tres canales deja de encontrar la
+        variante. No lanza ningun error: simplemente dejan de coincidir.
         """
+        try:
+            guard_variant_write(f"actualizar variante {variant_id}")
+        except GuardrailError as e:
+            return {"aplicado": False, "bloqueado_por": str(e)}
         client = get_client()
         body: dict[str, Any] = {}
         if code is not None:
@@ -437,4 +474,5 @@ def register(mcp) -> None:  # noqa: ANN001
         if not body:
             return {"error": "Debe especificar al menos un campo a actualizar"}
 
-        return client.put(f"/v1/variants/{variant_id}.json", json_body=body)
+        return {"aplicado": True, "bsale": client.put(
+            f"/v1/variants/{variant_id}.json", json_body=body)}

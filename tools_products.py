@@ -83,7 +83,17 @@ def register(mcp) -> None:  # noqa: ANN001
         state: int | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
-        """Actualiza campos basicos de un producto en Bsale. WRITE OPERATION."""
+        """Actualiza campos basicos de un producto en Bsale. WRITE OPERATION.
+
+        Vive en un modulo "de lectura" por historia, no por diseno: es una
+        escritura al ERP y pasa por el mismo candado que las demas. state=1
+        desactiva el producto ENTERO, con todas sus variantes.
+        """
+        from guardrails import GuardrailError, guard_variant_write
+        try:
+            guard_variant_write(f"actualizar producto {product_id}")
+        except GuardrailError as e:
+            return {"aplicado": False, "bloqueado_por": str(e)}
         client = get_client()
         body: dict[str, Any] = {}
         if name is not None:
@@ -96,4 +106,5 @@ def register(mcp) -> None:  # noqa: ANN001
         if not body:
             return {"error": "Debe especificar al menos un campo a actualizar"}
 
-        return client.put(f"/v1/products/{product_id}.json", json_body=body)
+        return {"aplicado": True, "bsale": client.put(
+            f"/v1/products/{product_id}.json", json_body=body)}

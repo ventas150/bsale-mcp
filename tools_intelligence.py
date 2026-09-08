@@ -58,6 +58,50 @@ CAP_DOCS_DETALLE = 500
 documento: subirlo alarga el bloqueo del hilo y acerca el 429."""
 
 
+def _fetch_declarado(client, path, params, max_items, que, alternativa=None):
+    """paginated_fetch + el bloque de cobertura listo para pegar en la respuesta.
+
+    paginated_get() devolvia solo ["items"]: TIRABA el aviso de truncado. Es el
+    mismo patron que costo 4.101 documentos de marzo-2025, y seguia vivo en los
+    tres tools que deciden compras y quiebres.
+
+    El caso del stock es el peor: /v1/stocks.json tiene 240.427 filas (medido
+    el 08-sep-2026) y estos tools leian 2.500. Con 4 workers y ~1 s por pagina,
+    leerlas todas son ~20 minutos, muy por encima del corte de 180 s del
+    cliente MCP: no se puede arreglar subiendo el tope. Lo que si se puede es
+    dejar de presentar el 1% como si fuera el total, y decir cual es el tool
+    que si cubre todo.
+
+    Importa la DIRECCION del error: una variante con stock en seis sucursales
+    de la que solo entra una fila se ve con menos stock del que tiene, y el
+    tool sugiere comprar. Y una variante que no entro no puede aparecer en
+    riesgo por rapido que se venda: se lee como "no hay quiebre".
+    """
+    f = client.paginated_fetch(path, params=params, max_items=max_items)
+    items = f["items"] or []
+    total = f.get("total_count")
+    cob = {
+        "que": que,
+        "leidos": len(items),
+        "total_en_bsale": total,
+        "truncado": bool(f.get("truncated")),
+    }
+    if total:
+        cob["pct"] = round(len(items) / total * 100, 2)
+    if cob["truncado"]:
+        cob["advertencia"] = (
+            "PARCIAL: se leyeron %s de %s %s (%s%%). Los numeros de abajo son un "
+            "PISO, no un total: lo que no se leyo no puede aparecer, y el stock "
+            "de una variante puede salir mas bajo del real si quedaron sucursales "
+            "afuera." % (
+                cob["leidos"], total if total else "?", que, cob.get("pct", "?"),
+            )
+        )
+        if alternativa:
+            cob["alternativa"] = alternativa
+    return items, cob
+
+
 def _velocity_en_vivo(client, docs, cap=CAP_DOCS_DETALLE, por_sucursal=False,
                       variant_id=None):
     """Suma unidades por variante leyendo el detalle de una MUESTRA de docs.
@@ -166,7 +210,13 @@ def register(mcp) -> None:  # noqa: ANN001
         if office_id:
             stock_params["officeid"] = office_id
 
-        stocks = client.paginated_get("/v1/stocks.json", params=stock_params, max_pages=50)
+        stocks, cobertura_stock = _fetch_declarado(
+            client, "/v1/stocks.json", stock_params, 2500,
+            "filas de stock",
+            "bsale_quiebres_proyectados_fast lee la velocity del snapshot y "
+            "consulta el stock en vivo SOLO de las variantes candidatas, asi "
+            "que no depende de este tope.",
+        )
 
         # variant_id -> {office_id: stock}
         current_stock: dict[int, dict[int, float]] = defaultdict(dict)
@@ -234,6 +284,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "office_id": office_id,
             "analyzed_documents": analyzed_docs,
+            "cobertura_stock": cobertura_stock,
             "cobertura_velocity": cobertura_velocity,
             "total_at_risk": len(risks),
             "risks": risks,
@@ -283,15 +334,17 @@ def register(mcp) -> None:  # noqa: ANN001
 
         velocity_by_office: dict[int, float] = defaultdict(float)
         # Estrategia: pagina documentos del periodo, leer details, filtrar por variant
-        docs = client.paginated_get(
-            "/v1/documents.json",
-            params={
+        docs, cobertura_documentos = _fetch_declarado(
+            client, "/v1/documents.json",
+            {
                 "limit": 50,
                 "emissiondaterange": iso_to_epoch_range(start_date.isoformat(), end_date.isoformat()),
                 "state": 0,
                 "expand": "[office,document_type]",
             },
-            max_pages=100,
+            5000, "documentos del periodo",
+            "bsale_sugerencia_allocation_fast sale del snapshot, que tiene el "
+            "periodo completo.",
         )
 
         vel_por_oficina, cobertura_velocity = _velocity_en_vivo(
@@ -351,6 +404,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "variant_id": variant_id,
             "lookback_days": lookback_days,
             "current_state": rows,
+            "cobertura_documentos": cobertura_documentos,
             "cobertura_velocity": cobertura_velocity,
             "suggestions": suggestions,
         }
@@ -377,10 +431,10 @@ def register(mcp) -> None:  # noqa: ANN001
         client = get_client()
 
         # 1. Stock total por variante
-        stock_items = client.paginated_get(
-            "/v1/stocks.json",
-            params={"limit": 50, "expand": "[variant]"},
-            max_pages=80,
+        stock_items, cobertura_stock = _fetch_declarado(
+            client, "/v1/stocks.json", {"limit": 50, "expand": "[variant]"}, 4000,
+            "filas de stock",
+            "bsale_proyeccion_compras_fast no depende de este tope.",
         )
         stock_total: dict[int, float] = defaultdict(float)
         variant_info: dict[int, dict[str, Any]] = {}
@@ -442,6 +496,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "producttypeid": producttypeid,
             "total_recommendations": len(recommendations),
+            "cobertura_stock": cobertura_stock,
             "cobertura_velocity": cobertura_velocity,
             "recommendations": recommendations[:100],
         }
@@ -584,13 +639,20 @@ def register(mcp) -> None:  # noqa: ANN001
             "state": 0,
             "expand": "[client,document_type]",
         }
-        docs = client.paginated_get("/v1/documents.json", params=params, max_pages=100)
+        docs, cobertura_documentos = _fetch_declarado(
+            client, "/v1/documents.json", params, 5000, "documentos del periodo",
+            "bsale_segmentacion_clientes_rfm_fast sale del snapshot y cubre el "
+            "periodo completo.",
+        )
 
         client_rfm: dict[int, dict[str, Any]] = defaultdict(
             lambda: {"last_purchase_ts": 0, "frequency": 0, "monetary": 0.0, "name": ""}
         )
 
-        for doc in docs[:max_clients * 5]:
+        # Sin el segundo tope: eran dos topes encadenados y mandaba el menor,
+        # en silencio. Ahora el unico tope es el de _fetch_declarado, que ademas
+        # dice cuanto quedo afuera.
+        for doc in docs:
             # Excluir guias de despacho
             if not is_sales_doc(doc):
                 continue
@@ -643,6 +705,7 @@ def register(mcp) -> None:  # noqa: ANN001
         summary = {seg: len(clients) for seg, clients in segments.items()}
         return {
             "period_days": days_back,
+            "cobertura_documentos": cobertura_documentos,
             "total_clients_analyzed": len(client_rfm),
             "summary_by_segment": summary,
             "top_champions": sorted(

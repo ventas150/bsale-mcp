@@ -670,10 +670,19 @@ def snapshot_details(
             # Paginado: un GET suelto traia solo 50 lineas y, como el documento
             # quedaba marcado como procesado, el resto se perdia para siempre.
             # Las facturas institucionales son justo las de muchas lineas.
+            # workers=1 A PROPOSITO. Esta funcion YA corre dentro de un pool
+            # de BSALE_DETAIL_WORKERS (4). Sin este parametro, paginated_fetch
+            # abria su PROPIO pool de BSALE_PAGE_WORKERS (4) para cada
+            # documento de mas de una pagina: 4 x 4 = 16 conexiones
+            # simultaneas contra Bsale, que empieza a frenar en 6. Eso es lo
+            # que explicaba los 242 reintentos medidos el 07-sep, no la
+            # concurrencia del pool externo, que ya se habia bajado de 6 a 4
+            # sin que el problema cambiara.
             fetch = client.paginated_fetch(
                 f"/v1/documents/{doc_id}/details.json",
                 params={"limit": 50, "expand": "[variant]"},
                 max_items=2000,
+                workers=1,
             )
             if fetch["truncated"]:
                 # no insertar parcial: se reintenta en la proxima corrida

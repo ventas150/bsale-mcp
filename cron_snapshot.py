@@ -34,7 +34,8 @@ def run() -> int:
 
     # Si alguno de los pasos registro error, salir con codigo !=0 para que
     # Render marque la corrida como fallida y dispare la notificacion.
-    failed = [k for k in result if k.endswith("_error")]
+    from sync_incremental import recolectar_errores
+    failed = recolectar_errores(result)
     if failed:
         logger.error("Pasos con error: %s", failed)
         return 1

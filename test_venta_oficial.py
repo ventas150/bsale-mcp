@@ -1432,3 +1432,339 @@ def test_el_cron_tambien_crea_su_esquema():
     codigo = _solo_codigo(inspect.getsource(sync.run))
 
     assert "init_db" in codigo
+
+
+# ===========================================================================
+# Auditoria del 08-sep-2026. Un test por arreglo, y para cada uno se verifico
+# que falla si se revierte el arreglo (no alcanza con que pase).
+# ===========================================================================
+
+class _McpFalso:
+    """Captura las funciones que register() decora, para poder llamarlas.
+
+    @mcp.tool() en fastmcp 4.0.3 devuelve la funcion original (verificado), asi
+    que basta con quedarse con la referencia.
+    """
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self, *a, **k):
+        def deco(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return deco
+
+
+class _ClienteEscrituraFalso:
+    def __init__(self):
+        self.llamadas = []
+
+    def post(self, path, json_body=None, **k):
+        self.llamadas.append(("POST", path, json_body))
+        return {"id": 9999}
+
+    def put(self, path, json_body=None, **k):
+        self.llamadas.append(("PUT", path, json_body))
+        return {"id": 9999}
+
+
+def _tools_de_escritura(monkeypatch):
+    tw = pytest.importorskip("tools_writes")
+    cli = _ClienteEscrituraFalso()
+    monkeypatch.setattr(tw, "get_client", lambda: cli)
+    m = _McpFalso()
+    tw.register(m)
+    return m.tools, cli
+
+
+# --------------------------------------------------------------- 1. access_log
+def test_el_secreto_de_la_url_no_se_escribe_en_el_log_de_acceso():
+    """La autenticacion va en la URL, asi que el access log es una fuga.
+
+    uvicorn 0.52.4 trae Config.access_log=True por defecto (verificado contra
+    la libreria instalada). Con el secreto como segmento del path, cada request
+    escribia la credencial completa del ERP en stdout -> logs de Render.
+    """
+    import inspect
+
+    server = pytest.importorskip("server")
+    codigo = _solo_codigo(inspect.getsource(server.main))
+
+    assert "access_log=False" in codigo, (
+        "sin esto el secreto de /mcp/<secreto> queda en los logs de Render"
+    )
+
+
+# ------------------------------------------- 2. ventana de documentos y HIST_END
+def test_el_cron_mira_catorce_dias_no_dos():
+    """La boleta 1280257: emitida el 03-sep, generada el 07-sep.
+
+    Con la ventana de 2 dias nunca entro al snapshot ($101.970). El arreglo de
+    los 14 dias existia, pero en nightly_snapshot(), que ningun cron corre.
+    """
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    codigo = _solo_codigo(inspect.getsource(sync.sync_ventas))
+
+    assert "days_back=14" in codigo
+    assert "days_back=2" not in codigo
+
+
+def test_el_backfill_historico_no_se_cierra_para_siempre(monkeypatch):
+    """HIST_END era la constante "2026-09": al llegar ahi, nunca mas releia nada.
+
+    Ahora es el mes actual, movil. Cuando entra octubre, septiembre vuelve a ser
+    anterior al corte y se relee entero, recogiendo lo que se haya emitido con
+    fecha retroactiva durante el mes.
+    """
+    from datetime import datetime, timezone
+
+    sync = pytest.importorskip("sync_incremental")
+    assert not hasattr(sync, "HIST_END"), "la constante fija tiene que estar muerta"
+
+    # Con el reloj movido, NO comparando contra el mes de hoy: la constante
+    # vieja era "2026-09" y este test se escribio en septiembre de 2026, asi
+    # que comparar contra hoy lo hacia pasar con el bug puesto. Probaba el
+    # calendario, no el codigo.
+    class _RelojFalso:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2027, 4, 15, 12, 0, tzinfo=tz or timezone.utc)
+
+    original = sync.datetime
+    sync.datetime = _RelojFalso
+    try:
+        assert sync.hist_end() == "2027-04"
+    finally:
+        sync.datetime = original
+
+    assert sync.hist_end() == datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+# ----------------------------------------------------- 3. errores anidados
+def test_un_error_anidado_marca_la_corrida_como_fallida():
+    """Ningun paso pone su error en el primer nivel de results.
+
+    snapshot_stock devuelve {"stock": {..., "stock_error": ...}}. El chequeo
+    viejo era [k for k in results if k.endswith("_error")], que nunca coincidia:
+    una corrida de stock incompleta salia con codigo 0 y Render la pintaba
+    verde.
+    """
+    sync = pytest.importorskip("sync_incremental")
+
+    r = sync.recolectar_errores({"stock": {"completo": False, "stock_error": "faltan filas"}})
+    assert r == ["stock.stock_error"]
+
+    r = sync.recolectar_errores({"retention": {"hubo_error": True}})
+    assert r == ["retention.hubo_error"]
+
+    # hist_error vive dentro de una LISTA
+    r = sync.recolectar_errores({"historico": [{"hist_mes": "2025-03", "hist_error": "truncado"}]})
+    assert r == ["historico[0].hist_error"]
+
+
+def test_lo_que_no_es_error_no_marca_la_corrida():
+    sync = pytest.importorskip("sync_incremental")
+
+    assert sync.recolectar_errores({"stock": {"completo": True, "rows": 240427}}) == []
+    # las claves de error en None o vacio no cuentan
+    assert sync.recolectar_errores({"stock": {"stock_error": None}}) == []
+    assert sync.recolectar_errores({"retention": {"hubo_error": False}}) == []
+    # retention_warning es a proposito una advertencia, no un error
+    assert sync.recolectar_errores({"retention_warning": "algo"}) == []
+
+
+def test_algunos_documentos_fallidos_no_son_una_falla_pero_todos_si():
+    """Que fallen 3 de 2.000 documentos es normal. Que fallen los 2.000 no."""
+    sync = pytest.importorskip("sync_incremental")
+
+    assert sync.recolectar_errores({"d": {"docs_processed": 2000, "errors": 3}}) == []
+    assert sync.recolectar_errores({"d": {"docs_processed": 2000, "errors": 2000}}) == ["d.errors"]
+
+
+def test_el_cron_y_el_sync_usan_el_mismo_criterio():
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    cron = pytest.importorskip("cron_snapshot")
+
+    assert "recolectar_errores" in _solo_codigo(inspect.getsource(sync.run))
+    assert "recolectar_errores" in _solo_codigo(inspect.getsource(cron.run))
+
+
+# ------------------------------------------------- 4. cobertura declarada
+def test_los_tools_de_decision_ya_no_usan_el_paginado_que_tira_el_truncado():
+    """paginated_get devuelve ["items"] y descarta el aviso de truncado.
+
+    bsale_quiebres_proyectados leia 2.500 filas de las 240.427 que tiene Bsale
+    (medido el 08-sep-2026): el 1,04%, presentado como si fuera el total.
+    """
+    import ast
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    # Con ast, no buscando texto: este archivo NOMBRA paginated_get en los
+    # comentarios para explicar por que se saco, y _solo_codigo() no alcanza a
+    # descartar todos los docstrings anidados. Un test que busca texto sobre
+    # este repo se prueba a si mismo.
+    arbol = ast.parse(inspect.getsource(ti))
+    llamadas = [
+        n.func.attr
+        for n in ast.walk(arbol)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    ]
+    assert "paginated_get" not in llamadas, (
+        "paginated_get tira el aviso de truncado; usar _fetch_declarado"
+    )
+    assert "paginated_fetch" in llamadas
+
+
+def test_una_lectura_truncada_lo_dice_y_ofrece_el_tool_que_si_cubre():
+    ti = pytest.importorskip("tools_intelligence")
+
+    class _Cli:
+        def paginated_fetch(self, path, params=None, max_items=0, workers=None):
+            return {"items": [{"i": n} for n in range(max_items)],
+                    "total_count": 240427, "truncated": True}
+
+    items, cob = ti._fetch_declarado(
+        _Cli(), "/v1/stocks.json", {}, 2500, "filas de stock", "usar el _fast",
+    )
+    assert len(items) == 2500
+    assert cob["truncado"] is True
+    assert cob["total_en_bsale"] == 240427
+    assert cob["pct"] == 1.04
+    assert "PISO" in cob["advertencia"]
+    assert cob["alternativa"] == "usar el _fast"
+
+
+def test_una_lectura_completa_no_grita():
+    ti = pytest.importorskip("tools_intelligence")
+
+    class _Cli:
+        def paginated_fetch(self, path, params=None, max_items=0, workers=None):
+            return {"items": [{"i": n} for n in range(120)],
+                    "total_count": 120, "truncated": False}
+
+    _items, cob = ti._fetch_declarado(_Cli(), "/x.json", {}, 5000, "cosas")
+    assert cob["truncado"] is False
+    assert cob["pct"] == 100.0
+    assert "advertencia" not in cob
+
+
+# ---------------------------------------------------- 5. pools desanidados
+def test_el_detalle_no_anida_pools_contra_bsale():
+    """4 workers externos x 4 internos = 16 simultaneas. Bsale frena en 6.
+
+    Es lo que explicaba los 242 reintentos, no la concurrencia del pool
+    externo, que ya se habia bajado de 6 a 4 sin que el problema cambiara.
+    """
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.snapshot_details))
+
+    assert "workers=1" in codigo, (
+        "el paginated_fetch de adentro del pool tiene que ir con workers=1"
+    )
+
+
+# --------------------------------------- 6. candados en escrituras de catalogo
+def test_las_escrituras_de_catalogo_tienen_kill_switch(monkeypatch):
+    """activar/desactivar/actualizar variante y producto no tenian ninguno."""
+    tools, cli = _tools_de_escritura(monkeypatch)
+    monkeypatch.setenv("BSALE_CATALOG_WRITES_ENABLED", "0")
+
+    for nombre, args in (
+        ("bsale_activar_variante", (123,)),
+        ("bsale_desactivar_variante", (123,)),
+    ):
+        r = tools[nombre](*args)
+        assert r["aplicado"] is False, nombre
+        assert "BLOQUEADA" in r["bloqueado_por"], nombre
+
+    r = tools["bsale_actualizar_variante"](123, code="NUEVO")
+    assert r["aplicado"] is False
+    assert cli.llamadas == [], "no puede haber tocado Bsale"
+
+
+def test_cambiar_el_sku_pasa_por_el_candado(monkeypatch):
+    """El code es la llave con Shopify y Mercado Libre via sku_mapping."""
+    tools, cli = _tools_de_escritura(monkeypatch)
+    monkeypatch.setenv("BSALE_CATALOG_WRITES_ENABLED", "1")
+
+    r = tools["bsale_actualizar_variante"](123, code="SKU-NUEVO")
+    assert r["aplicado"] is True
+    assert cli.llamadas == [("PUT", "/v1/variants/123.json", {"code": "SKU-NUEVO"})]
+
+
+# ------------------------------------- 6b. validacion de cantidades y costos
+def test_no_se_escribe_stock_con_cantidad_invalida(monkeypatch):
+    """bsale_crear_traspaso_stock ya validaba; las otras tres no.
+
+    Una cantidad negativa en un "consumo" invierte el sentido de la operacion.
+    """
+    tools, cli = _tools_de_escritura(monkeypatch)
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    for nombre in ("bsale_ajustar_stock", "bsale_consumir_stock", "bsale_recepcionar_stock"):
+        for mala in (0, -5, float("nan")):
+            r = tools[nombre](variant_id=1, office_id=1, quantity=mala)
+            assert r["aplicado"] is False, f"{nombre} acepto {mala}"
+    assert cli.llamadas == [], "ninguna llego a Bsale"
+
+
+def test_no_se_recepciona_con_costo_negativo(monkeypatch):
+    """Un costo negativo contamina el costo promedio y de ahi todo el margen."""
+    tools, cli = _tools_de_escritura(monkeypatch)
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    r = tools["bsale_recepcionar_stock"](variant_id=1, office_id=1, quantity=5, cost=-100)
+    assert r["aplicado"] is False
+    assert cli.llamadas == []
+
+
+def test_una_escritura_de_stock_exitosa_dice_que_se_aplico(monkeypatch):
+    """El camino de exito devolvia el JSON crudo de Bsale, sin clave "aplicado".
+
+    El camino BLOQUEADO si devolvia {"aplicado": False}. Un llamador que
+    escribiera el chequeo obvio -- if not r.get("aplicado"): reintentar --
+    reintentaba sobre una escritura EXITOSA. Sin idempotencia en Bsale, eso es
+    un ajuste de stock aplicado dos veces.
+    """
+    tools, cli = _tools_de_escritura(monkeypatch)
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["aplicado"] is True
+    assert len(cli.llamadas) == 1
+    assert cli.llamadas[0][1] == "/v1/stocks/adjustments.json"
+
+
+# -------------------------------------------------- 7. precio actual en cero
+def test_una_variante_en_cero_no_puede_recibir_cualquier_precio():
+    """`if antes:` dejaba pasar el 0 porque es falsy.
+
+    delta_pct quedaba None, excede_umbral en False, y el filtro siguiente era
+    `is None`, que 0.0 no cumple: el tope del 5% no se aplicaba a nada.
+    """
+    g = pytest.importorskip("guardrails")
+
+    with pytest.raises(g.GuardrailError) as e:
+        g.validate_price_updates([{"variant_id": 1, "new_price": 99000}], current={1: 0.0})
+    assert "no se escribio nada" in str(e.value).lower()
+
+
+def test_el_tope_de_delta_sigue_funcionando_con_precio_normal():
+    g = pytest.importorskip("guardrails")
+
+    tabla = g.validate_price_updates(
+        [{"variant_id": 1, "new_price": 10300}], current={1: 10000}, max_delta_pct=5.0
+    )
+    assert tabla[0]["delta_pct"] == 3.0
+    with pytest.raises(g.GuardrailError):
+        g.validate_price_updates(
+            [{"variant_id": 1, "new_price": 20000}], current={1: 10000}, max_delta_pct=5.0
+        )
