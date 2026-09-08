@@ -939,3 +939,26 @@ def test_cobertura_compara_el_mismo_universo():
     # y tiene que aplicar los mismos filtros que el denominador
     assert "and_(*cond_doc, tiene_detalle)" in codigo
     assert "cond_det" not in codigo, "cond_det era el filtro paralelo que no calzaba"
+
+
+# ============================================================
+# Todo tool que salga de la velocity declara su cobertura
+# ============================================================
+# quiebres, proyeccion de compras, allocation y sobrestockeos salen del
+# detalle de linea. Si al periodo le falta detalle, la velocity queda
+# subestimada y devuelven MENOS riesgo del que hay, sin decirlo. Una lista
+# vacia se nota; un riesgo subestimado no.
+
+def test_los_tools_de_velocity_declaran_cobertura():
+    import inspect
+
+    tidb = pytest.importorskip("tools_intelligence_db")
+    codigo = _solo_codigo(inspect.getsource(tidb.register))
+
+    # los cuatro returns que salen de vel_rows tienen que traerla
+    assert codigo.count('"cobertura_detalle": cobertura_ultimos_dias(') >= 4, (
+        "falta declarar la cobertura en algun tool de velocity"
+    )
+    assert "def cobertura_ultimos_dias" not in codigo, (
+        "el helper va a nivel de modulo, no dentro de register()"
+    )

@@ -142,6 +142,21 @@ def cobertura_de_detalle(desde, hasta, office_id=None) -> dict[str, Any]:
     return out
 
 
+def cobertura_ultimos_dias(dias: int, office_id: int | None = None) -> dict:
+    """Cobertura de detalle de los ultimos N dias, para los tools de velocity.
+
+    quiebres, proyeccion de compras, allocation y sobrestockeos salen TODOS de
+    la velocity, y la velocity sale del detalle de linea. Si al periodo le
+    falta detalle, la velocity queda subestimada y estos tools devuelven menos
+    riesgo del que hay, callados. Es el mismo modo de falla que tenia
+    top_productos_fast devolviendo [] para marzo-2025, pero peor: una lista
+    vacia se nota, un riesgo subestimado no.
+    """
+    hasta = datetime.now(timezone.utc)
+    desde = hasta - timedelta(days=dias)
+    return cobertura_de_detalle(desde, hasta, office_id)
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools SQL-powered."""
 
@@ -263,6 +278,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "office_id": office_id,
             "min_velocity": min_velocity,
             "checked_variants": len(vel_rows),
+            "cobertura_detalle": cobertura_ultimos_dias(lookback_days, office_id),
             "en_riesgo_en_los_revisados": len(risks),
             "risks": risks,
         }
@@ -362,6 +378,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "source": "snapshot",
             "variant_id": variant_id,
             "lookback_days": lookback_days,
+            "cobertura_detalle": cobertura_ultimos_dias(lookback_days),
             "current_state": rows,
             "suggestions": suggestions,
         }
@@ -456,6 +473,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "lookback_days": lookback_days,
             "min_velocity": min_velocity,
             "checked_variants": len(vel_rows),
+            "cobertura_detalle": cobertura_ultimos_dias(lookback_days),
             "recomendaciones_en_los_revisados": len(recs),
             "recommendations": recs,
         }
@@ -597,6 +615,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "min_coverage_days": min_coverage_days,
             "lookback_days": lookback_days,
             "checked_variants": len(vel_rows),
+            "cobertura_detalle": cobertura_ultimos_dias(lookback_days),
             "total_sobrestockeos": len(sobrestockeos),
             "capital_inmovilizado_en_los_revisados_clp": total_capital_tied,
             "nota_cobertura": "Calculado solo sobre las variantes revisadas (ver checked_variants), no sobre todo el catalogo.",
