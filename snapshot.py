@@ -13,6 +13,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from concurrent.futures import ThreadPoolExecutor
+
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -517,12 +519,18 @@ def snapshot_details(
 
     # El tope ya lo aplico el LIMIT del query. Volver a cortar aca con otra
     # variable es justo el bug que se acaba de sacar.
-    for cand in todo:
-        doc_id = cand.document_id
-        emission_date = cand.emission_date
-        office_id = cand.office_id
-        use = cand.document_type_use or 0
+    #
+    # Los documentos se piden EN PARALELO. Antes iban de a uno: 1 request,
+    # esperar, siguiente. Medido el 08-sep-2026 asi daba ~8 documentos por
+    # segundo, o sea 4,5 horas para los 129.000 pendientes, y cada llamada
+    # de mas de ~1.400 documentos se pasaba del timeout de 180 s del cliente
+    # MCP. La concurrencia la aguanta Bsale (misma que usa paginated_fetch).
+    _DETALLE_WORKERS = int(os.getenv("BSALE_DETAIL_WORKERS", "6"))
+    n_workers = max(1, min(_DETALLE_WORKERS, 10))
 
+    def _bajar(cand):
+        """Devuelve (doc_id, filas, hubo_error). No toca la base: solo red."""
+        doc_id = cand.document_id
         try:
             # Paginado: un GET suelto traia solo 50 lineas y, como el documento
             # quedaba marcado como procesado, el resto se perdia para siempre.
@@ -532,49 +540,68 @@ def snapshot_details(
                 params={"limit": 50, "expand": "[variant]"},
                 max_items=2000,
             )
-            resp = {"items": fetch["items"]}
             if fetch["truncated"]:
-                errors += 1
-                continue  # no insertar parcial: se reintenta en la proxima corrida
+                # no insertar parcial: se reintenta en la proxima corrida
+                return doc_id, [], True
+            items = fetch["items"] or []
         except Exception:  # noqa: BLE001
-            errors += 1
-            continue
+            return doc_id, [], True
 
-        items = resp.get("items", []) or []
-        line_rows = []
+        filas = []
         for line in items:
             variant = line.get("variant") or {}
             line_id = line.get("id")
             if line_id is None:
                 continue
-            line_rows.append({
+            filas.append({
                 "document_id": doc_id,
                 "line_id": line_id,
                 "variant_id": variant.get("id"),
                 "variant_code": variant.get("code"),
                 "variant_description": (variant.get("description") or "")[:500],
-                "office_id": office_id,
-                "emission_date": emission_date,
-                "document_type_use": use,
+                "office_id": cand.office_id,
+                "emission_date": cand.emission_date,
+                "document_type_use": cand.document_type_use or 0,
                 "quantity": float(line.get("quantity", 0) or 0),
                 "net_amount": float(line.get("netAmount", 0) or 0),
                 "total_amount": float(line.get("totalAmount", 0) or 0),
                 "fetched_at": datetime.now(timezone.utc),
             })
+        return doc_id, filas, False
 
-        if line_rows:
-            # Dedupe por (document_id, line_id) por la misma razon que en documentos.
-            dedup_lines: dict[tuple, dict[str, Any]] = {}
-            for lr in line_rows:
-                dedup_lines[(lr["document_id"], lr["line_id"])] = lr
-            line_rows = list(dedup_lines.values())
+    pendientes_de_insertar: dict[tuple, dict[str, Any]] = {}
 
+    def _descargar(filas_dict):
+        """Inserta lo acumulado. Se llama por tandas para no juntar todo en RAM."""
+        nonlocal rows_inserted
+        if not filas_dict:
+            return
+        valores = list(filas_dict.values())
+        CHUNK = 500
+        for k in range(0, len(valores), CHUNK):
+            trozo = valores[k:k + CHUNK]
             with db_session() as s:
-                stmt = pg_insert(document_details_snapshot).values(line_rows)
-                stmt = stmt.on_conflict_do_nothing(index_elements=["document_id", "line_id"])
+                stmt = pg_insert(document_details_snapshot).values(trozo)
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=["document_id", "line_id"]
+                )
                 s.execute(stmt)
-            rows_inserted += len(line_rows)
-        docs_processed += 1
+            rows_inserted += len(trozo)
+        filas_dict.clear()
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for _doc_id, filas, hubo_error in pool.map(_bajar, todo):
+                if hubo_error:
+                    errors += 1
+                    continue
+                # Dedupe por (document_id, line_id), misma razon que en documentos.
+                for fila in filas:
+                    pendientes_de_insertar[(fila["document_id"], fila["line_id"])] = fila
+                docs_processed += 1
+                if len(pendientes_de_insertar) >= 2000:
+                    _descargar(pendientes_de_insertar)
+        _descargar(pendientes_de_insertar)
 
     return {
         "docs_processed": docs_processed,
