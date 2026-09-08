@@ -45,8 +45,10 @@ def register(mcp) -> None:  # noqa: ANN001
         el cron nocturno (cron_snapshot.py), que es un proceso aparte.
 
         Por que: este tool corre DENTRO del web service, el mismo proceso que
-        responde /health. snapshot_stock pagina secuencialmente ~6.000 paginas y
-        tarda cerca de 2 horas; 'all' hace ademas variants y details. Con eso el
+        responde /health. snapshot_stock baja ~3.000 paginas; desde el
+        08-sep-2026 va en paralelo y tarda ~10 min (antes, en serie, mas de 2
+        horas), pero sigue siendo demasiado para este proceso, y 'all' hace
+        ademas variants y details. Con eso el
         healthcheck no responde en 5 segundos, Render marca el servicio caido y
         reinicia la instancia a mitad de la carga. Ya paso el 07-sep-2026 con un
         backfill de 46.738 documentos, que es una fraccion de esto — y 'all' era

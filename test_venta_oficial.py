@@ -1157,3 +1157,158 @@ def test_no_poder_leer_el_audit_no_es_lo_mismo_que_no_haber_escrituras():
     assert "if desde_db is not None" in lectura, (
         "con 'if desde_db:' una lista vacia legitima caeria al archivo"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stock en paralelo. La corrida serial tardaba mas de una hora (~3.000 paginas
+# a ~1,4 s cada una), y en ese rato cualquier deploy la mataba a medio camino.
+# Lo delicado no es la velocidad sino el criterio de completitud: de el depende
+# si se borran o no las filas que la corrida no toco.
+# ---------------------------------------------------------------------------
+
+class _ClienteStockFalso:
+    """Emula /v1/stocks.json: devuelve `count` y paginas de `limit` filas."""
+
+    def __init__(self, total, fallar_en=(), vacias=()):
+        self.total = total
+        self.fallar_en = set(fallar_en)
+        self.vacias = set(vacias)
+        self.offsets = []
+
+    def get(self, path, params=None, use_cache=True):
+        params = params or {}
+        off = params["offset"]
+        lim = params["limit"]
+        self.offsets.append(off)
+        if off in self.fallar_en:
+            raise RuntimeError("500 simulado de Bsale")
+        if off in self.vacias:
+            # 200 OK con items vacio. Bsale lo hace bajo carga. NO es un error.
+            return {"count": self.total, "items": []}
+        items = [
+            {
+                "quantity": 1.0,
+                "variant": {"id": k, "code": "V%d" % k},
+                "office": {"id": 1, "name": "Quilicura"},
+            }
+            for k in range(off, min(off + lim, self.total))
+        ]
+        return {"count": self.total, "items": items}
+
+
+class _SesionFalsa:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt):
+        self.sink.append(stmt)
+        return None
+
+
+def _montar_stock(monkeypatch, cliente):
+    """Deja snapshot_stock corriendo contra el cliente falso y sin Postgres."""
+    snapshot = pytest.importorskip("snapshot")
+    escrituras = []
+    bajas = []
+    monkeypatch.setenv("BSALE_STOCK_WORKERS", "4")
+    monkeypatch.setattr(snapshot, "get_client", lambda: cliente)
+    monkeypatch.setattr(snapshot, "db_session", lambda: _SesionFalsa(escrituras))
+    monkeypatch.setattr(
+        snapshot,
+        "_borrar_stock_no_reportado",
+        lambda ts: bajas.append(ts) or 0,
+    )
+    return snapshot, escrituras, bajas
+
+
+def test_el_stock_se_baja_en_paralelo_y_no_pagina_a_pagina():
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.snapshot_stock))
+
+    assert "ThreadPoolExecutor" in codigo, "la bajada tiene que ser en paralelo"
+    assert "BSALE_STOCK_WORKERS" in codigo, "la concurrencia tiene que ser regulable"
+    assert 'primera.get("count")' in codigo, (
+        "el plan de la corrida sale de count, no de llegar a una pagina vacia"
+    )
+
+
+def test_una_corrida_completa_de_stock_lee_todo_y_recien_ahi_da_de_baja(monkeypatch):
+    cliente = _ClienteStockFalso(total=1000)
+    snapshot, escrituras, bajas = _montar_stock(monkeypatch, cliente)
+
+    out = snapshot.snapshot_stock(max_pages=6000)
+
+    assert out["completo"] is True
+    assert out["rows"] == 1000
+    assert out["filas_vistas"] == 1000
+    assert out["count_bsale"] == 1000
+    assert out["paginas_previstas"] == 20
+    assert "stock_error" not in out
+    assert len(bajas) == 1, "solo tras una corrida completa se da de baja"
+    # 20 paginas del plan + 1 de cola que vuelve vacia. Nada mas.
+    assert sorted(cliente.offsets) == [50 * p for p in range(21)]
+
+
+def test_una_pagina_que_falla_deja_la_corrida_incompleta_y_no_borra_nada(monkeypatch):
+    cliente = _ClienteStockFalso(total=1000, fallar_en={200})
+    snapshot, escrituras, bajas = _montar_stock(monkeypatch, cliente)
+
+    out = snapshot.snapshot_stock(max_pages=6000)
+
+    assert out["completo"] is False
+    assert "stock_error" in out, "cron_snapshot marca la corrida por la clave *_error"
+    assert "200" in out["stock_error"]
+    assert bajas == [], "una corrida a medias no puede borrar stock"
+
+
+def test_una_pagina_vacia_sin_error_no_puede_dar_la_corrida_por_completa(monkeypatch):
+    """El modo de falla caro y silencioso.
+
+    Bsale bajo carga contesta 200 con items vacio. Si la completitud se midiera
+    solo por "todas las paginas respondieron", esta corrida quedaria completa y
+    _borrar_stock_no_reportado borraria 50 filas que SI existen: esas variantes
+    aparecerian en cero en la tienda hasta la corrida siguiente. La guardarraya
+    compara filas leidas contra count.
+    """
+    cliente = _ClienteStockFalso(total=1000, vacias={300})
+    snapshot, escrituras, bajas = _montar_stock(monkeypatch, cliente)
+
+    out = snapshot.snapshot_stock(max_pages=6000)
+
+    assert out["filas_vistas"] == 950
+    assert out["completo"] is False, "faltan 50 filas que Bsale dice tener"
+    assert "1000" in out["stock_error"] and "950" in out["stock_error"]
+    assert bajas == [], "no se borra nada cuando el conteo no cuadra"
+
+
+def test_si_bsale_crece_durante_la_corrida_la_cola_lo_alcanza(monkeypatch):
+    """count es la foto del arranque. Si entran filas nuevas, no pueden perderse."""
+    cliente = _ClienteStockFalso(total=1000)
+    snapshot, escrituras, bajas = _montar_stock(monkeypatch, cliente)
+
+    # A partir de la segunda pagina leida, Bsale ya tiene 1.100 filas.
+    original = cliente.get
+    estado = {"n": 0}
+
+    def get_creciendo(path, params=None, use_cache=True):
+        estado["n"] += 1
+        if estado["n"] > 1:
+            cliente.total = 1100
+        return original(path, params=params, use_cache=use_cache)
+
+    monkeypatch.setattr(cliente, "get", get_creciendo)
+
+    out = snapshot.snapshot_stock(max_pages=6000)
+
+    assert out["filas_vistas"] == 1100, "las 100 filas nuevas entran por la cola"
+    assert out["paginas_cola"] == 2
+    assert out["completo"] is True
+    assert len(bajas) == 1

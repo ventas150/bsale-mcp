@@ -258,19 +258,71 @@ def snapshot_documents_range(
 
 
 def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
-    """Snapshot del stock actual por sucursal.
+    """Snapshot del stock actual por sucursal, bajado en paralelo.
 
-    Pagina incrementalmente y persiste cada N paginas para no perder data si timeout.
+    Antes esto paginaba de a una pagina en serie: ~1,4 s por cada 50 filas.
+    Con ~150.000 filas son ~3.000 paginas y mas de una hora de corrida, durante
+    la cual el cron esta tomado y cualquier deploy la mata a medio camino.
+
+    Ahora la pagina 0 trae ademas `count`, y con eso se calcula la lista exacta
+    de offsets y se bajan con un pool de threads. `count` da tambien un criterio
+    de completitud mucho mas fuerte que el anterior ("llegue a una pagina
+    vacia"): la corrida es completa solo si se leyeron TODAS las paginas
+    previstas y ninguna fallo. Eso importa porque de ese criterio depende si se
+    borran o no las filas que la corrida no toco.
     """
     client = get_client()
     snapshot_ts = datetime.now(timezone.utc)
 
-    PERSIST_EVERY = 10  # persiste cada 10 paginas (500 rows) para no perder progreso
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple] = set()
-    total_persisted = 0
+    PAGE = 50
+    FLUSH_CADA = 40  # paginas por flush (2.000 filas)
+    COLA_MAX = 40    # paginas extra si Bsale crecio durante la corrida
+    workers = max(1, int(os.getenv("BSALE_STOCK_WORKERS", "4")))
 
-    def _flush(buffer: list[dict[str, Any]]) -> int:
+    seen: set[tuple] = set()
+    buffer: list[dict[str, Any]] = []
+    total_persisted = 0
+    paginas_ok = 0
+    error: str | None = None
+
+    def _pagina(offset: int) -> dict[str, Any]:
+        return client.get(
+            "/v1/stocks.json",
+            params={"limit": PAGE, "offset": offset, "expand": "[variant,office]"},
+            use_cache=False,
+        )
+
+    def _intento(offset: int):
+        try:
+            return offset, _pagina(offset), None
+        except Exception as e:  # noqa: BLE001
+            return offset, None, f"{type(e).__name__}: {str(e)[:200]}"
+
+    def _acumular(data: dict[str, Any]) -> int:
+        n = 0
+        for item in (data.get("items") or []):
+            variant = item.get("variant") or {}
+            office = item.get("office") or {}
+            vid = variant.get("id")
+            oid = office.get("id")
+            if vid is None or oid is None:
+                continue
+            key = (vid, oid)
+            if key in seen:
+                continue
+            seen.add(key)
+            buffer.append({
+                "updated_at": snapshot_ts,
+                "variant_id": vid,
+                "office_id": oid,
+                "quantity": float(item.get("quantity", 0) or 0),
+                "variant_code": variant.get("code"),
+                "office_name": office.get("name"),
+            })
+            n += 1
+        return n
+
+    def _flush() -> int:
         """Upsert sobre el estado actual.
 
         Antes era on_conflict_do_nothing sobre (snapshot_date, variant_id,
@@ -292,84 +344,110 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
                 },
             )
             s.execute(stmt)
-        return len(buffer)
+        n = len(buffer)
+        buffer.clear()
+        return n
 
-    error: str | None = None
-    incompleto = False
-    completo = False
-    page = -1
-    for page in range(max_pages):
-        try:
-            data = client.get(
-                "/v1/stocks.json",
-                params={"limit": 50, "offset": page * 50, "expand": "[variant,office]"},
-                use_cache=False,
-            )
-        except Exception as e:  # noqa: BLE001
-            # Antes esto era `break` a secas: un 5xx o un 429 en la pagina 300
-            # de ~6.000 cortaba en silencio, se hacia flush de lo que llevaba y
-            # se devolvia un dict SIN ninguna marca de error. cron_snapshot.py
-            # busca claves *_error para marcar la corrida como fallida, no
-            # encontraba ninguna, y la daba por exitosa. Peor: como
-            # build_stock_resumen y la vista stock_current usan
-            # max(snapshot_date), esa foto del 5% GANABA sobre la completa.
-            error = f"{type(e).__name__}: {str(e)[:200]}"
-            incompleto = True
-            logger.error("snapshot_stock corto en la pagina %d: %s", page, error)
+    # Pagina 0 aparte: si esta falla no hay corrida, y su `count` es lo que
+    # define el plan del resto.
+    _, primera, err0 = _intento(0)
+    if err0 is not None:
+        logger.error("snapshot_stock no pudo leer la pagina 0: %s", err0)
+        return {
+            "snapshot_ts": snapshot_ts.isoformat(),
+            "rows": 0,
+            "paginas_leidas": 0,
+            "completo": False,
+            "stock_error": err0,
+            "advertencia": (
+                "No se pudo leer la primera pagina de stock. No se escribio ni "
+                "se borro nada: el estado anterior queda intacto."
+            ),
+        }
+
+    paginas_ok = 1
+    _acumular(primera)
+    total_bsale = int(primera.get("count") or 0)
+
+    paginas_previstas = max(1, -(-total_bsale // PAGE)) if total_bsale else 1
+    tope = min(paginas_previstas, max_pages)
+    truncado = paginas_previstas > max_pages
+    offsets = [p * PAGE for p in range(1, tope)]
+
+    if offsets:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i in range(0, len(offsets), FLUSH_CADA):
+                lote = offsets[i:i + FLUSH_CADA]
+                for offset, data, err in pool.map(_intento, lote):
+                    if err is not None:
+                        error = error or f"offset {offset}: {err}"
+                        logger.error(
+                            "snapshot_stock fallo en offset %d: %s", offset, err
+                        )
+                        continue
+                    paginas_ok += 1
+                    _acumular(data)
+                total_persisted += _flush()
+
+    # Cola: `count` es la foto del instante en que arranco la corrida. Si Bsale
+    # sumo filas mientras bajabamos quedan fuera del plan, asi que se siguen
+    # leyendo de a una hasta que venga una pagina corta o vacia.
+    cola = 0
+    offset = tope * PAGE
+    while error is None and not truncado and cola < COLA_MAX:
+        _, data, err = _intento(offset)
+        if err is not None:
+            error = f"cola offset {offset}: {err}"
             break
-        items = data.get("items", []) or []
+        items = data.get("items") or []
         if not items:
-            completo = True
+            break
+        paginas_ok += 1
+        cola += 1
+        _acumular(data)
+        offset += PAGE
+        if len(items) < PAGE:
             break
 
-        for item in items:
-            variant = item.get("variant") or {}
-            office = item.get("office") or {}
-            vid = variant.get("id")
-            oid = office.get("id")
-            if vid is None or oid is None:
-                continue
-            key = (vid, oid)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({
-                "updated_at": snapshot_ts,
-                "variant_id": vid,
-                "office_id": oid,
-                "quantity": float(item.get("quantity", 0) or 0),
-                "variant_code": variant.get("code"),
-                "office_name": office.get("name"),
-            })
+    total_persisted += _flush()
 
-        # Flush incremental cada N paginas
-        if (page + 1) % PERSIST_EVERY == 0 and rows:
-            total_persisted += _flush(rows)
-            rows = []
+    # Guardarraya. `count` dice cuantas filas deberia haber. Contar paginas no
+    # alcanza: Bsale bajo carga devuelve 200 con items vacio, sin error. Con el
+    # criterio de "todas las paginas respondieron" esa corrida quedaria
+    # COMPLETA, y entonces _borrar_stock_no_reportado borraria las filas de esa
+    # pagina, que existen. Un stock viejo se corrige solo en la corrida
+    # siguiente; uno borrado se ve como cero en la tienda.
+    filas_vistas = len(seen)
+    faltante = total_bsale - filas_vistas
+    if total_bsale and faltante > 10:
+        error = error or (
+            f"Bsale reporta {total_bsale} filas de stock y solo se leyeron "
+            f"{filas_vistas} ({faltante} sin explicacion)"
+        )
 
-        if len(items) < 50:
-            completo = True
-            break
-    else:
-        # Se agotaron las max_pages sin llegar al final del listado.
-        incompleto = True
-        error = error or f"se alcanzo el tope de {max_pages} paginas"
+    completo = error is None and not truncado and paginas_ok == tope + cola
 
-    # Flush remaining
-    if rows:
-        total_persisted += _flush(rows)
-
-    out = {
+    out: dict[str, Any] = {
         "snapshot_ts": snapshot_ts.isoformat(),
         "rows": total_persisted,
+        "count_bsale": total_bsale,
+        "paginas_previstas": paginas_previstas,
+        "paginas_leidas": paginas_ok,
+        "paginas_cola": cola,
+        "filas_vistas": filas_vistas,
+        "workers": workers,
         "max_pages_attempted": max_pages,
-        "paginas_leidas": page + 1,
-        "completo": bool(completo and not incompleto),
+        "completo": completo,
     }
-    if incompleto or not completo:
+    if truncado:
+        error = error or (
+            f"se alcanzo el tope de {max_pages} paginas y Bsale reporta "
+            f"{paginas_previstas}"
+        )
+    if not completo:
         # La clave *_error es la que hace que cron_snapshot marque la corrida
         # como fallida y dispare la notificacion de Render.
-        out["stock_error"] = error or "la corrida no llego al final del listado"
+        out["stock_error"] = error or "la corrida no leyo todas las paginas previstas"
         out["advertencia"] = (
             "Corrida de stock incompleta: hay variantes con el valor de una "
             "corrida anterior. Mirar updated_at por fila para saber cuales. "
