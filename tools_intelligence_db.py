@@ -99,18 +99,32 @@ def cobertura_de_detalle(desde, hasta, office_id=None) -> dict[str, Any]:
     d = documents_snapshot.c
     det = document_details_snapshot.c
     cond_doc = [d.emission_date.between(desde, hasta), *official_sale_conditions(documents_snapshot)]
-    cond_det = [det.emission_date.between(desde, hasta)]
     if office_id:
         cond_doc.append(d.office_id == office_id)
-        cond_det.append(det.office_id == office_id)
+
+    # Los dos lados tienen que contar el MISMO universo. El numerador contaba
+    # los document_id distintos de document_details_snapshot filtrando solo por
+    # fecha y sucursal, sin la regla de venta oficial, mientras el denominador
+    # si la aplicaba. Como los pedidos web, las notas de venta y los anulados
+    # tambien tienen lineas, el numerador incluia documentos que el
+    # denominador excluye: el 08-sep-2026 los ultimos 30 dias daban 5.208 de
+    # 5.128, o sea 101,6% de cobertura. Un porcentaje sobre 100 es la senal de
+    # que se estan comparando dos poblaciones distintas — y hacia parecer
+    # completo un periodo al que le faltaba detalle.
+    tiene_detalle = exists().where(
+        and_(
+            det.document_id == d.document_id,
+            det.emission_date.between(desde, hasta),
+        )
+    )
     with db_session() as s:
         total = s.execute(
             select(func.count()).select_from(documents_snapshot).where(and_(*cond_doc))
         ).scalar() or 0
         con_det = s.execute(
-            select(func.count(func.distinct(det.document_id)))
-            .select_from(document_details_snapshot)
-            .where(and_(*cond_det))
+            select(func.count())
+            .select_from(documents_snapshot)
+            .where(and_(*cond_doc, tiene_detalle))
         ).scalar() or 0
     pct = round(100 * con_det / total, 1) if total else 0.0
     out = {

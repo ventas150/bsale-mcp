@@ -913,3 +913,29 @@ def test_details_batch_topa_el_lote():
 
     # y el tope tiene que ser real, no solo texto
     assert batch(max_docs=2001).get("aplicado") is False
+
+
+# ============================================================
+# La cobertura de detalle no puede pasar de 100%
+# ============================================================
+# El numerador contaba document_id distintos de document_details_snapshot
+# filtrando solo por fecha y sucursal, sin la regla de venta oficial; el
+# denominador si la aplicaba. Como los pedidos web, las notas de venta y los
+# anulados tambien tienen lineas, el numerador incluia documentos que el
+# denominador excluye. Medido el 08-sep-2026: 5.208 de 5.128 = 101,6%. Un
+# porcentaje sobre 100 delata que se comparan dos poblaciones distintas, y
+# hacia parecer completo un periodo al que le faltaba detalle.
+
+def test_cobertura_compara_el_mismo_universo():
+    import inspect
+
+    tidb = pytest.importorskip("tools_intelligence_db")
+    codigo = _solo_codigo(inspect.getsource(tidb.cobertura_de_detalle))
+
+    # el numerador ya no puede salir de contar la tabla de lineas suelta
+    assert "select_from(document_details_snapshot)" not in codigo, (
+        "el numerador tiene que contar cabeceras que TIENEN detalle, no lineas"
+    )
+    # y tiene que aplicar los mismos filtros que el denominador
+    assert "and_(*cond_doc, tiene_detalle)" in codigo
+    assert "cond_det" not in codigo, "cond_det era el filtro paralelo que no calzaba"
