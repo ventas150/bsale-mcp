@@ -224,6 +224,35 @@ def run(modo: str) -> int:
             logger.error("Error en sync_variantes: %s", e)
             results["variants_error"] = str(e)
 
+    # Detalle de linea del hueco historico, del mas viejo al mas nuevo.
+    #
+    # OJO CON DONDE VIVE ESTE PASO. El cron de Render corre
+    # `python sync_incremental.py --modo auto`, NO cron_snapshot.py. La
+    # primera version de este backfill quedo dentro de nightly_snapshot(),
+    # que ningun cron ejecuta: habria estado "listo" sin correr nunca.
+    # Verificado el 08-sep-2026 leyendo la configuracion del cron en Render.
+    #
+    # POR QUE HACE FALTA: el paso de detalle de sync_ventas mira solo lo
+    # reciente. Medido el 08-sep-2026: ene-ago 2025 tenia 0% de detalle de
+    # linea en 54.562 documentos y ene-ago 2026 un 58,2%, asi que las
+    # UNIDADES no se podian comparar ano contra ano.
+    #
+    # El presupuesto es chico A PROPOSITO: este cron corre cada 30 minutos y
+    # la corrida normal dura ~1m30s. 2.000 documentos son ~45 s a los 45
+    # doc/s medidos. Con 48 corridas al dia son ~96.000 documentos diarios,
+    # o sea que los ~51.000 pendientes se cierran en menos de un dia sin
+    # alargar ninguna corrida ni arriesgar solapamiento.
+    try:
+        from snapshot import snapshot_details
+
+        results["detalle_historico"] = snapshot_details(
+            max_docs=int(os.getenv("DETALLE_HISTORICO_POR_CORRIDA", "2000")),
+            oldest_first=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en el backfill historico de detalle: %s", e)
+        results["detalle_historico_error"] = str(e)
+
     # Regenerar la capa LLM (antes del stock, que es el paso lento).
     try:
         from digests import build_all

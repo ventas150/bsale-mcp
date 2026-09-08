@@ -1064,3 +1064,51 @@ def test_la_retencion_corre_antes_del_backfill_historico():
     assert codigo.index("apply_retention") < codigo.index("oldest_first=True"), (
         "si la corrida muere en el backfill, la retencion no corre esa noche"
     )
+
+
+# ============================================================
+# Un paso automatico tiene que vivir donde el cron lo ejecuta
+# ============================================================
+# El cron de Render corre `python sync_incremental.py --modo auto` cada 30
+# minutos. NO corre cron_snapshot.py. El 08-sep-2026 se programo el backfill
+# historico de detalle dentro de nightly_snapshot(), que ningun cron llama:
+# quedo "listo" sin poder ejecutarse nunca. Los 51.000 documentos de 2025 no
+# se habrian completado jamas y nadie se habria enterado, porque el paso
+# existia y los tests pasaban.
+
+def test_el_backfill_historico_vive_donde_el_cron_lo_ejecuta():
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    codigo = _solo_codigo(inspect.getsource(sync.run))
+
+    assert "snapshot_details(" in codigo, (
+        "el backfill historico de detalle tiene que estar en sync_incremental.run(), "
+        "que es lo que el cron ejecuta de verdad"
+    )
+    assert "oldest_first=True" in codigo, (
+        "sin oldest_first nunca se llega a los periodos viejos"
+    )
+
+
+def test_el_presupuesto_por_corrida_cabe_en_la_cadencia():
+    """El cron dispara cada 30 min y la corrida normal dura ~1m30s.
+
+    Un presupuesto grande por corrida alarga cada pasada y arriesga que dos
+    corridas se solapen.
+    """
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    codigo = _solo_codigo(inspect.getsource(sync.run))
+    assert 'DETALLE_HISTORICO_POR_CORRIDA", "2000"' in codigo
+
+
+def test_nightly_snapshot_declara_que_no_lo_corre_el_cron():
+    """Para que nadie vuelva a agregar un paso automatico en codigo muerto."""
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    doc = inspect.getdoc(snapshot.nightly_snapshot) or ""
+    assert "NINGUN CRON" in doc.upper()
+    assert "sync_incremental" in doc

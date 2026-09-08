@@ -636,7 +636,19 @@ def snapshot_details(
 
 
 def nightly_snapshot() -> dict[str, Any]:
-    """Job nocturno: ejecuta todos los snapshots en orden."""
+    """Job nocturno completo. OJO: HOY NINGUN CRON LLAMA A ESTA FUNCION.
+
+    El cron de Render `bsale-mcp-snapshot` corre
+    `python sync_incremental.py --modo auto` cada 30 minutos, NO
+    cron_snapshot.py. Verificado en la configuracion del cron el
+    08-sep-2026, despues de programar aca un backfill que nunca iba a
+    ejecutarse.
+
+    Se conserva porque sirve para una corrida completa a mano y porque
+    cron_snapshot.py la usa si algun dia se agenda. **Antes de agregar un
+    paso aca, confirmar en el dashboard de Render que comando corre el
+    cron.** Si el paso tiene que correr solo, va en sync_incremental.run().
+    """
     logger.info("Iniciando snapshot nocturno")
     results = {}
     try:

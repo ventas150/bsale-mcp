@@ -1,5 +1,12 @@
 """Entry point del snapshot nocturno como proceso aparte (Render Cron Job).
 
+OJO (08-sep-2026): el cron `bsale-mcp-snapshot` NO corre este archivo. Corre
+`python sync_incremental.py --modo auto` cada 30 minutos. Este entry point
+queda disponible para una corrida completa a mano, pero editarlo NO cambia
+nada de lo que pasa solo. Verificar siempre el comando en el dashboard antes
+de tocar cualquiera de los dos.
+
+
 Reemplaza al APScheduler in-process de server.py: el snapshot pesado deja de
 competir por memoria con el web service y ya no muere en cada redeploy.
 Render ejecuta este script segun el schedule del cron job; corre una vez y
