@@ -173,22 +173,50 @@ def register(mcp) -> None:  # noqa: ANN001
 
     @mcp.tool()
     def bsale_snapshot_details_batch(
-        batch_size: int = 100,
-        max_docs: int = 200,
+        batch_size: int | None = None,
+        max_docs: int = 1000,
         only_recent_days: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        oldest_first: bool = False,
     ) -> dict[str, Any]:
         """Fetch details (line items) para docs sin details aun. WRITE OP.
 
-        Una sola llamada procesa hasta `batch_size` docs (1 API call/doc a Bsale).
-        Para backfill grande, llamar varias veces hasta remaining_to_process=0.
+        1 API call por documento. Medido el 08-sep-2026: ~8 documentos por
+        segundo, o sea que 1.000 documentos son unos 2 minutos. Ese es el tope
+        razonable por llamada: corre dentro del web service.
+
+        Para un backfill grande, llamar varias veces hasta que
+        remaining_to_process llegue a 0. Ese numero ahora es un COUNT real
+        sobre la base; antes se calculaba restando el tope y daba 0 siempre.
 
         Args:
-            batch_size: Docs a procesar por llamada (default 100).
-            max_docs: Cap absoluto de docs a procesar en esta llamada.
-            only_recent_days: Si pasa N, solo procesa docs ultimos N dias.
+            batch_size: Alias historico de max_docs. Si vienen los dos, manda el menor.
+            max_docs: Documentos por llamada (default 1.000, ~2 minutos).
+            only_recent_days: Solo documentos de los ultimos N dias.
+            date_from / date_to: Ventana explicita 'YYYY-MM-DD' inclusive. Es la
+                forma de rellenar un periodo viejo puntual.
+            oldest_first: Del mas viejo al mas nuevo. Necesario para un backfill
+                historico: con el orden por defecto nunca se llega a lo viejo.
         """
+        if max_docs and max_docs > 4000:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    f"max_docs={max_docs}. El tope es 4.000 (~8 minutos) porque "
+                    "esto corre DENTRO del web service, el mismo proceso que "
+                    "responde /health. Para el hueco historico completo no hace "
+                    "falta forzar: el cron nocturno ya lo va cerrando solo."
+                ),
+                "alternativa": "llamar varias veces con max_docs<=4000",
+            }
         return snapshot_details(
-            batch_size=batch_size, max_docs=max_docs, only_recent_days=only_recent_days,
+            batch_size=batch_size,
+            max_docs=max_docs,
+            only_recent_days=only_recent_days,
+            date_from=date_from,
+            date_to=date_to,
+            oldest_first=oldest_first,
         )
 
     @mcp.tool()

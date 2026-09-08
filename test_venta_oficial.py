@@ -724,3 +724,185 @@ def test_health_no_bloquea_el_event_loop():
     # y no debe filtrar internals
     for prohibido in ("cache_file", "db_error", "escritura_precios"):
         assert prohibido not in codigo, f"/health no debe exponer {prohibido}"
+
+
+# ============================================================
+# Nada que vaya a una columna JSONB puede llevar datetime
+# ============================================================
+# mapping_audit.before y mapping_audit.after son JSONB. El driver los pasa
+# por json.dumps, que no sabe serializar datetime. bsale_mapping_crear metia
+# ahi la fila cruda (con created_at/updated_at) y bsale_mapping_actualizar el
+# snapshot leido de la base (idem): las dos escrituras al audit reventaban al
+# insertar. El tool fallaba entero, no solo el audit, porque van en la misma
+# transaccion.
+
+def test_lo_que_va_a_jsonb_no_lleva_datetime():
+    import json
+    from datetime import datetime, timezone
+
+    tools_mapping = pytest.importorskip("tools_mapping")
+
+    fila = {
+        "bsale_code": "ABC-123",
+        "confidence": 1.0,
+        "created_at": datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc),
+        "anidado": {"cuando": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+        "lista": [datetime(2026, 1, 2, tzinfo=timezone.utc), "texto", 3],
+        "nulo": None,
+    }
+
+    # la fila cruda es exactamente lo que reventaba
+    with pytest.raises(TypeError):
+        json.dumps(fila)
+
+    limpia = tools_mapping._jsonable(fila)
+    json.dumps(limpia)  # no debe tirar
+
+    assert limpia["created_at"] == "2026-09-08T12:00:00+00:00"
+    assert limpia["anidado"]["cuando"] == "2026-01-01T00:00:00+00:00"
+    assert limpia["lista"][0] == "2026-01-02T00:00:00+00:00"
+    assert limpia["lista"][1] == "texto"
+    assert limpia["lista"][2] == 3
+    assert limpia["nulo"] is None
+    assert limpia["confidence"] == 1.0
+
+
+def test_los_tools_de_mapping_pasan_todo_por_jsonable():
+    """Que el helper exista no sirve si el tool no lo usa."""
+    import inspect
+
+    tools_mapping = pytest.importorskip("tools_mapping")
+    src = inspect.getsource(tools_mapping.register)
+
+    # ninguna insercion al audit puede pasar un valor crudo
+    for crudo in ("after=row,", "before=before,", "after={**before, **updates},"):
+        assert crudo not in src, f"{crudo} va crudo a una columna JSONB"
+
+    assert "after=_jsonable(row)" in src
+    assert "before=_jsonable(before)" in src
+
+
+# ============================================================
+# La escritura de precios usa el endpoint que existe
+# ============================================================
+# Bsale no tiene POST de detalles de lista de precio. Su documentacion: "NO
+# existe un POST de lista de precio, debido a que las listas de precios
+# comparten el total de productos de Bsale. Y solo se puede editar sus
+# valores, con el verbo PUT". El codigo posteaba un lote a
+# /v1/price_lists/{id}/details.json, que no existe: habria fallado DESPUES de
+# consumir el confirm_token.
+
+def test_precios_no_postean_al_endpoint_que_no_existe():
+    import inspect
+
+    tools_writes = pytest.importorskip("tools_writes")
+    src = inspect.getsource(tools_writes.register)
+
+    assert "/details.json\", json_body" not in src
+    assert "client.post(" not in src.split("# PRECIOS")[-1], (
+        "la escritura de precios no puede usar POST: Bsale solo documenta PUT"
+    )
+    assert "details/{detalle_id}.json" in src, "tiene que ir por PUT al detalle"
+
+
+def test_precios_abortan_si_falta_el_id_del_detalle():
+    """Sin detail_id no hay forma de escribir; no se escribe nada a medias."""
+    import inspect
+
+    tools_writes = pytest.importorskip("tools_writes")
+    src = inspect.getsource(tools_writes.register)
+
+    assert "variantes_sin_detalle" in src
+    # el chequeo tiene que estar ANTES del bucle que escribe
+    assert src.index("sin_detalle") < src.index("client.put(")
+
+
+# ============================================================
+# El backfill de detalle de linea tiene que poder terminar
+# ============================================================
+# Medido el 08-sep-2026: ene-ago 2025 tenia 0% de detalle en 54.562
+# documentos y ene-ago 2026 un 58,2%. La causa no era el volumen: el nocturno
+# llamaba snapshot_details(only_recent_days=90), asi que nada anterior a 90
+# dias se iba a completar NUNCA. Encima habia dos topes encadenados
+# (todo[:max_docs] y despues todo[:batch_size]) donde mandaba el menor en
+# silencio, y remaining_to_process se calculaba restando el tope, o sea daba
+# 0 con 129.000 documentos pendientes.
+
+def test_el_nocturno_cierra_el_hueco_historico():
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    src = inspect.getsource(snapshot.nightly_snapshot)
+
+    assert "oldest_first=True" in src, (
+        "sin oldest_first el backfill se queda masticando lo reciente y nunca "
+        "llega a los periodos viejos"
+    )
+    assert "details_historico" in src
+
+
+def _solo_codigo(src: str) -> str:
+    """Descarta docstrings y comentarios de un fuente.
+
+    Estos tests buscan patrones prohibidos en el CODIGO, y los
+    comentarios de este repo NOMBRAN el patron viejo para explicar por
+    que se saco. Sin este filtro el test prueba el comentario en vez del
+    codigo: ya paso dos veces (health_check y snapshot_details).
+    """
+    lineas = []
+    en_docstring = False
+    for linea in src.splitlines():
+        limpia = linea.strip()
+        if limpia.startswith(chr(34) * 3) or limpia.startswith(chr(39) * 3):
+            comillas = limpia[:3]
+            if len(limpia) > 3 and limpia.endswith(comillas):
+                continue
+            en_docstring = not en_docstring
+            continue
+        if en_docstring or limpia.startswith('#'):
+            continue
+        lineas.append(linea)
+    return chr(10).join(lineas)
+
+
+def test_snapshot_details_tiene_un_solo_tope():
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.snapshot_details))
+
+    # el segundo corte encadenado era el bug
+    assert "todo[:batch_size]" not in codigo
+    assert ".limit(cap)" in codigo, "el tope tiene que ir en el query"
+    assert "cap_efectivo" in codigo, "el tope efectivo se declara en el resultado"
+
+    # y lo que queda tiene que ser un count real, no una resta del tope
+    assert "len(todo) - batch_size" not in codigo
+    assert "pendientes_antes" in codigo
+
+
+def test_snapshot_details_acepta_ventana_de_fechas():
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    params = inspect.signature(snapshot.snapshot_details).parameters
+    for esperado in ("date_from", "date_to", "oldest_first"):
+        assert esperado in params, f"falta el parametro {esperado}"
+
+
+def test_dia_utc_es_medianoche_exacta():
+    from datetime import datetime, timezone
+
+    snapshot = pytest.importorskip("snapshot")
+    d = snapshot._dia_utc("2025-03-31")
+    assert d == datetime(2025, 3, 31, 0, 0, tzinfo=timezone.utc)
+
+
+def test_details_batch_topa_el_lote():
+    """Corre dentro del web service: un lote enorme lo deja sin /health."""
+    tools = _tools_de(pytest.importorskip("tools_snapshot"))
+    batch = tools["bsale_snapshot_details_batch"]
+    r = batch(max_docs=50000)
+    assert r.get("aplicado") is False
+    assert "4.000" in str(r)

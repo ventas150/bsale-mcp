@@ -9,10 +9,11 @@ Esto evita el doble conteo que existia con la PK compuesta (snapshot_date, docum
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bsale_client import get_client, is_sales_doc, iso_to_epoch_range
@@ -25,6 +26,16 @@ from db import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dia_utc(fecha: str) -> datetime:
+    """'YYYY-MM-DD' -> medianoche UTC exacta.
+
+    emission_date en el snapshot es medianoche UTC exacta (es una FECHA
+    disfrazada de timestamp), asi que comparar contra medianoche UTC hace que
+    date_to sea inclusivo sin sumar un dia.
+    """
+    return datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
 def _ts_to_dt(ts: Any) -> datetime | None:
@@ -418,57 +429,95 @@ def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
 
 
 def snapshot_details(
-    batch_size: int = 50,
-    max_docs: int = 500,
+    batch_size: int | None = None,
+    max_docs: int | None = None,
     only_recent_days: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    oldest_first: bool = False,
 ) -> dict[str, Any]:
     """Para docs en documents_snapshot que aun no tienen details, fetch y store.
 
     Bsale requiere 1 API call por documento para sus details. Esta funcion
-    es la mas costosa - se ejecuta en batches para no timeout.
+    es la mas costosa. Medido el 08-sep-2026: ~8 documentos por segundo.
+
+    OJO con batch_size y max_docs: eran DOS topes distintos aplicados uno
+    despues del otro (`todo[:max_docs]` y despues `for cand in todo[:batch_size]`),
+    asi que mandaba el mas chico y el otro no hacia nada. Con los defaults
+    viejos (batch_size=50, max_docs=500) pedir 500 documentos procesaba 50 y
+    no lo decia. Ahora hay UN tope efectivo y va declarado en el resultado.
 
     Args:
-        batch_size: Cuantos docs procesar por llamada.
-        max_docs: Cap absoluto de docs a procesar en esta llamada.
-        only_recent_days: Si pasa N, solo procesa docs con emission_date >= now - N dias.
-            None = todos los docs sin details aun.
+        batch_size: Alias historico de max_docs. Si vienen los dos, manda el menor.
+        max_docs: Cuantos documentos procesar en esta llamada. Default 400.
+        only_recent_days: Solo docs con emission_date >= now - N dias.
+        date_from / date_to: Ventana explicita 'YYYY-MM-DD' (inclusive). Es lo
+            que se usa para rellenar un periodo viejo puntual — el nocturno
+            corria con only_recent_days=90, asi que ningun documento anterior
+            a esa ventana se iba a completar NUNCA por si solo.
+        oldest_first: Procesa del mas viejo al mas nuevo. Para que un backfill
+            historico avance en vez de quedarse siempre en lo reciente.
 
     Returns:
-        Dict con count de docs procesados, lineas insertadas, errores.
+        Dict con count de docs procesados, lineas insertadas, errores y el
+        tope efectivo que se aplico.
     """
     client = get_client()
 
-    # 1. Encuentra docs sin details aun (LEFT JOIN antimatch)
-    with db_session() as s:
-        existing_doc_ids = set(s.execute(
-            select(document_details_snapshot.c.document_id).distinct()
-        ).scalars().all())
+    topes = [t for t in (batch_size, max_docs) if t]
+    cap = min(topes) if topes else 400
 
-        # Docs candidatos. Seleccionamos document_type_use (columna liviana) en vez
-        # de raw (JSONB completo) para no cargar miles de documentos enteros en
-        # memoria — esto evita los OOM al ampliar la ventana de dias.
-        cand_stmt = select(
-            documents_snapshot.c.document_id,
-            documents_snapshot.c.emission_date,
-            documents_snapshot.c.office_id,
-            documents_snapshot.c.document_type_use,
+    # 1. Encuentra docs sin details aun. El anti-join va en SQL: la version
+    # anterior traia a Python TODOS los document_id con detalle y TODOS los
+    # documentos del snapshot para cruzarlos en memoria (159.000 filas y
+    # subiendo) solo para quedarse con unos cientos.
+    with db_session() as s:
+        ya_tienen = select(document_details_snapshot.c.document_id).where(
+            document_details_snapshot.c.document_id == documents_snapshot.c.document_id
         )
+        filtros = [~ya_tienen.exists()]
         if only_recent_days:
             from datetime import timedelta as _td
             cutoff = datetime.now(timezone.utc) - _td(days=only_recent_days)
-            cand_stmt = cand_stmt.where(documents_snapshot.c.emission_date >= cutoff)
-        cand_stmt = cand_stmt.order_by(documents_snapshot.c.emission_date.desc())
+            filtros.append(documents_snapshot.c.emission_date >= cutoff)
+        if date_from:
+            filtros.append(documents_snapshot.c.emission_date >= _dia_utc(date_from))
+        if date_to:
+            filtros.append(documents_snapshot.c.emission_date <= _dia_utc(date_to))
 
-        candidates = s.execute(cand_stmt).fetchall()
+        orden = (
+            documents_snapshot.c.emission_date.asc()
+            if oldest_first
+            else documents_snapshot.c.emission_date.desc()
+        )
+        cand_stmt = (
+            select(
+                documents_snapshot.c.document_id,
+                documents_snapshot.c.emission_date,
+                documents_snapshot.c.office_id,
+                documents_snapshot.c.document_type_use,
+            )
+            .where(*filtros)
+            .order_by(orden)
+            .limit(cap)
+        )
+        todo = s.execute(cand_stmt).fetchall()
 
-    # Filtra los que ya tienen details
-    todo = [c for c in candidates if c.document_id not in existing_doc_ids][:max_docs]
+        # Cuantos quedan DE VERDAD con estos mismos filtros. La version
+        # anterior calculaba `len(todo) - batch_size`, que con el tope aplicado
+        # da 0 siempre: el tool informaba "no queda nada" con 129.000
+        # documentos pendientes.
+        pendientes_antes = s.execute(
+            select(func.count()).select_from(documents_snapshot).where(*filtros)
+        ).scalar_one()
 
     rows_inserted = 0
     docs_processed = 0
     errors = 0
 
-    for cand in todo[:batch_size]:
+    # El tope ya lo aplico el LIMIT del query. Volver a cortar aca con otra
+    # variable es justo el bug que se acaba de sacar.
+    for cand in todo:
         doc_id = cand.document_id
         emission_date = cand.emission_date
         office_id = cand.office_id
@@ -527,14 +576,13 @@ def snapshot_details(
             rows_inserted += len(line_rows)
         docs_processed += 1
 
-    remaining = max(0, len(todo) - batch_size)
-
     return {
         "docs_processed": docs_processed,
         "lines_inserted": rows_inserted,
         "errors": errors,
-        "remaining_to_process": remaining,
-        "candidates_total": len(todo),
+        "cap_efectivo": cap,
+        "remaining_to_process": max(0, pendientes_antes - docs_processed),
+        "candidates_total": pendientes_antes,
     }
 
 
@@ -572,13 +620,37 @@ def nightly_snapshot() -> dict[str, Any]:
         logger.error("Error en snapshot_variants: %s", e)
         results["variants_error"] = str(e)
 
-    # Details para docs recientes. Ahora corre en el Cron Job dedicado (no compite
-    # con el web service), por lo que se puede subir el batch para mejor cobertura.
+    # Details para docs recientes. Corre en el Cron Job dedicado (no compite
+    # con el web service), asi que el batch puede ser grande.
     try:
-        results["details"] = snapshot_details(batch_size=400, max_docs=400, only_recent_days=90)
+        results["details"] = snapshot_details(max_docs=2000, only_recent_days=90)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en snapshot_details: %s", e)
         results["details_error"] = str(e)
+
+    # Y el hueco historico, del mas viejo al mas nuevo.
+    #
+    # POR QUE EXISTE ESTE PASO: el de arriba filtra a 90 dias. Todo documento
+    # anterior a esa ventana no lo miraba NADIE, nunca. Medido el 08-sep-2026:
+    # ene-ago 2025 tenia 0% de detalle de linea en 54.562 documentos, y ene-ago
+    # 2026 un 58,2%. O sea que las UNIDADES no se podian comparar ano contra
+    # ano, y el tool devolvia lista vacia sin decir por que.
+    #
+    # Va oldest_first a proposito: con el orden por defecto (mas nuevo
+    # primero) el backfill se queda para siempre masticando lo reciente y
+    # nunca llega a 2025.
+    #
+    # Presupuesto: ~8 documentos por segundo medidos, asi que 8.000 son unos
+    # 17 minutos por noche. Con ~129.000 pendientes converge en ~16 noches sin
+    # tocar la configuracion de Render ni alargar de golpe la corrida.
+    try:
+        results["details_historico"] = snapshot_details(
+            max_docs=int(os.getenv("DETAILS_BACKFILL_POR_NOCHE", "8000")),
+            oldest_first=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en el backfill historico de details: %s", e)
+        results["details_historico_error"] = str(e)
 
     logger.info("Snapshot nocturno completado: %s", results)
     # La retencion solo se llamaba desde sync_incremental.run(). Si el unico

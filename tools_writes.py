@@ -214,9 +214,16 @@ def register(mcp) -> None:  # noqa: ANN001
     # PRECIOS
     # ============================
 
-    def _leer_precios_actuales(client, price_list_id: int, variant_ids: list[int]) -> dict[int, float]:
-        """Lee el precio vigente de cada variante en la lista. Sin esto no hay rollback."""
-        actuales: dict[int, float] = {}
+    def _leer_detalles_actuales(
+        client, price_list_id: int, variant_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        """Lee el detalle vigente de cada variante: su id y su precio.
+
+        El `id` del detalle no es un lujo: es la unica forma documentada de
+        escribir un precio en Bsale (PUT sobre el detalle). Ver el comentario
+        de bsale_actualizar_precios_masivo.
+        """
+        detalles: dict[int, dict[str, Any]] = {}
         for vid in variant_ids:
             try:
                 data = client.get(
@@ -227,11 +234,22 @@ def register(mcp) -> None:  # noqa: ANN001
                 items = data.get("items") or []
                 if items:
                     valor = items[0].get("variantValue")
-                    if valor is not None:
-                        actuales[int(vid)] = float(valor)
+                    detalle_id = items[0].get("id")
+                    if valor is not None and detalle_id is not None:
+                        detalles[int(vid)] = {
+                            "detail_id": int(detalle_id),
+                            "precio": float(valor),
+                        }
             except Exception:  # noqa: BLE001
-                continue  # queda fuera de `actuales` -> el guardrail aborta
-        return actuales
+                continue  # queda fuera -> el guardrail aborta
+        return detalles
+
+    def _leer_precios_actuales(client, price_list_id: int, variant_ids: list[int]) -> dict[int, float]:
+        """Precio vigente por variante. Sin esto no hay rollback."""
+        return {
+            vid: d["precio"]
+            for vid, d in _leer_detalles_actuales(client, price_list_id, variant_ids).items()
+        }
 
     @mcp.tool()
     def bsale_actualizar_precios_masivo(
@@ -276,7 +294,8 @@ def register(mcp) -> None:  # noqa: ANN001
                         variant_ids.append(int(u["variant_id"]))
                     except (TypeError, ValueError):
                         pass
-            actuales = _leer_precios_actuales(client, price_list_id, variant_ids)
+            detalles = _leer_detalles_actuales(client, price_list_id, variant_ids)
+            actuales = {vid: d["precio"] for vid, d in detalles.items()}
             tabla = validate_price_updates(
                 updates, current=actuales, max_delta_pct=max_delta_pct
             )
@@ -303,25 +322,58 @@ def register(mcp) -> None:  # noqa: ANN001
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e), "cambios": 0}
 
-        body = {
-            "details": [
-                {"variantId": f["variant_id"], "variantValue": f["precio_nuevo"]}
-                for f in tabla
-            ]
-        }
-        resultado = client.post(
-            f"/v1/price_lists/{price_list_id}/details.json", json_body=body
-        )
+        # OJO: aca habia un POST a /v1/price_lists/{id}/details.json con un
+        # arreglo "details". ESE ENDPOINT NO EXISTE. La documentacion de Bsale
+        # es explicita: "NO existe un POST de lista de precio, debido a que las
+        # listas de precios comparten el total de productos de Bsale. Y solo se
+        # puede editar sus valores, con el verbo PUT". Lo unico documentado es
+        # PUT /v1/price_lists/{id}/details/{detailId}.json, de a un detalle.
+        # El POST habria fallado DESPUES de consumir el confirm_token, o sea
+        # con el candado ya gastado y sin haber escrito nada.
+        # Por eso hace falta el id del detalle, no el de la variante.
+        sin_detalle = [
+            f["variant_id"] for f in tabla if int(f["variant_id"]) not in detalles
+        ]
+        if sin_detalle:
+            return {
+                "aplicado": False,
+                "bloqueado_por": (
+                    "No se pudo resolver el id del detalle en la lista para "
+                    f"{len(sin_detalle)} variante(s). Sin ese id no hay forma "
+                    "documentada de escribir el precio, y no se escribe nada "
+                    "a medias."
+                ),
+                "variantes_sin_detalle": sin_detalle,
+                "cambios": 0,
+            }
+
+        aplicados: list[dict[str, Any]] = []
+        fallidos: list[dict[str, Any]] = []
+        for f in tabla:
+            vid = int(f["variant_id"])
+            detalle_id = detalles[vid]["detail_id"]
+            try:
+                client.put(
+                    f"/v1/price_lists/{price_list_id}/details/{detalle_id}.json",
+                    json_body={"id": detalle_id, "variantValue": f["precio_nuevo"]},
+                )
+                aplicados.append(f)
+            except Exception as e:  # noqa: BLE001
+                fallidos.append({**f, "error": str(e)})
+
         return {
-            "aplicado": True,
+            # Se escribe de a una variante, asi que una corrida puede quedar a
+            # medias. Se declara en vez de disfrazarlo de exito.
+            "aplicado": bool(aplicados) and not fallidos,
+            "parcial": bool(aplicados) and bool(fallidos),
             "price_list_id": price_list_id,
-            "cambios": len(tabla),
-            "tabla_aplicada": tabla,
+            "cambios": len(aplicados),
+            "fallidos": fallidos,
+            "tabla_aplicada": aplicados,
             "para_revertir": [
                 {"variant_id": f["variant_id"], "new_price": f["precio_actual"]}
-                for f in tabla
+                for f in aplicados
             ],
-            "respuesta_bsale": resultado,
         }
 
     @mcp.tool()

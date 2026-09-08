@@ -17,6 +17,27 @@ from sqlalchemy import or_, select
 from db import mapping_audit, session as db_session, sku_mapping
 
 
+def _jsonable(valor: Any) -> Any:
+    """Deja un valor listo para una columna JSONB.
+
+    OJO: mapping_audit.before y mapping_audit.after son JSONB. El driver los
+    serializa con json.dumps, que NO sabe convertir datetime y tira
+    "Object of type datetime is not JSON serializable". Tanto la fila que
+    arma bsale_mapping_crear (created_at, updated_at) como el snapshot
+    "before" que lee bsale_mapping_actualizar desde la base traen datetimes,
+    asi que las dos escrituras al audit reventaban al insertar. Los datetime
+    se guardan en ISO 8601, que es lo que se quiere leer despues de todos
+    modos.
+    """
+    if isinstance(valor, datetime):
+        return valor.isoformat()
+    if isinstance(valor, dict):
+        return {k: _jsonable(v) for k, v in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_jsonable(v) for v in valor]
+    return valor
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de mapping."""
 
@@ -97,11 +118,11 @@ def register(mcp) -> None:  # noqa: ANN001
             s.execute(mapping_audit.insert().values(
                 mapping_id=new_id,
                 action="created",
-                after=row,
+                after=_jsonable(row),
                 actor="mcp",
             ))
 
-        return {"mapping_id": new_id, "status": "created", "row": row}
+        return {"mapping_id": new_id, "status": "created", "row": _jsonable(row)}
 
     @mcp.tool()
     def bsale_mapping_actualizar(
@@ -144,12 +165,16 @@ def register(mcp) -> None:  # noqa: ANN001
             s.execute(mapping_audit.insert().values(
                 mapping_id=mapping_id,
                 action="updated",
-                before=before,
-                after={**before, **updates},
+                before=_jsonable(before),
+                after=_jsonable({**before, **updates}),
                 actor="mcp",
             ))
 
-        return {"mapping_id": mapping_id, "status": "updated", "updates": updates}
+        return {
+            "mapping_id": mapping_id,
+            "status": "updated",
+            "updates": _jsonable(updates),
+        }
 
     @mcp.tool()
     def bsale_mapping_auto_match_sku() -> dict[str, Any]:
