@@ -1211,11 +1211,17 @@ class _SesionFalsa:
         return None
 
 
+# Lo que snapshot_stock dejo registrado en sync_estado durante el ultimo
+# _montar_stock. Va aparte para no cambiarle la firma a la funcion.
+REGISTROS_STOCK = []
+
+
 def _montar_stock(monkeypatch, cliente):
     """Deja snapshot_stock corriendo contra el cliente falso y sin Postgres."""
     snapshot = pytest.importorskip("snapshot")
     escrituras = []
     bajas = []
+    REGISTROS_STOCK.clear()
     monkeypatch.setenv("BSALE_STOCK_WORKERS", "4")
     monkeypatch.setattr(snapshot, "get_client", lambda: cliente)
     monkeypatch.setattr(snapshot, "db_session", lambda: _SesionFalsa(escrituras))
@@ -1223,6 +1229,11 @@ def _montar_stock(monkeypatch, cliente):
         snapshot,
         "_borrar_stock_no_reportado",
         lambda ts: bajas.append(ts) or 0,
+    )
+    monkeypatch.setattr(
+        snapshot,
+        "_registrar_estado",
+        lambda clave, valor: REGISTROS_STOCK.append((clave, valor)),
     )
     return snapshot, escrituras, bajas
 
@@ -1312,3 +1323,112 @@ def test_si_bsale_crece_durante_la_corrida_la_cola_lo_alcanza(monkeypatch):
     assert out["paginas_cola"] == 2
     assert out["completo"] is True
     assert len(bajas) == 1
+
+
+# ---------------------------------------------------------------------------
+# "La foto esta fresca" NO es "la foto esta completa".
+#
+# El 08-sep-2026 se cancelo una corrida de stock a mitad: stock_actual quedo
+# con 67.000 de ~150.000 filas y con updated_at de hacia un rato. Como el modo
+# auto solo miraba la ANTIGUEDAD de la foto, con STOCK_EVERY_HOURS=12 iba a
+# servir medio inventario durante 12 horas, en horario de tienda, sin que nada
+# avisara. Ahora la corrida deja registrado si termino, y la siguiente pasada
+# la repite si no.
+# ---------------------------------------------------------------------------
+
+class _SesionScalar:
+    def __init__(self, valor=None, revienta=False):
+        self.valor = valor
+        self.revienta = revienta
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        if self.revienta:
+            raise RuntimeError("base caida")
+        return self
+
+    def scalar(self):
+        return self.valor
+
+
+def _completa_con(monkeypatch, **kw):
+    db = pytest.importorskip("db")
+    sync = pytest.importorskip("sync_incremental")
+    monkeypatch.setattr(db, "session", lambda: _SesionScalar(**kw))
+    return sync._ultima_corrida_stock_completa()
+
+
+def test_sin_registro_de_corrida_el_stock_se_considera_incompleto(monkeypatch):
+    """Base nueva o corrida que nunca llego a registrar: hay que correr."""
+    assert _completa_con(monkeypatch, valor=None) is False
+
+
+def test_una_corrida_marcada_incompleta_obliga_a_repetir(monkeypatch):
+    assert _completa_con(monkeypatch, valor={"completo": False}) is False
+
+
+def test_una_corrida_completa_no_se_repite(monkeypatch):
+    assert _completa_con(monkeypatch, valor={"completo": True}) is True
+
+
+def test_si_no_se_puede_leer_el_estado_no_se_dispara_el_paso_pesado(monkeypatch):
+    """Mismo criterio que _stock_photo_age_hours: ante la duda, no correr."""
+    assert _completa_con(monkeypatch, revienta=True) is True
+
+
+def test_el_modo_auto_mira_completitud_ademas_de_antiguedad():
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    codigo = _solo_codigo(inspect.getsource(sync.run))
+
+    assert "_ultima_corrida_stock_completa" in codigo, (
+        "auto tiene que repetir la corrida si la anterior quedo a medias"
+    )
+    assert "_stock_photo_age_hours" in codigo
+
+
+def test_la_corrida_de_stock_registra_que_quedo_completa(monkeypatch):
+    cliente = _ClienteStockFalso(total=1000)
+    snapshot, _, _ = _montar_stock(monkeypatch, cliente)
+
+    snapshot.snapshot_stock(max_pages=6000)
+
+    assert len(REGISTROS_STOCK) == 1
+    clave, valor = REGISTROS_STOCK[0]
+    assert clave == "stock_ultima_corrida"
+    assert valor["completo"] is True
+    assert valor["filas_vistas"] == 1000
+    assert valor["error"] is None
+
+
+def test_la_corrida_de_stock_registra_que_quedo_incompleta(monkeypatch):
+    cliente = _ClienteStockFalso(total=1000, fallar_en={200})
+    snapshot, _, _ = _montar_stock(monkeypatch, cliente)
+
+    snapshot.snapshot_stock(max_pages=6000)
+
+    clave, valor = REGISTROS_STOCK[0]
+    assert clave == "stock_ultima_corrida"
+    assert valor["completo"] is False
+    assert valor["error"], "el registro tiene que decir por que"
+
+
+def test_el_cron_tambien_crea_su_esquema():
+    """init_db vivia solo en server.py, o sea solo en el web service.
+
+    Una tabla nueva en db.py no existia para el cron hasta que el web service
+    se reiniciara. Como los helpers que la leen atrapan la excepcion, el
+    sintoma habria sido "el paso no hace nada", sin error visible.
+    """
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    codigo = _solo_codigo(inspect.getsource(sync.run))
+
+    assert "init_db" in codigo

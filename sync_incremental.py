@@ -65,6 +65,34 @@ def _stock_photo_age_hours() -> float:
         return 0.0  # ante la duda, no correr el paso pesado
 
 
+def _ultima_corrida_stock_completa() -> bool:
+    """True si la ultima corrida de stock termino de leer todo Bsale.
+
+    Sin esto, una corrida cortada a mitad deja stock_actual con la mitad de las
+    filas y con updated_at reciente: _stock_photo_age_hours la ve fresca y el
+    modo auto no la vuelve a correr en 12 horas. Paso el 08-sep-2026: una
+    corrida cancelada dejo 67.000 de ~150.000 filas.
+
+    Ante un error de lectura devuelve True (no forzar el paso pesado), igual
+    criterio que _stock_photo_age_hours.
+    """
+    from sqlalchemy import text
+    from db import session as db_session
+    try:
+        with db_session() as s:
+            fila = s.execute(text(
+                "select valor from sync_estado where clave = 'stock_ultima_corrida'"
+            )).scalar()
+        if not fila:
+            # Nunca se registro una corrida: no se puede afirmar que este
+            # completa, asi que se corre.
+            return False
+        return bool(fila.get("completo"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("_ultima_corrida_stock_completa: %s", e)
+        return True
+
+
 def _variants_empty() -> bool:
     """True si el catalogo de variantes aun no se carga en esta base."""
     from sqlalchemy import text
@@ -177,6 +205,17 @@ def run(modo: str) -> int:
     results: dict[str, Any] = {}
     now = datetime.now(timezone.utc)
 
+    # El cron nunca creaba tablas: init_db() solo corria en server.py, o sea en
+    # el web service. Agregar una tabla a db.py quedaba dependiendo de que el
+    # web service se reiniciara primero, y mientras tanto el paso que la usa
+    # fallaba en silencio (los helpers atrapan la excepcion). create_all es
+    # idempotente y barato, asi que el cron tambien se asegura su esquema.
+    try:
+        from db import init_db
+        init_db()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("init_db en el cron fallo: %s", e)
+
     # Asegura el esquema de digests ANTES de todo: el cursor del backfill
     # historico vive en llm_digests y en una base recien creada aun no existe.
     try:
@@ -187,8 +226,14 @@ def run(modo: str) -> int:
 
     do_ventas = modo in ("ventas", "full", "auto")
     # stock: en full/stock siempre; en auto solo si la foto esta vieja (ver arriba)
+    # Dos condiciones, no una. "Fresca" no implica "completa": una corrida
+    # cortada deja la tabla a medias con updated_at reciente.
     do_stock = modo in ("stock", "full") or (
-        modo == "auto" and _stock_photo_age_hours() >= STOCK_EVERY_HOURS
+        modo == "auto"
+        and (
+            _stock_photo_age_hours() >= STOCK_EVERY_HOURS
+            or not _ultima_corrida_stock_completa()
+        )
     )
     # variantes: 1 vez al día, o si el catalogo aun no existe en esta base
     do_variants = modo == "auto" and (

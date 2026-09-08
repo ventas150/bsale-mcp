@@ -23,6 +23,7 @@ from db import (
     document_details_snapshot,
     documents_snapshot,
     stock_actual,
+    sync_estado,
     variants_snapshot,
     session as db_session,
 )
@@ -458,7 +459,41 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
         # aparecio ya no existe en Bsale. Si la corrida quedo a medias, borrar
         # lo no tocado eliminaria stock real.
         out["filas_dadas_de_baja"] = _borrar_stock_no_reportado(snapshot_ts)
+
+    # Lo lee sync_incremental para decidir si tiene que repetir la corrida.
+    _registrar_estado("stock_ultima_corrida", {
+        "completo": bool(completo),
+        "snapshot_ts": snapshot_ts.isoformat(),
+        "filas": total_persisted,
+        "filas_vistas": filas_vistas,
+        "count_bsale": total_bsale,
+        "error": out.get("stock_error"),
+    })
     return out
+
+
+def _registrar_estado(clave: str, valor: dict[str, Any]) -> None:
+    """Deja constancia de como termino un paso del cron.
+
+    No puede voltear la corrida: si falla, se loguea y se sigue. Pero tampoco
+    puede fallar callado, porque de este registro depende que la corrida
+    siguiente sepa que la anterior quedo a medias.
+    """
+    try:
+        with db_session() as s:
+            stmt = pg_insert(sync_estado).values(
+                clave=clave,
+                valor=valor,
+                actualizado=datetime.now(timezone.utc),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["clave"],
+                set_={"valor": stmt.excluded.valor,
+                      "actualizado": stmt.excluded.actualizado},
+            )
+            s.execute(stmt)
+    except Exception as e:  # noqa: BLE001
+        logger.error("No se pudo registrar el estado %s: %s", clave, e)
 
 
 def _borrar_stock_no_reportado(corrida_ts) -> int:

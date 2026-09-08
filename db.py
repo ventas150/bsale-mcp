@@ -188,6 +188,23 @@ audit_log = Table(
 )
 
 
+# Estado de las corridas del cron. Una fila por clave.
+#
+# Existe por un modo de falla concreto: "la foto de stock es fresca" NO es lo
+# mismo que "la foto de stock esta completa". Si una corrida se corta a mitad
+# (deploy, cancelacion, 5xx de Bsale), stock_actual queda con la mitad de las
+# filas y con updated_at de hace un rato, o sea que parece recien hecha. Con
+# STOCK_EVERY_HOURS=12 eso significa servir medio inventario durante 12 horas
+# sin que nada avise. Aca queda registrado si la ultima corrida termino.
+sync_estado = Table(
+    "sync_estado",
+    metadata,
+    Column("clave", String(100), primary_key=True),
+    Column("valor", JSONB),
+    Column("actualizado", DateTime(timezone=True), index=True),
+)
+
+
 mapping_audit = Table(
     "mapping_audit",
     metadata,
