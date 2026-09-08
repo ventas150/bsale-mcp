@@ -1628,12 +1628,40 @@ def test_lo_que_no_es_error_no_marca_la_corrida():
     assert sync.recolectar_errores({"retention_warning": "algo"}) == []
 
 
-def test_algunos_documentos_fallidos_no_son_una_falla_pero_todos_si():
-    """Que fallen 3 de 2.000 documentos es normal. Que fallen los 2.000 no."""
+def test_algunos_documentos_fallidos_no_son_una_falla_pero_ninguno_que_entre_si():
+    """Que fallen 3 de 2.000 es normal. Que no entre NINGUNO es sistemico.
+
+    El criterio era `errors >= docs_processed` y estaba mal en las dos
+    direcciones, porque en snapshot.py el camino de error hace
+    `errors += 1; continue`: los dos contadores son DISJUNTOS, nunca suman el
+    lote. Con el token vencido fallan los 400 y docs_processed queda en 0, o
+    sea que la guarda vieja (que exigia proc > 0) NO disparaba justo en el caso
+    que decia cubrir; y con 1.001 fallos de 2.000 SI disparaba, dejando el cron
+    en rojo por una tanda de 429 que la corrida siguiente completa sola.
+    """
     sync = pytest.importorskip("sync_incremental")
 
+    # Algunos fallan: normal, no marca.
     assert sync.recolectar_errores({"d": {"docs_processed": 2000, "errors": 3}}) == []
-    assert sync.recolectar_errores({"d": {"docs_processed": 2000, "errors": 2000}}) == ["d.errors"]
+    # Falla la mitad: sigue siendo parcial, NO puede marcar.
+    assert sync.recolectar_errores({"d": {"docs_processed": 999, "errors": 1001}}) == []
+    # No entro ninguno: eso si es sistemico.
+    assert sync.recolectar_errores({"d": {"docs_processed": 0, "errors": 400}}) == ["d.errors"]
+    # Lote vacio: no se intento nada, no es un error.
+    assert sync.recolectar_errores({"d": {"docs_processed": 0, "errors": 0}}) == []
+
+
+def test_un_digest_caido_marca_la_corrida():
+    """digests.py no usa una clave *_error: mete el error en el VALOR.
+
+    Un matcher que solo mira nombres de clave lo dejaba pasar entero, que es
+    el mismo modo de falla que este helper vino a cerrar.
+    """
+    sync = pytest.importorskip("sync_incremental")
+
+    r = sync.recolectar_errores({"digests": {"ventas_hoy": "error: could not connect"}})
+    assert r == ["digests.ventas_hoy"]
+    assert sync.recolectar_errores({"digests": {"ventas_hoy": "ok"}}) == []
 
 
 def test_el_cron_y_el_sync_usan_el_mismo_criterio():
@@ -1758,13 +1786,25 @@ def test_no_se_escribe_stock_con_cantidad_invalida(monkeypatch):
 
     Una cantidad negativa en un "consumo" invierte el sentido de la operacion.
     """
-    tools, cli = _tools_de_escritura(monkeypatch)
     monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
 
-    for nombre in ("bsale_ajustar_stock", "bsale_consumir_stock", "bsale_recepcionar_stock"):
-        for mala in (0, -5, float("nan")):
+    # CON stock cargado. Antes este test corria sin stock, asi que
+    # bsale_ajustar_stock cortaba con "no se pudo leer el stock actual" y el
+    # assert pasaba por el motivo equivocado: verificaba una precondicion del
+    # mock, no el guardrail. Y ademas afirmaba que ajustar rechaza el 0, que es
+    # falso a proposito (0 es un saldo final legitimo).
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(1, 1): 10.0})
+
+    for nombre in ("bsale_consumir_stock", "bsale_recepcionar_stock"):
+        for mala in (0, -5, float("nan"), float("inf")):
             r = tools[nombre](variant_id=1, office_id=1, quantity=mala)
             assert r["aplicado"] is False, f"{nombre} acepto {mala}"
+
+    # ajustar_stock es un SALDO final: rechaza negativo y NaN, acepta 0.
+    for mala in (-5, float("nan"), float("inf")):
+        r = tools["bsale_ajustar_stock"](variant_id=1, office_id=1, quantity=mala)
+        assert r["aplicado"] is False, f"ajustar acepto {mala}"
+
     assert cli.llamadas == [], "ninguna llego a Bsale"
 
 
@@ -1789,9 +1829,43 @@ def test_una_escritura_de_stock_exitosa_dice_que_se_aplico(monkeypatch):
     tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
     monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
 
-    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12, cost=9500)
     assert r["aplicado"] is True
     assert len(cli.llamadas) == 1
+
+
+def test_subir_stock_sin_costo_no_escribe(monkeypatch):
+    """Subir stock se aplica como RECEPCION, y una recepcion sin cost entra a 0.
+
+    Eso arrastra el costo promedio de la variante en Bsale hacia abajo de forma
+    permanente: Bsale no recalcula hacia atras. Un scrub de $9.500 con 20
+    unidades, ajustado +10 a costo 0, queda con costo promedio $6.333 y el
+    margen de esa variante queda mal para siempre. Bajar stock no lo necesita.
+    """
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["aplicado"] is False
+    assert "costo 0" in r["bloqueado_por"]
+    assert cli.llamadas == [], "no puede haber tocado Bsale"
+
+    # Bajar stock si puede ir sin costo.
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 20.0})
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["aplicado"] is True
+    assert cli.llamadas[0][1] == "/v1/stocks/consumptions.json"
+
+
+def test_el_objetivo_queda_en_la_nota_para_poder_reconstruirlo(monkeypatch):
+    """El audit log guarda el body. Sin esto queda "recepcion de 7" y no se
+    puede reconstruir que la orden fue "dejalo en 12"."""
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
+
+    tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12, cost=9500)
+    nota = cli.llamadas[0][2]["note"]
+    assert "objetivo 12" in nota and "antes 5" in nota
 
 
 def test_ajustar_stock_no_usa_el_endpoint_que_no_esta_documentado(monkeypatch):
@@ -1804,7 +1878,7 @@ def test_ajustar_stock_no_usa_el_endpoint_que_no_esta_documentado(monkeypatch):
     tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
     monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
 
-    tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12, cost=9500)
     paths = [c[1] for c in cli.llamadas]
     assert "/v1/stocks/adjustments.json" not in paths
     assert paths == ["/v1/stocks/receptions.json"]
@@ -1820,11 +1894,12 @@ def test_ajustar_stock_deja_el_valor_final_pedido_no_lo_suma(monkeypatch):
 
     # Falta: hay que SUMAR 7.
     tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
-    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12, cost=9500)
     assert r["stock_antes"] == 5.0 and r["objetivo"] == 12.0
     assert r["delta_aplicado"] == 7.0
     assert cli.llamadas[0][1] == "/v1/stocks/receptions.json"
     assert cli.llamadas[0][2]["details"][0]["quantity"] == 7.0
+    assert cli.llamadas[0][2]["details"][0]["cost"] == 9500.0
 
     # Sobra: hay que RESTAR 8.
     tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 20.0})
@@ -2017,3 +2092,56 @@ def test_el_sobrestockeo_dice_a_que_precio_esta_valorizado():
     assert '"capital_inmovilizado_en_los_revisados_clp"' not in codigo
     assert '"valorizado_a_precio_venta_clp"' in codigo
     assert '"nota_valorizacion"' in codigo
+
+
+def test_el_detalle_de_precio_se_verifica_contra_la_variante(monkeypatch):
+    """detalle_id es el destino del PUT: tomarlo a ciegas escribe sobre otra.
+
+    Si Bsale ignorara el filtro `variantid`, items[0] seria la primera fila del
+    listado COMPLETO de la lista de precios. Ni sin_precio_actual ni
+    sin_detalle lo notarian, porque la clave del dict es vid pase lo que pase.
+    Falla cerrada: si no se puede confirmar la variante, el detalle no entra y
+    el guardrail aborta antes de escribir.
+    """
+    tw = pytest.importorskip("tools_writes")
+
+    class _CliPrecios:
+        def __init__(self, items):
+            self.items = items
+            self.escrituras = []
+
+        def get(self, path, params=None, **k):
+            return {"items": self.items}
+
+        def put(self, path, json_body=None, **k):
+            self.escrituras.append((path, json_body))
+            return {"id": 1}
+
+    monkeypatch.setenv("BSALE_PRICE_WRITES_ENABLED", "1")
+    monkeypatch.setenv("BSALE_WRITABLE_PRICE_LISTS", "5")
+
+    def _precios(items):
+        cli = _CliPrecios(items)
+        m = _McpFalso()
+        monkeypatch.setattr(tw, "get_client", lambda: cli)
+        tw.register(m)
+        return m.tools["bsale_actualizar_precios_masivo"], cli
+
+    # Caso malo: Bsale IGNORA el filtro y devuelve el detalle de OTRA variante.
+    tool, cli = _precios([{"id": 111, "variantValue": "19990", "variant": {"id": 999}}])
+    r = tool(price_list_id=5, updates=[{"variant_id": 117733, "new_price": 20990}])
+    # OJO con la asercion: un dry_run EXITOSO tambien devuelve aplicado=False,
+    # asi que comprobar eso no distingue nada. Lo que distingue es que aca no
+    # hay tabla: el guardrail abortó antes de armarla.
+    assert "bloqueado_por" in r, "tenia que abortar, no armar una tabla"
+    assert r.get("dry_run") is not True
+    assert "tabla_de_cambios" not in r
+    assert cli.escrituras == []
+
+    # Caso bueno: el detalle corresponde, el dry_run arma la tabla.
+    tool, cli = _precios([{"id": 111, "variantValue": "19990", "variant": {"id": 117733}}])
+    r = tool(price_list_id=5, updates=[{"variant_id": 117733, "new_price": 20500}])
+    assert r["dry_run"] is True
+    assert r["tabla_de_cambios"][0]["precio_actual"] == 19990.0
+    assert r["confirm_token"]
+    assert cli.escrituras == [], "un dry_run no escribe"

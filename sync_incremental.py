@@ -174,21 +174,39 @@ def recolectar_errores(obj: Any, _ruta: str = "", _prof: int = 0) -> list[str]:
     30 minutos durante meses sin que nadie se enterara.
 
     `errors` (el contador de snapshot_details) NO cuenta por si solo: que
-    fallen algunos documentos de un lote de 2.000 es normal. Solo cuenta
-    cuando fallaron TODOS los que se procesaron, que si es una falla sistemica
-    (token vencido, Bsale caido).
+    fallen algunos documentos de un lote de 2.000 es normal. La falla sistemica
+    (token vencido, Bsale caido) es que NINGUNO haya entrado.
+
+    La primera version de este chequeo decia `errors >= docs_processed`, y
+    estaba mal en las dos direcciones. En snapshot.py el camino de error hace
+    `errors += 1; continue`, o sea que docs_processed NO se incrementa: los dos
+    contadores son DISJUNTOS. Consecuencias medidas:
+
+      - Fallan los 400 documentos del lote -> docs_processed = 0 -> la guarda
+        exigia `proc > 0` -> NO disparaba. Justo el caso que decia cubrir.
+      - Fallan 1.001 de 2.000 -> errors >= docs_processed -> SI disparaba, y
+        una tanda de 429 transitorios que la corrida siguiente completa sola
+        dejaba el cron en rojo.
+
+    El criterio correcto es `errors > 0 and docs_processed == 0`: se intento y
+    no entro ninguno.
     """
     hallazgos: list[str] = []
     if _prof > 6:
         return hallazgos
+    if isinstance(obj, str) and obj.startswith("error:"):
+        # digests.py no usa una clave *_error: mete el error en el VALOR
+        # ({"ventas_hoy": "error: could not connect"}). Un matcher que solo
+        # mira nombres de clave lo dejaba pasar entero, que es el mismo modo
+        # de falla que este helper vino a cerrar.
+        return [_ruta or "<raiz>"]
     if isinstance(obj, dict):
         errs, proc = obj.get("errors"), obj.get("docs_processed")
         if (
             isinstance(errs, int)
             and isinstance(proc, int)
             and errs > 0
-            and proc > 0
-            and errs >= proc
+            and proc == 0
         ):
             hallazgos.append(("%s.errors" % _ruta) if _ruta else "errors")
         for k, v in obj.items():

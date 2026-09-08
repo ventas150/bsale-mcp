@@ -64,6 +64,7 @@ def register(mcp) -> None:  # noqa: ANN001
         office_id: int,
         quantity: float,
         note: str = "Ajuste via MCP",
+        cost: float | None = None,
     ) -> dict[str, Any]:
         """Deja el stock de una variante en una sucursal EN UN VALOR FINAL.
 
@@ -96,10 +97,26 @@ def register(mcp) -> None:  # noqa: ANN001
             office_id: ID de la sucursal.
             quantity: Cantidad FINAL que debe quedar en stock. 0 es valido.
             note: Nota explicativa (queda en historial Bsale).
+            cost: Costo unitario. OBLIGATORIO cuando el ajuste SUMA stock.
+
+        Sobre `cost`: subir el stock se aplica como una recepcion, y una
+        recepcion sin costo entra a costo 0 y arrastra el costo promedio de la
+        variante hacia abajo EN BSALE, de forma permanente. Un scrub que cuesta
+        $9.500 con 20 unidades, ajustado +10 a costo 0, queda con costo
+        promedio $6.333 y todos los reportes de margen de esa variante quedan
+        mal para siempre: Bsale no recalcula hacia atras. Por eso, si el ajuste
+        suma y no viene costo, se aborta. Bajar stock no lo necesita.
+
+        LIMITE CONOCIDO: entre el GET del stock actual y el POST no hay
+        transaccion. Si se vende una unidad en el medio, el saldo final no es
+        el pedido. La idempotencia vale para un reintento inmediato sobre
+        stock quieto, no frente a movimientos concurrentes.
         """
         try:
             guard_stock_write()
             objetivo = validar_cantidad(quantity, "quantity", permitir_cero=True)
+            if cost is not None:
+                cost = validar_costo(cost)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
@@ -125,15 +142,35 @@ def register(mcp) -> None:  # noqa: ANN001
                 "detalle": "El stock ya esta en el valor pedido. No se escribio nada.",
             }
 
+        detalle: dict[str, Any] = {"variantId": variant_id, "quantity": abs(delta)}
         if delta > 0:
+            if cost is None:
+                return {
+                    "aplicado": False,
+                    "bloqueado_por": (
+                        f"Subir el stock de {actual} a {objetivo} se aplica como una "
+                        "recepcion, y una recepcion sin `cost` entra a costo 0: "
+                        "arrastra el costo promedio de la variante en Bsale hacia "
+                        "abajo de forma permanente y deja todos los reportes de "
+                        "margen mal. Pasar `cost` con el costo unitario real. No se "
+                        "escribio nada."
+                    ),
+                    "stock_actual": actual,
+                    "objetivo": objetivo,
+                    "delta_necesario": delta,
+                }
+            detalle["cost"] = cost
             path, movimiento = "/v1/stocks/receptions.json", "recepcion"
         else:
             path, movimiento = "/v1/stocks/consumptions.json", "consumo"
 
         body = {
             "officeId": office_id,
-            "note": note,
-            "details": [{"variantId": variant_id, "quantity": abs(delta)}],
+            # El objetivo va en la nota: el audit log guarda el body, y sin esto
+            # queda registrado "recepcion de 7" sin que se pueda reconstruir que
+            # la orden fue "dejalo en 12".
+            "note": f"{note} [objetivo {objetivo}, antes {actual}]",
+            "details": [detalle],
         }
         # "aplicado": True explicito. Antes el camino de exito devolvia el JSON
         # crudo de Bsale, que no trae esa clave, mientras el camino BLOQUEADO si
@@ -316,18 +353,32 @@ def register(mcp) -> None:  # noqa: ANN001
             try:
                 data = client.get(
                     f"/v1/price_lists/{price_list_id}/details.json",
-                    params={"variantid": vid, "limit": 1},
+                    params={"variantid": vid, "limit": 50, "expand": "[variant]"},
                     use_cache=False,
                 )
-                items = data.get("items") or []
-                if items:
-                    valor = items[0].get("variantValue")
-                    detalle_id = items[0].get("id")
+                for item in (data.get("items") or []):
+                    # Verificar que el detalle es el de ESTA variante, en vez
+                    # de tomar items[0] a ciegas. detalle_id es el destino del
+                    # PUT: si Bsale ignorara el filtro `variantid`, items[0]
+                    # seria la primera fila del listado COMPLETO de la lista de
+                    # precios y se escribiria el precio nuevo SOBRE OTRA
+                    # VARIANTE. Ni sin_precio_actual ni sin_detalle lo notarian,
+                    # porque la clave del dict es vid pase lo que pase.
+                    #
+                    # Falla cerrada a proposito: si no se puede confirmar la
+                    # variante, el detalle no entra, y el guardrail aborta la
+                    # corrida entera antes de escribir nada.
+                    v = (item.get("variant") or {}).get("id")
+                    if v is None or int(v) != int(vid):
+                        continue
+                    valor = item.get("variantValue")
+                    detalle_id = item.get("id")
                     if valor is not None and detalle_id is not None:
                         detalles[int(vid)] = {
                             "detail_id": int(detalle_id),
                             "precio": float(valor),
                         }
+                    break
             except Exception:  # noqa: BLE001
                 continue  # queda fuera -> el guardrail aborta
         return detalles
