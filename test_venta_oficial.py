@@ -849,21 +849,59 @@ def _solo_codigo(src: str) -> str:
     comentarios de este repo NOMBRAN el patron viejo para explicar por
     que se saco. Sin este filtro el test prueba el comentario en vez del
     codigo: ya paso dos veces (health_check y snapshot_details).
+
+    La primera version era un toggle por linea sobre las comillas triples. Se
+    desincronizaba con cualquier string multilinea cuya apertura no estuviera
+    al principio de la linea, y a partir de ahi descartaba TODO el resto del
+    archivo en silencio: los assert pasaban sobre texto vacio y no probaban
+    nada. Verificado el 08-sep-2026 sobre tools_intelligence.py, donde tres
+    asserts sobre codigo que SI estaba presente daban falso.
+
+    Ahora se tokeniza y se blanquea por posicion, que es exacto.
     """
-    lineas = []
-    en_docstring = False
-    for linea in src.splitlines():
-        limpia = linea.strip()
-        if limpia.startswith(chr(34) * 3) or limpia.startswith(chr(39) * 3):
-            comillas = limpia[:3]
-            if len(limpia) > 3 and limpia.endswith(comillas):
+    import ast
+    import io
+    import tokenize
+
+    lineas = src.splitlines(keepends=True)
+    borrar = []
+
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == tokenize.COMMENT:
+                borrar.append((tok.start, tok.end))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+
+    try:
+        arbol = ast.parse(src)
+        contenedores = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        for n in ast.walk(arbol):
+            if not isinstance(n, contenedores):
                 continue
-            en_docstring = not en_docstring
-            continue
-        if en_docstring or limpia.startswith('#'):
-            continue
-        lineas.append(linea)
-    return chr(10).join(lineas)
+            cuerpo = getattr(n, "body", None)
+            if (
+                cuerpo
+                and isinstance(cuerpo[0], ast.Expr)
+                and isinstance(cuerpo[0].value, ast.Constant)
+                and isinstance(cuerpo[0].value.value, str)
+            ):
+                c = cuerpo[0].value
+                borrar.append(((c.lineno, c.col_offset), (c.end_lineno, c.end_col_offset)))
+    except SyntaxError:
+        pass
+
+    # De atras hacia adelante, para que borrar no corra los offsets restantes.
+    for (l1, c1), (l2, c2) in sorted(borrar, reverse=True):
+        if l1 == l2:
+            lineas[l1 - 1] = lineas[l1 - 1][:c1] + lineas[l1 - 1][c2:]
+        else:
+            lineas[l1 - 1] = lineas[l1 - 1][:c1] + "\n"
+            for i in range(l1, l2 - 1):
+                lineas[i] = "\n"
+            lineas[l2 - 1] = lineas[l2 - 1][c2:]
+
+    return "".join(lineas)
 
 
 def test_snapshot_details_tiene_un_solo_tope():
@@ -1457,8 +1495,22 @@ class _McpFalso:
 
 
 class _ClienteEscrituraFalso:
-    def __init__(self):
+    def __init__(self, stock=None):
         self.llamadas = []
+        # stock[(variant_id, office_id)] -> cantidad
+        self.stock = stock or {}
+
+    def get(self, path, params=None, **k):
+        params = params or {}
+        vid, oid = params.get("variantid"), params.get("officeid")
+        q = self.stock.get((vid, oid))
+        if q is None:
+            return {"items": []}
+        return {"items": [{
+            "quantity": q,
+            "variant": {"id": vid},
+            "office": {"id": oid},
+        }]}
 
     def post(self, path, json_body=None, **k):
         self.llamadas.append(("POST", path, json_body))
@@ -1469,9 +1521,9 @@ class _ClienteEscrituraFalso:
         return {"id": 9999}
 
 
-def _tools_de_escritura(monkeypatch):
+def _tools_de_escritura(monkeypatch, stock=None):
     tw = pytest.importorskip("tools_writes")
-    cli = _ClienteEscrituraFalso()
+    cli = _ClienteEscrituraFalso(stock)
     monkeypatch.setattr(tw, "get_client", lambda: cli)
     m = _McpFalso()
     tw.register(m)
@@ -1734,13 +1786,106 @@ def test_una_escritura_de_stock_exitosa_dice_que_se_aplico(monkeypatch):
     reintentaba sobre una escritura EXITOSA. Sin idempotencia en Bsale, eso es
     un ajuste de stock aplicado dos veces.
     """
-    tools, cli = _tools_de_escritura(monkeypatch)
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
     monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
 
     r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
     assert r["aplicado"] is True
     assert len(cli.llamadas) == 1
-    assert cli.llamadas[0][1] == "/v1/stocks/adjustments.json"
+
+
+def test_ajustar_stock_no_usa_el_endpoint_que_no_esta_documentado(monkeypatch):
+    """La documentacion de Bsale lista DOS endpoints de escritura de stock.
+
+    receptions y consumptions. adjustments.json no aparece, igual que el POST de
+    lista de precios que tampoco existia. Verificado el 08-sep-2026 en dos
+    fuentes.
+    """
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    paths = [c[1] for c in cli.llamadas]
+    assert "/v1/stocks/adjustments.json" not in paths
+    assert paths == ["/v1/stocks/receptions.json"]
+
+
+def test_ajustar_stock_deja_el_valor_final_pedido_no_lo_suma(monkeypatch):
+    """quantity es el SALDO que debe quedar, no la cantidad a mover.
+
+    El docstring prometia "cantidad final" y el codigo mandaba ese numero como
+    delta al endpoint. Con stock 5 y quantity 12, el stock quedaba en 17.
+    """
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+
+    # Falta: hay que SUMAR 7.
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 5.0})
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["stock_antes"] == 5.0 and r["objetivo"] == 12.0
+    assert r["delta_aplicado"] == 7.0
+    assert cli.llamadas[0][1] == "/v1/stocks/receptions.json"
+    assert cli.llamadas[0][2]["details"][0]["quantity"] == 7.0
+
+    # Sobra: hay que RESTAR 8.
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 20.0})
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["delta_aplicado"] == -8.0
+    assert cli.llamadas[0][1] == "/v1/stocks/consumptions.json"
+    assert cli.llamadas[0][2]["details"][0]["quantity"] == 8.0
+
+
+def test_ajustar_stock_dos_veces_no_mueve_nada_la_segunda(monkeypatch):
+    """Idempotencia. Bsale no expone claves de idempotencia.
+
+    Un timeout del cliente MCP sobre una escritura que Bsale SI aplico deja al
+    llamador sin saber que paso. Si reintenta y el ajuste fuera un delta, el
+    stock queda con el doble. Calculando la diferencia contra el stock actual,
+    el segundo intento es un no-op.
+    """
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 12.0})
+
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["aplicado"] is False
+    assert r["sin_cambios"] is True
+    assert cli.llamadas == [], "no puede haber escrito nada"
+
+
+def test_ajustar_stock_no_escribe_si_no_pudo_leer_el_actual(monkeypatch):
+    """Sin el valor actual no hay como calcular el ajuste. Falla cerrada."""
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={})
+
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=12)
+    assert r["aplicado"] is False
+    assert "no se escribio nada" in r["motivo"].lower()
+    assert cli.llamadas == []
+
+
+def test_ajustar_stock_a_cero_es_valido(monkeypatch):
+    """0 es un saldo final legitimo, aunque sea una cantidad de movimiento invalida."""
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(7, 2): 4.0})
+
+    r = tools["bsale_ajustar_stock"](variant_id=7, office_id=2, quantity=0)
+    assert r["aplicado"] is True
+    assert r["delta_aplicado"] == -4.0
+    assert cli.llamadas[0][1] == "/v1/stocks/consumptions.json"
+
+
+def test_la_escritura_de_catalogo_esta_apagada_por_default(monkeypatch):
+    """Cambiar un SKU rompe el sync con Shopify y Mercado Libre sin dar error.
+
+    El kill-switch de stock viene encendido porque es operativo y se usa. Este
+    no: activar, desactivar y renombrar variantes o productos es excepcional, y
+    ahora Andrea tambien tiene acceso al conector.
+    """
+    monkeypatch.delenv("BSALE_CATALOG_WRITES_ENABLED", raising=False)
+    tools, cli = _tools_de_escritura(monkeypatch)
+
+    r = tools["bsale_actualizar_variante"](123, code="SKU-NUEVO")
+    assert r["aplicado"] is False
+    assert cli.llamadas == []
 
 
 # -------------------------------------------------- 7. precio actual en cero
@@ -1768,3 +1913,107 @@ def test_el_tope_de_delta_sigue_funcionando_con_precio_normal():
         g.validate_price_updates(
             [{"variant_id": 1, "new_price": 20000}], current={1: 10000}, max_delta_pct=5.0
         )
+
+
+# ===========================================================================
+# Correcciones de cifras de la auditoria (frente "correctitud del dinero").
+# ===========================================================================
+
+def test_el_rfm_en_vivo_aplica_la_regla_de_venta_oficial_completa():
+    """Solo sacaba guias, y eso hacia contar los pedidos web dos veces.
+
+    Bsale genera PEDIDO WEB (tipo 26, nota de venta) Y la boleta por la misma
+    compra. is_sales_doc solo excluye use=2, asi que las dos entraban: un
+    cliente con 3 compras web salia con frequency 6 y el doble de facturacion,
+    y cruzaba el umbral de "Champion". La version _fast (SQL) si aplicaba la
+    regla completa, o sea que los dos RFM daban distinto para el mismo cliente.
+    """
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    codigo = _solo_codigo(inspect.getsource(ti))
+
+    assert "if not is_sales_doc(doc):" not in codigo, (
+        "is_sales_doc no alcanza: hay que usar is_official_sale"
+    )
+    assert "if not is_official_sale(doc):" in codigo
+
+
+def test_producttypeid_llega_a_la_consulta():
+    """Se aceptaba, se documentaba como filtro y se devolvia en la respuesta.
+
+    Pero no entraba en ningun params: preguntar por una marca devolvia el
+    catalogo entero rotulado como si fuera de esa marca.
+    """
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    codigo = _solo_codigo(inspect.getsource(ti))
+
+    assert '_p_stock["producttypeid"] = producttypeid' in codigo
+
+
+def test_ninguna_fecha_se_convierte_con_la_zona_local_del_proceso():
+    """fromtimestamp sin tz usa la zona local: es convertir emission_date.
+
+    emissionDate es medianoche UTC exacta. Hoy Render corre en UTC y sale bien
+    por accidente; con TZ=America/Santiago todos los dias se corren uno hacia
+    atras y la venta del lunes aparece como del domingo.
+    """
+    import ast
+    import inspect
+
+    for mod in ("tools_analytics", "tools_intelligence", "snapshot", "digests"):
+        m = pytest.importorskip(mod)
+        arbol = ast.parse(inspect.getsource(m))
+        for n in ast.walk(arbol):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "fromtimestamp"
+            ):
+                kw = {k.arg for k in n.keywords}
+                assert "tz" in kw, (
+                    f"{mod}: fromtimestamp sin tz en la linea {n.lineno}"
+                )
+
+
+def test_el_desglose_por_tipo_cuenta_igual_que_el_resto_de_la_respuesta():
+    """by_office y by_day excluyen las NC del conteo; by_document_type no.
+
+    Sumar los count de by_document_type daba documentos_de_venta +
+    notas_de_credito: dentro de la MISMA respuesta habia dos totales de
+    documentos que no cerraban entre si.
+    """
+    import inspect
+
+    ts = pytest.importorskip("tools_snapshot")
+    codigo = _solo_codigo(inspect.getsource(ts))
+
+    # Acotado al SELECT del desglose por tipo. El otro func.count() del archivo
+    # esta en la consulta de "excluidos", donde contar TODO si es lo correcto:
+    # un assert sobre el modulo entero lo agarraria como falso positivo.
+    lineas = [l.strip() for l in codigo.splitlines() if l.strip()]
+    i = lineas.index("d.document_type_name,")
+    assert lineas[i + 1] == 'n_venta.label("docs"),', (
+        "el conteo por tipo tiene que usar n_venta, igual que by_office y by_day; "
+        f"hoy usa: {lineas[i + 1]}"
+    )
+
+
+def test_el_sobrestockeo_dice_a_que_precio_esta_valorizado():
+    """No es capital inmovilizado: es a cuanto se venderia ese stock.
+
+    avg_price sale de total_amount de la linea, que es el bruto CON IVA que se
+    le cobro al cliente. Para un scrub que se vende a $29.990 y cuesta $9.500,
+    llamarle "capital" sobrestima 3,2 veces la plata que hay puesta.
+    """
+    import inspect
+
+    tid = pytest.importorskip("tools_intelligence_db")
+    codigo = _solo_codigo(inspect.getsource(tid))
+
+    assert '"capital_tied_clp"' not in codigo
+    assert '"capital_inmovilizado_en_los_revisados_clp"' not in codigo
+    assert '"valorizado_a_precio_venta_clp"' in codigo
+    assert '"nota_valorizacion"' in codigo

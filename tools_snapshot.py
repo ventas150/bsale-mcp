@@ -493,7 +493,13 @@ def register(mcp) -> None:  # noqa: ANN001
                     select(
                         d.document_type_id,
                         d.document_type_name,
-                        func.count().label("docs"),
+                        # n_venta, no func.count(): by_office y by_day ya
+                        # excluyen las notas de credito del conteo y este no.
+                        # Sumar los count de este desglose daba
+                        # documentos_de_venta + notas_de_credito, o sea que
+                        # dentro de la MISMA respuesta habia dos totales de
+                        # documentos que no cerraban entre si.
+                        n_venta.label("docs"),
                         func.sum(amt).label("total"),
                     )
                     .where(cond)

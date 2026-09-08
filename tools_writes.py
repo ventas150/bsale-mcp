@@ -23,6 +23,34 @@ from guardrails import (
 )
 
 
+def _stock_actual_de(client, variant_id: int, office_id: int):
+    """Stock de una variante en una sucursal. None si no se pudo leer.
+
+    Verifica que la fila devuelta sea la pedida en vez de tomar items[0] a
+    ciegas: si Bsale ignorara un filtro que no reconoce, items[0] seria la
+    primera fila del listado COMPLETO y se ajustaria contra el stock de otra
+    variante.
+    """
+    try:
+        data = client.get(
+            "/v1/stocks.json",
+            params={"variantid": variant_id, "officeid": office_id, "limit": 50,
+                    "expand": "[variant,office]"},
+            use_cache=False,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    for item in (data.get("items") or []):
+        v = (item.get("variant") or {}).get("id")
+        o = (item.get("office") or {}).get("id")
+        try:
+            if v is not None and o is not None and int(v) == variant_id and int(o) == office_id:
+                return float(item.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de escritura."""
 
@@ -37,43 +65,89 @@ def register(mcp) -> None:  # noqa: ANN001
         quantity: float,
         note: str = "Ajuste via MCP",
     ) -> dict[str, Any]:
-        """Ajusta el stock de una variante en una sucursal a un valor especifico.
+        """Deja el stock de una variante en una sucursal EN UN VALOR FINAL.
 
         WRITE OPERATION. Pasa por audit log.
+
+        Antes esto posteaba a /v1/stocks/adjustments.json. Ese endpoint NO
+        aparece en la documentacion de Bsale: la documentacion oficial lista
+        DOS endpoints de escritura de stock, receptions y consumptions, y
+        ninguno mas (verificado el 08-sep-2026 en dos fuentes). Es el mismo
+        caso del POST de lista de precios, que tampoco existia.
+
+        Ademas el docstring prometia "cantidad final" mientras el comentario de
+        bsale_client advertia que un reintento podia "consumir el stock dos
+        veces", cosa que solo tiene sentido si quantity es un delta. Las dos
+        cosas no podian ser ciertas. La documentacion dice que en receptions y
+        consumptions quantity es la cantidad A SUMAR o A RESTAR, no el saldo.
+
+        Ahora se lee el stock actual, se calcula la diferencia y se aplica con
+        el endpoint documentado que corresponda. Tres consecuencias:
+
+          1. No depende de un endpoint no documentado.
+          2. La semantica es de verdad la que dice el nombre: valor final.
+          3. Es IDEMPOTENTE. Correrlo dos veces no mueve nada la segunda vez,
+             porque la diferencia ya es cero. Bsale no expone claves de
+             idempotencia, asi que esta es la unica forma de que un reintento
+             por timeout no aplique el ajuste dos veces.
 
         Args:
             variant_id: ID de la variante (SKU).
             office_id: ID de la sucursal.
-            quantity: Cantidad final que debe quedar en stock.
+            quantity: Cantidad FINAL que debe quedar en stock. 0 es valido.
             note: Nota explicativa (queda en historial Bsale).
-
-        Returns:
-            Dict con el ajuste creado en Bsale.
         """
         try:
             guard_stock_write()
-            quantity = validar_cantidad(quantity)
+            objetivo = validar_cantidad(quantity, "quantity", permitir_cero=True)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
         client = get_client()
+        actual = _stock_actual_de(client, variant_id, office_id)
+        if actual is None:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    f"No se pudo leer el stock actual de la variante {variant_id} "
+                    f"en la sucursal {office_id}. Sin el valor actual no hay como "
+                    "calcular el ajuste: no se escribio nada."
+                ),
+            }
+
+        delta = round(objetivo - actual, 4)
+        if abs(delta) < 1e-9:
+            return {
+                "aplicado": False,
+                "sin_cambios": True,
+                "stock_actual": actual,
+                "objetivo": objetivo,
+                "detalle": "El stock ya esta en el valor pedido. No se escribio nada.",
+            }
+
+        if delta > 0:
+            path, movimiento = "/v1/stocks/receptions.json", "recepcion"
+        else:
+            path, movimiento = "/v1/stocks/consumptions.json", "consumo"
+
         body = {
             "officeId": office_id,
             "note": note,
-            "details": [
-                {
-                    "variantId": variant_id,
-                    "quantity": quantity,
-                }
-            ],
+            "details": [{"variantId": variant_id, "quantity": abs(delta)}],
         }
         # "aplicado": True explicito. Antes el camino de exito devolvia el JSON
         # crudo de Bsale, que no trae esa clave, mientras el camino BLOQUEADO si
         # devolvia {"aplicado": False}. Un llamador que escribiera el chequeo
         # obvio -- if not r.get("aplicado"): reintentar -- reintentaba sobre una
-        # escritura EXITOSA. Con Bsale sin claves de idempotencia, eso es un
-        # ajuste de stock aplicado dos veces.
-        return {"aplicado": True, "bsale": client.post("/v1/stocks/adjustments.json", json_body=body)}
+        # escritura EXITOSA.
+        return {
+            "aplicado": True,
+            "movimiento": movimiento,
+            "stock_antes": actual,
+            "objetivo": objetivo,
+            "delta_aplicado": delta,
+            "bsale": client.post(path, json_body=body),
+        }
 
     @mcp.tool()
     def bsale_consumir_stock(

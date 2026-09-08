@@ -14,7 +14,7 @@ rojo desde julio: 50 paginas x 50 documentos = 2.500 documentos, poco mas de
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bsale_client import (
@@ -175,7 +175,16 @@ def register(mcp) -> None:  # noqa: ANN001
             emit_date_ts = doc.get("emissionDate")
             if emit_date_ts:
                 try:
-                    day = datetime.fromtimestamp(int(emit_date_ts)).strftime("%Y-%m-%d")
+                    # tz=timezone.utc explicito. Sin el, fromtimestamp usa
+                    # la zona local del proceso, que es una conversion de zona
+                    # aplicada sobre emission_date, justo lo que la regla
+                    # prohibe: emissionDate es medianoche UTC exacta. Hoy Render
+                    # corre en UTC y sale bien por accidente; el dia que alguien
+                    # setee TZ=America/Santiago, TODOS los dias se corren uno
+                    # hacia atras y la venta del lunes aparece como del domingo.
+                    day = datetime.fromtimestamp(
+                        int(emit_date_ts), tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
                     by_day[day]["count"] += 1
                     by_day[day]["amount"] += amount
                 except (ValueError, TypeError):

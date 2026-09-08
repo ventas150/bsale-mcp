@@ -580,6 +580,13 @@ def register(mcp) -> None:  # noqa: ANN001
             if coverage < min_coverage_days:
                 continue
 
+            # OJO: avg_price sale de total_amount de la linea, que es el
+            # BRUTO CON IVA que se le cobro al cliente, no el costo. O sea que
+            # esto NO es "capital inmovilizado": es a cuanto se venderia ese
+            # stock. Para un scrub que se vende a $29.990 y cuesta $9.500, la
+            # cifra sobrestima el capital real 3,2 veces. El costo no esta en
+            # el snapshot, asi que no se puede calcular aca; lo que si se puede
+            # es no llamarle capital a un precio de venta.
             avg_price = float(r.total_revenue or 0) / vtot if vtot > 0 else 0
             capital_tied = stock_total * avg_price
 
@@ -601,15 +608,15 @@ def register(mcp) -> None:  # noqa: ANN001
                 "lookback_units_sold": round(vtot, 0),
                 "coverage_days": round(coverage, 0),
                 "avg_price": round(avg_price, 0),
-                "capital_tied_clp": round(capital_tied, 0),
+                "valorizado_a_precio_venta_clp": round(capital_tied, 0),
                 "concentration_pct": round(concentration_pct, 1),
                 "concentrated_in": largest_office["office_name"] if largest_office else None,
             })
 
         # Ordenar por capital_tied descendente (donde hay mas plata muerta)
-        sobrestockeos.sort(key=lambda x: x["capital_tied_clp"], reverse=True)
+        sobrestockeos.sort(key=lambda x: x["valorizado_a_precio_venta_clp"], reverse=True)
 
-        total_capital_tied = sum(s["capital_tied_clp"] for s in sobrestockeos)
+        total_valorizado = sum(s["valorizado_a_precio_venta_clp"] for s in sobrestockeos)
         return {
             "source": "hybrid (velocity:snapshot, stock:live)",
             "min_coverage_days": min_coverage_days,
@@ -617,7 +624,13 @@ def register(mcp) -> None:  # noqa: ANN001
             "checked_variants": len(vel_rows),
             "cobertura_detalle": cobertura_ultimos_dias(lookback_days),
             "total_sobrestockeos": len(sobrestockeos),
-            "capital_inmovilizado_en_los_revisados_clp": total_capital_tied,
+            "valorizado_a_precio_venta_en_los_revisados_clp": total_valorizado,
+            "nota_valorizacion": (
+                "Valorizado a PRECIO DE VENTA CON IVA, no a costo: es a cuanto "
+                "se venderia ese stock, no la plata que hay puesta en el. El "
+                "costo no esta en el snapshot. Para capital real, multiplicar "
+                "por el margen inverso."
+            ),
             "nota_cobertura": "Calculado solo sobre las variantes revisadas (ver checked_variants), no sobre todo el catalogo.",
             "sobrestockeos": sobrestockeos,
         }

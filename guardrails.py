@@ -58,14 +58,14 @@ def guard_variant_write(descripcion: str = "") -> None:
     Cambiarlo rompe el sync de los tres canales SIN lanzar ningun error - los
     productos simplemente dejan de coincidir.
     """
-    if not _flag("BSALE_CATALOG_WRITES_ENABLED", "1"):
+    if not _flag("BSALE_CATALOG_WRITES_ENABLED", "0"):
         raise GuardrailError(
             "Escritura de catalogo BLOQUEADA por politica "
             "(BSALE_CATALOG_WRITES_ENABLED=0). " + descripcion
         )
 
 
-def validar_cantidad(quantity, campo: str = "quantity") -> float:
+def validar_cantidad(quantity, campo: str = "quantity", permitir_cero: bool = False) -> float:
     """Cantidad de un movimiento de stock: numerica, finita y > 0.
 
     bsale_crear_traspaso_stock ya validaba esto; ajustar, consumir y
@@ -80,11 +80,16 @@ def validar_cantidad(quantity, campo: str = "quantity") -> float:
         raise GuardrailError(f"{campo} no es numerico: {quantity!r}. No se escribio nada.")
     if q != q or q in (float("inf"), float("-inf")):
         raise GuardrailError(f"{campo} no es un numero valido: {quantity!r}. No se escribio nada.")
-    if q <= 0:
+    if q < 0:
         raise GuardrailError(
-            f"{campo} debe ser mayor que 0 (llego {q}). Un movimiento de stock "
-            "negativo invierte la operacion y uno en cero no hace nada pero "
-            "queda en el historial. No se escribio nada."
+            f"{campo} no puede ser negativo (llego {q}). Un movimiento de stock "
+            "negativo invierte la operacion. No se escribio nada."
+        )
+    if q == 0 and not permitir_cero:
+        raise GuardrailError(
+            f"{campo} en cero no hace nada pero deja un movimiento vacio en el "
+            "historial de Bsale que despues hay que ir a explicar. No se "
+            "escribio nada."
         )
     return q
 

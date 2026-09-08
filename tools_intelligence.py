@@ -431,8 +431,15 @@ def register(mcp) -> None:  # noqa: ANN001
         client = get_client()
 
         # 1. Stock total por variante
+        # producttypeid SI se pasa a las dos consultas. Se aceptaba, se
+        # documentaba como "filtra por marca/tipo de producto" y se devolvia en
+        # la respuesta, pero no entraba en ningun params: preguntar por una
+        # marca devolvia el catalogo entero rotulado como si fuera de esa marca.
+        _p_stock = {"limit": 50, "expand": "[variant]"}
+        if producttypeid:
+            _p_stock["producttypeid"] = producttypeid
         stock_items, cobertura_stock = _fetch_declarado(
-            client, "/v1/stocks.json", {"limit": 50, "expand": "[variant]"}, 4000,
+            client, "/v1/stocks.json", _p_stock, 4000,
             "filas de stock",
             "bsale_proyeccion_compras_fast no depende de este tope.",
         )
@@ -653,8 +660,14 @@ def register(mcp) -> None:  # noqa: ANN001
         # en silencio. Ahora el unico tope es el de _fetch_declarado, que ademas
         # dice cuanto quedo afuera.
         for doc in docs:
-            # Excluir guias de despacho
-            if not is_sales_doc(doc):
+            # La regla de venta oficial COMPLETA, no solo sacar guias.
+            # is_sales_doc solo excluye use=2. Los pedidos web (tipo 26) son
+            # notas de venta y Bsale genera ADEMAS la boleta: contando los dos,
+            # un cliente que compro 3 veces por la web salia con frequency 6 y
+            # el doble de facturacion, y cruzaba el umbral de "Champion". La
+            # version _fast (SQL) si aplicaba la regla completa, asi que los dos
+            # RFM daban resultados distintos para el mismo cliente.
+            if not is_official_sale(doc):
                 continue
             client_ref = doc.get("client") or {}
             cid = client_ref.get("id")
