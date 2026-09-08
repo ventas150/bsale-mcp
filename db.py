@@ -163,6 +163,31 @@ sku_mapping = Table(
     Column("updated_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)),
 )
 
+# Registro de TODA escritura hacia Bsale.
+#
+# POR QUE EN POSTGRES Y NO EN UN ARCHIVO (08-sep-2026). Vivia en
+# AUDIT_DIR/writes.jsonl, apuntando al disco persistente de Render. Ese disco
+# nunca quedo montado: el render.yaml lo declara pero el blueprint jamas se
+# sincronizo, asi que el audit caia al fallback /tmp/bsale_audit y se
+# BORRABA EN CADA DEPLOY Y EN CADA REINICIO. Verificado el 08-sep: despues de
+# un deploy el log estaba en cero eventos.
+#
+# El registro de quien cambio un precio o un stock en el ERP no puede
+# depender de un disco que no existe. La base ya esta pagada, ya tiene
+# respaldo y sobrevive a los deploys.
+audit_log = Table(
+    "audit_log",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime(timezone=True), index=True),
+    Column("method", String(10)),
+    Column("path", String(500), index=True),
+    Column("actor", String(100), index=True),
+    # El evento completo, ya censurado por _redact.
+    Column("evento", JSONB),
+)
+
+
 mapping_audit = Table(
     "mapping_audit",
     metadata,

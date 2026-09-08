@@ -1112,3 +1112,48 @@ def test_nightly_snapshot_declara_que_no_lo_corre_el_cron():
     doc = inspect.getdoc(snapshot.nightly_snapshot) or ""
     assert "NINGUN CRON" in doc.upper()
     assert "sync_incremental" in doc
+
+
+# ============================================================
+# El audit de escrituras no puede vivir en un disco que no existe
+# ============================================================
+# Vivia en AUDIT_DIR/writes.jsonl apuntando al disco persistente de Render.
+# Ese disco nunca quedo montado (el render.yaml lo declara pero el blueprint
+# jamas se sincronizo), asi que caia al fallback /tmp y se borraba en cada
+# deploy. Verificado el 08-sep-2026: despues de un deploy, cero eventos.
+
+def test_el_audit_no_depende_de_un_disco():
+    import inspect
+
+    audit = pytest.importorskip("audit")
+    codigo = _solo_codigo(inspect.getsource(audit.audit_log))
+    assert "_escribir_en_postgres(event)" in codigo, (
+        "el destino real del audit es Postgres, no un archivo"
+    )
+    # el archivo queda, pero solo como respaldo
+    assert codigo.index("_escribir_en_postgres") < codigo.index("AUDIT_FILE.open")
+
+
+def test_el_audit_nunca_voltea_una_escritura():
+    """Lo llama cada write hacia Bsale: un problema de logging no puede romperla."""
+    import inspect
+
+    audit = pytest.importorskip("audit")
+    src = inspect.getsource(audit._escribir_en_postgres)
+    assert "except Exception" in src
+    assert "return False" in src
+
+
+def test_no_poder_leer_el_audit_no_es_lo_mismo_que_no_haber_escrituras():
+    """[] dice 'no hubo escrituras'. Si no se pudo leer, hay que decir otra cosa."""
+    import inspect
+
+    audit = pytest.importorskip("audit")
+    src = inspect.getsource(audit._leer_de_postgres)
+    assert "return None" in src, (
+        "si la base no responde tiene que devolver None, no lista vacia"
+    )
+    lectura = _solo_codigo(inspect.getsource(audit.read_recent))
+    assert "if desde_db is not None" in lectura, (
+        "con 'if desde_db:' una lista vacia legitima caeria al archivo"
+    )

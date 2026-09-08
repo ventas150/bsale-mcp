@@ -96,14 +96,45 @@ def audit_log(
     # Stdout para que Render lo capture en logs
     logger.info("AUDIT %s", line)
 
-    # Tambien a disco
-    with _lock:
-        try:
-            _rotar_si_hace_falta()
-            with AUDIT_FILE.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError as e:
-            logger.warning("No se pudo escribir audit log a disco: %s", e)
+    # Postgres es el destino REAL. El archivo queda como respaldo por si la
+    # base no esta disponible: el audit nunca puede tumbar una escritura al
+    # ERP, pero tampoco puede perderse en silencio.
+    if not _escribir_en_postgres(event):
+        with _lock:
+            try:
+                _rotar_si_hace_falta()
+                with AUDIT_FILE.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError as e:
+                logger.warning("No se pudo escribir audit log a disco: %s", e)
+
+
+def _escribir_en_postgres(event: dict[str, Any]) -> bool:
+    """Inserta el evento en audit_log. Devuelve False si no se pudo.
+
+    Nunca lanza: esto lo llama cada escritura hacia Bsale y un problema de
+    logging no puede voltear una operacion del ERP.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        from db import DATABASE_URL, audit_log as tabla, session as db_session
+
+        if not DATABASE_URL:
+            return False
+
+        with db_session() as s:
+            s.execute(tabla.insert().values(
+                ts=datetime.fromtimestamp(event["ts"], tz=timezone.utc),
+                method=event.get("method"),
+                path=(event.get("path") or "")[:500],
+                actor=(event.get("actor") or "")[:100],
+                evento=event,
+            ))
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Audit a Postgres fallo, se usa el archivo: %s", e)
+        return False
 
 
 _SENSIBLES = {
@@ -157,9 +188,43 @@ def _rotar_si_hace_falta() -> None:
         logger.warning("No se pudo rotar el audit log: %s", e)
 
 
+def _leer_de_postgres(limit: int) -> list[dict[str, Any]] | None:
+    """Ultimos N eventos desde audit_log. None si la base no esta disponible.
+
+    Se distingue None (no pude leer) de [] (lei y no hay nada): con [] el
+    llamador se queda tranquilo creyendo que no hubo escrituras, que es
+    justamente la clase de mentira silenciosa que se saco de este repo.
+    """
+    try:
+        from sqlalchemy import desc, select
+
+        from db import DATABASE_URL, audit_log as tabla, session as db_session
+
+        if not DATABASE_URL:
+            return None
+
+        with db_session() as s:
+            filas = s.execute(
+                select(tabla.c.evento).order_by(desc(tabla.c.ts)).limit(limit)
+            ).scalars().all()
+        # El mas nuevo primero desde SQL; se devuelve en orden cronologico,
+        # que es como venia del archivo.
+        return [f for f in reversed(filas) if f]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudo leer el audit de Postgres: %s", e)
+        return None
+
+
 def read_recent(limit: int = 50) -> list[dict[str, Any]]:
-    """Lee los ultimos N eventos del audit log, sin cargarlo entero."""
+    """Lee los ultimos N eventos del audit log."""
     limit = max(1, min(int(limit), 1000))
+
+    desde_db = _leer_de_postgres(limit)
+    if desde_db is not None:
+        return desde_db
+
+    # Respaldo: el archivo, que puede tener lo escrito mientras la base no
+    # estaba disponible.
     if not AUDIT_FILE.exists():
         return []
     with _lock:
