@@ -192,21 +192,25 @@ def register(mcp) -> None:  # noqa: ANN001
 
         Args:
             batch_size: Alias historico de max_docs. Si vienen los dos, manda el menor.
-            max_docs: Documentos por llamada (default 1.000, ~2 minutos).
+            max_docs: Documentos por llamada. Default 1.000; el tope es 2.000
+                porque el cliente MCP corta a los 180 s.
             only_recent_days: Solo documentos de los ultimos N dias.
             date_from / date_to: Ventana explicita 'YYYY-MM-DD' inclusive. Es la
                 forma de rellenar un periodo viejo puntual.
             oldest_first: Del mas viejo al mas nuevo. Necesario para un backfill
                 historico: con el orden por defecto nunca se llega a lo viejo.
         """
-        if max_docs and max_docs > 4000:
+        if max_docs and max_docs > 2000:
             return {
                 "aplicado": False,
                 "motivo": (
-                    f"max_docs={max_docs}. El tope es 4.000 (~8 minutos) porque "
-                    "esto corre DENTRO del web service, el mismo proceso que "
-                    "responde /health. Para el hueco historico completo no hace "
-                    "falta forzar: el cron nocturno ya lo va cerrando solo."
+                    f"max_docs={max_docs}. El tope es 2.000. No es solo por el "
+                    "healthcheck: el cliente MCP corta la llamada a los 180 "
+                    "segundos, y 2.500 y 4.000 se pasaron los dos (medido el "
+                    "08-sep-2026). El trabajo igual sigue corriendo en el "
+                    "servidor, pero uno se queda sin saber como termino. Para "
+                    "el hueco historico completo no hace falta forzar: el cron "
+                    "nocturno ya lo va cerrando solo."
                 ),
                 "alternativa": "llamar varias veces con max_docs<=4000",
             }

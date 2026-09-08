@@ -525,7 +525,10 @@ def snapshot_details(
     # segundo, o sea 4,5 horas para los 129.000 pendientes, y cada llamada
     # de mas de ~1.400 documentos se pasaba del timeout de 180 s del cliente
     # MCP. La concurrencia la aguanta Bsale (misma que usa paginated_fetch).
-    _DETALLE_WORKERS = int(os.getenv("BSALE_DETAIL_WORKERS", "6"))
+    # 4, no 6. Con 6 sostenidos Bsale empieza a frenar: en una corrida de
+    # ~8.000 documentos el cliente acumulo 242 reintentos (08-sep-2026).
+    # 4 es la concurrencia que ya usa paginated_fetch sin protestas.
+    _DETALLE_WORKERS = int(os.getenv("BSALE_DETAIL_WORKERS", "4"))
     n_workers = max(1, min(_DETALLE_WORKERS, 10))
 
     def _bajar(cand):
@@ -667,12 +670,14 @@ def nightly_snapshot() -> dict[str, Any]:
     # primero) el backfill se queda para siempre masticando lo reciente y
     # nunca llega a 2025.
     #
-    # Presupuesto: ~8 documentos por segundo medidos, asi que 8.000 son unos
-    # 17 minutos por noche. Con ~129.000 pendientes converge en ~16 noches sin
-    # tocar la configuracion de Render ni alargar de golpe la corrida.
+    # Presupuesto: 40.000 por noche. Con el pool en paralelo se midieron 45
+    # documentos/segundo en frio y menos con Bsale ya frenando, asi que son
+    # entre 15 y 45 minutos. Aca no hay healthcheck que dejar sin responder
+    # (es el cron, no el web service) ni timeout de cliente MCP. Con ~129.000
+    # pendientes converge en 3 o 4 noches sin tocar la config de Render.
     try:
         results["details_historico"] = snapshot_details(
-            max_docs=int(os.getenv("DETAILS_BACKFILL_POR_NOCHE", "8000")),
+            max_docs=int(os.getenv("DETAILS_BACKFILL_POR_NOCHE", "40000")),
             oldest_first=True,
         )
     except Exception as e:  # noqa: BLE001

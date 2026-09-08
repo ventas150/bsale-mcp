@@ -905,4 +905,11 @@ def test_details_batch_topa_el_lote():
     batch = tools["bsale_snapshot_details_batch"]
     r = batch(max_docs=50000)
     assert r.get("aplicado") is False
-    assert "4.000" in str(r)
+    # OJO: no buscar un numero suelto en el mensaje. El texto nombra
+    # 2.500 y 4.000 como los tamanos que se pasaron del timeout del
+    # cliente MCP, asi que assert "4.000" in str(r) pasaba aunque el
+    # tope real fuera otro. El test probaba la anecdota, no el tope.
+    assert "El tope es 2.000" in str(r)
+
+    # y el tope tiene que ser real, no solo texto
+    assert batch(max_docs=2001).get("aplicado") is False
