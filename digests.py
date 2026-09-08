@@ -268,14 +268,12 @@ def build_stock_resumen(umbral_bajo: float = 3) -> dict[str, Any]:
     with db_session() as s:
         por_sucursal = s.execute(text(
             """
-            WITH latest AS (SELECT max(snapshot_date) AS d FROM stock_snapshot)
             SELECT s.office_id,
                    max(s.office_name)                          AS sucursal,
                    count(*)                                    AS skus,
                    sum(s.quantity)                             AS unidades,
                    count(*) FILTER (WHERE s.quantity <= 0)     AS quiebres
-            FROM stock_snapshot s, latest
-            WHERE s.snapshot_date = latest.d
+            FROM stock_actual s
             GROUP BY s.office_id
             ORDER BY sucursal
             """
@@ -283,17 +281,15 @@ def build_stock_resumen(umbral_bajo: float = 3) -> dict[str, Any]:
 
         quiebres = s.execute(text(
             """
-            WITH latest AS (SELECT max(snapshot_date) AS d FROM stock_snapshot)
             SELECT s.variant_code, s.office_name, s.quantity
-            FROM stock_snapshot s, latest
-            WHERE s.snapshot_date = latest.d
-              AND s.quantity <= :u
+            FROM stock_actual s
+            WHERE s.quantity <= :u
             ORDER BY s.quantity ASC
             LIMIT 20
             """
         ), {"u": umbral_bajo}).fetchall()
 
-        foto = s.execute(text("SELECT max(snapshot_date) FROM stock_snapshot")).scalar()
+        foto = s.execute(text("SELECT max(updated_at) FROM stock_actual")).scalar()
 
     return {
         "foto_stock": foto.isoformat() if foto else None,

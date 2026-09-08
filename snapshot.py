@@ -22,7 +22,7 @@ from bsale_client import get_client, is_sales_doc, iso_to_epoch_range
 from db import (
     document_details_snapshot,
     documents_snapshot,
-    stock_snapshot,
+    stock_actual,
     variants_snapshot,
     session as db_session,
 )
@@ -271,12 +271,25 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
     total_persisted = 0
 
     def _flush(buffer: list[dict[str, Any]]) -> int:
+        """Upsert sobre el estado actual.
+
+        Antes era on_conflict_do_nothing sobre (snapshot_date, variant_id,
+        office_id), o sea que cada corrida escribia un juego de filas nuevo.
+        Ahora es do_update sobre (variant_id, office_id): la fila de cada
+        variante en cada sucursal se pisa con el valor nuevo.
+        """
         if not buffer:
             return 0
         with db_session() as s:
-            stmt = pg_insert(stock_snapshot).values(buffer)
-            stmt = stmt.on_conflict_do_nothing(
-                index_elements=["snapshot_date", "variant_id", "office_id"]
+            stmt = pg_insert(stock_actual).values(buffer)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["variant_id", "office_id"],
+                set_={
+                    "quantity": stmt.excluded.quantity,
+                    "variant_code": stmt.excluded.variant_code,
+                    "office_name": stmt.excluded.office_name,
+                    "updated_at": stmt.excluded.updated_at,
+                },
             )
             s.execute(stmt)
         return len(buffer)
@@ -316,12 +329,12 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
             oid = office.get("id")
             if vid is None or oid is None:
                 continue
-            key = (snapshot_ts, vid, oid)
+            key = (vid, oid)
             if key in seen:
                 continue
             seen.add(key)
             rows.append({
-                "snapshot_date": snapshot_ts,
+                "updated_at": snapshot_ts,
                 "variant_id": vid,
                 "office_id": oid,
                 "quantity": float(item.get("quantity", 0) or 0),
@@ -358,34 +371,40 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
         # como fallida y dispare la notificacion de Render.
         out["stock_error"] = error or "la corrida no llego al final del listado"
         out["advertencia"] = (
-            "FOTO DE STOCK INCOMPLETA. Como los lectores usan "
-            "max(snapshot_date), esta foto parcial taparia a la ultima completa. "
-            "Volver a correr snapshot_stock antes de confiar en el stock."
+            "Corrida de stock incompleta: hay variantes con el valor de una "
+            "corrida anterior. Mirar updated_at por fila para saber cuales. "
+            "NO se borro nada: un valor viejo es mejor que ninguno."
         )
-        _marcar_stock_incompleto(snapshot_ts)
+    else:
+        # Solo despues de una corrida COMPLETA se puede afirmar que lo que no
+        # aparecio ya no existe en Bsale. Si la corrida quedo a medias, borrar
+        # lo no tocado eliminaria stock real.
+        out["filas_dadas_de_baja"] = _borrar_stock_no_reportado(snapshot_ts)
     return out
 
 
-def _marcar_stock_incompleto(snapshot_ts) -> None:
-    """Borra una foto de stock que quedo a medias.
+def _borrar_stock_no_reportado(corrida_ts) -> int:
+    """Borra las filas que esta corrida no toco. Solo tras una corrida completa.
 
-    Es preferible quedarse con la foto completa de ayer que con una parcial de
-    hoy: los lectores toman max(snapshot_date) y no tienen forma de saber que
-    la mas reciente cubre el 5% del inventario.
+    Con una tabla de estado actual y upsert, una variante que Bsale deja de
+    reportar (se dio de baja, quedo sin stock en esa sucursal) mantendria su
+    ultimo valor para siempre. updated_at es el que resuelve eso: lo que no se
+    escribio en esta corrida ya no existe del otro lado.
+
+    Este es el unico borrado del flujo de stock y es barato: opera sobre una
+    tabla de ~150.000 filas, no sobre 7,6 millones.
     """
     try:
         with db_session() as s:
             n = s.execute(
-                stock_snapshot.delete().where(
-                    stock_snapshot.c.snapshot_date == snapshot_ts
-                )
-            ).rowcount
-        logger.error(
-            "Foto de stock incompleta descartada (%s filas). Queda vigente la "
-            "ultima completa.", n,
-        )
+                stock_actual.delete().where(stock_actual.c.updated_at < corrida_ts)
+            ).rowcount or 0
+        if n:
+            logger.info("Stock: %s filas dadas de baja (ya no las reporta Bsale)", n)
+        return n
     except Exception as e:  # noqa: BLE001
-        logger.error("No se pudo descartar la foto parcial de stock: %s", e)
+        logger.error("No se pudo limpiar el stock no reportado: %s", e)
+        return 0
 
 
 def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
@@ -658,6 +677,31 @@ def nightly_snapshot() -> dict[str, Any]:
         logger.error("Error en snapshot_details: %s", e)
         results["details_error"] = str(e)
 
+    # RETENCION. Va ACA, antes del backfill historico, y no al final.
+    #
+    # ORDEN DE LOS PASOS: la retencion es corta y critica; el backfill
+    # historico es largo y opcional. Tenerla detras del backfill significa que
+    # cualquier cosa que mate la corrida a mitad de camino (un redeploy encima
+    # del cron, un tope de tiempo, un error de Bsale) deja la retencion sin
+    # correr esa noche. Eso fue exactamente lo que paso el 07-sep-2026: se
+    # empujaron 7 commits durante la noche, cada push redespliega el cron por
+    # autoDeploy, y la corrida de las 01:00 UTC murio a mitad. Un paso barato
+    # que arregla una tabla de 7,5 millones de filas no puede quedar detras de
+    # 40 minutos de trabajo opcional.
+    try:
+        from retention import apply_retention
+
+        results["retention"] = apply_retention()
+        # Se promueve a clave de primer nivel porque cron_snapshot.py solo
+        # mira las de primer nivel que terminan en _error. Anidado, un fallo
+        # de retencion no marcaba la corrida como fallida: podia fallar todas
+        # las noches sin que llegara un solo correo.
+        if results["retention"].get("hubo_error"):
+            results["retention_error"] = str(results["retention"])[:300]
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en la retencion: %s", e)
+        results["retention_error"] = str(e)[:300]
+
     # Y el hueco historico, del mas viejo al mas nuevo.
     #
     # POR QUE EXISTE ESTE PASO: el de arriba filtra a 90 dias. Todo documento
@@ -685,14 +729,4 @@ def nightly_snapshot() -> dict[str, Any]:
         results["details_historico_error"] = str(e)
 
     logger.info("Snapshot nocturno completado: %s", results)
-    # La retencion solo se llamaba desde sync_incremental.run(). Si el unico
-    # cron configurado es el nocturno, no corria NUNCA y stock_snapshot volvia
-    # a crecer hasta los 13 GB del incidente de agosto. Ahora corre en ambos.
-    try:
-        from retention import apply_retention
-
-        results["retention"] = apply_retention()
-    except Exception as e:  # noqa: BLE001
-        results["retention_error"] = str(e)[:200]
-
     return results

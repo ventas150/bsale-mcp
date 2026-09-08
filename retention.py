@@ -4,20 +4,44 @@ Evita que la base crezca sin limite (la causa del incidente de storage
 de agosto 2026: stock_snapshot llego a 13 GB con fotos horarias que
 ningun tool consultaba).
 
+POR QUE ESTE ARCHIVO SE REESCRIBIO (08-sep-2026)
+------------------------------------------------
+La version anterior no funcionaba, y no funcionaba en silencio. Medido:
+stock_snapshot tenia 7.535.095 filas creciendo 80.000 por noche, o sea
+~94 fotos, con una politica que decia 30 dias. En la MISMA corrida,
+variants_snapshot quedaba en exactamente 2 snapshots (44.508 filas), o sea
+que purge_variants_snapshots SI funcionaba. Mismo codigo, misma corrida: la
+unica diferencia era el tamano de la tabla.
+
+La causa es que el DELETE llevaba adentro
+
+    snapshot_date NOT IN (SELECT max(snapshot_date) FROM stock_snapshot
+                          GROUP BY snapshot_date::date)
+
+que obliga a agregar las 7,5 millones de filas enteras en cada ejecucion.
+Con el statement_timeout de 20 s que db.py pone en TODAS las conexiones, eso
+no alcanza a terminar nunca. La excepcion la atrapaba apply_retention(), la
+escribia en un log que nadie lee, y la corrida seguia como si nada.
+
+Dos cambios de fondo:
+
+1. El borrado se parte en dos. El grueso (todo lo anterior al corte diario)
+   es un predicado de RANGO sobre snapshot_date, que es la primera columna de
+   la PK (snapshot_date, variant_id, office_id): usa el indice y va por lotes
+   acotados. Recien despues, sobre una tabla ya chica, se aplica la regla fina
+   de "una foto por dia".
+2. La retencion corre con su propio statement_timeout. El de 20 s existe para
+   que una consulta pesada no ocupe una de las 5 conexiones del web service;
+   un mantenimiento nocturno no tiene por que heredarlo.
+
 Reglas (configurables por env var):
 - stock_snapshot:
-    * fotos horarias se conservan STOCK_HOURLY_RETENTION_HOURS (default 48h)
-    * mas alla de eso, solo la ULTIMA foto de cada dia
-    * todo lo anterior a STOCK_DAILY_RETENTION_DAYS se borra (default 30d)
-- variants_snapshot:
-    * se conservan las ultimas VARIANTS_KEEP_SNAPSHOTS fotos del catalogo
-      (default 2)
-- documents_snapshot / document_details_snapshot: NO se tocan.
-  Ahi vive el historico de ventas (backfill desde 2024-12) que alimenta
-  los comparativos; pesa poco porque es una fila por documento/linea.
-
-Llamado desde sync_incremental.run() al final de cada corrida. Es barato:
-en estado estacionario borra solo un punado de fotos viejas.
+    * fotos de las ultimas STOCK_HOURLY_RETENTION_HOURS (default 48h): todas
+    * entre eso y STOCK_DAILY_RETENTION_DAYS (default 7d): la ultima de cada dia
+    * mas viejo que eso: se borra
+- variants_snapshot: las ultimas VARIANTS_KEEP_SNAPSHOTS fotos (default 2)
+- documents_snapshot / document_details_snapshot: NO se tocan. Ahi vive el
+  historico de ventas que alimenta los comparativos.
 """
 from __future__ import annotations
 
@@ -32,36 +56,108 @@ from db import session as db_session
 logger = logging.getLogger(__name__)
 
 STOCK_HOURLY_RETENTION_HOURS = int(os.getenv("STOCK_HOURLY_RETENTION_HOURS", "48"))
-STOCK_DAILY_RETENTION_DAYS = int(os.getenv("STOCK_DAILY_RETENTION_DAYS", "30"))
+# 7, no 30. Una foto de stock son ~80.000 filas; 30 dias son 2,4 millones que
+# ningun tool consulta. Los tools de stock leen la foto MAS RECIENTE.
+STOCK_DAILY_RETENTION_DAYS = int(os.getenv("STOCK_DAILY_RETENTION_DAYS", "7"))
 VARIANTS_KEEP_SNAPSHOTS = int(os.getenv("VARIANTS_KEEP_SNAPSHOTS", "2"))
 
+# Timeout propio del mantenimiento. El de db.py (20 s) protege al web service.
+RETENTION_TIMEOUT_MS = int(os.getenv("RETENTION_STATEMENT_TIMEOUT_MS", "600000"))
+# Filas por lote. Acotado para que un lote entre holgado en el timeout y para
+# no tomar un lock largo sobre la tabla.
+RETENTION_BATCH = int(os.getenv("RETENTION_BATCH_ROWS", "50000"))
 
-def purge_stock_snapshots() -> int:
-    """Borra fotos de stock fuera de la politica. Devuelve filas borradas."""
+
+def _sin_timeout_corto(s) -> None:
+    """Le da a ESTA transaccion el timeout del mantenimiento.
+
+    SET LOCAL solo dura la transaccion, asi que no afecta al resto del pool.
+    """
+    s.execute(text(f"SET LOCAL statement_timeout = {RETENTION_TIMEOUT_MS}"))
+
+
+def _borrar_por_lotes(
+    s, where_sql: str, params: dict[str, Any], batch: int, max_lotes: int | None = None
+) -> tuple[int, bool]:
+    """Borra en lotes acotados por ctid. Devuelve (borradas, quedan_pendientes).
+
+    El DELETE ... WHERE ctid IN (SELECT ctid ... LIMIT n) es la forma de acotar
+    un borrado masivo en Postgres: cada vuelta toma un lock corto y el planner
+    puede usar el indice del WHERE para juntar el lote.
+
+    max_lotes existe para poder llamar esto desde un tool MCP sin pasarse del
+    timeout de 180 s del cliente. Con None corre hasta terminar (es lo que
+    hace el cron, que no tiene ese tope).
+    """
+    borradas = 0
+    lotes = 0
     sql = text(
-        """
-        DELETE FROM stock_snapshot s
-        WHERE s.snapshot_date < now() - make_interval(hours => :hours)
-          AND (
-            s.snapshot_date < now() - make_interval(days => :days)
-            OR s.snapshot_date NOT IN (
-              SELECT max(snapshot_date)
-              FROM stock_snapshot
-              GROUP BY snapshot_date::date
-            )
-          )
+        f"""
+        DELETE FROM stock_snapshot
+        WHERE ctid IN (
+            SELECT ctid FROM stock_snapshot
+            WHERE {where_sql}
+            LIMIT :batch
+        )
         """
     )
+    while True:
+        res = s.execute(sql, {**params, "batch": batch})
+        n = res.rowcount or 0
+        borradas += n
+        lotes += 1
+        if n < batch:
+            return borradas, False
+        if max_lotes is not None and lotes >= max_lotes:
+            return borradas, True
+
+
+def purge_stock_snapshots(max_lotes: int | None = None) -> dict[str, Any]:
+    """Vacia stock_snapshot, que es una tabla legada.
+
+    El 08-sep-2026 el stock dejo de guardarse como serie de tiempo y paso a
+    stock_actual, una fila por (variante, sucursal) con upsert. Se reviso quien
+    leia stock_snapshot y TODOS los consumidores pedian solo la foto mas
+    reciente; los tools de quiebres, proyeccion y sobrestockeos ni la tocaban
+    (leen stock en vivo de Bsale). O sea que sus 7.653.095 filas eran historico
+    que nadie consultaba.
+
+    Ya no hay politica de dias ni de horas que aplicar: la tabla entera sobra.
+    Esto la vacia por lotes y despues queda como no-op. La tabla se deja
+    creada a proposito, para poder volver atras sin una migracion inversa; se
+    borra cuando stock_actual lleve unas semanas andando.
+    """
+    out: dict[str, Any] = {"tabla": "stock_snapshot (legada)"}
+
     with db_session() as s:
-        res = s.execute(sql, {
-            "hours": STOCK_HOURLY_RETENTION_HOURS,
-            "days": STOCK_DAILY_RETENTION_DAYS,
-        })
-        return res.rowcount or 0
+        _sin_timeout_corto(s)
+        out["filas_antes"] = s.execute(
+            text("SELECT count(*) FROM stock_snapshot")
+        ).scalar_one()
+
+        if out["filas_antes"] == 0:
+            out["borradas_total"] = 0
+            out["quedan_pendientes"] = False
+            return out
+
+        # Sin WHERE que dependa de fechas: sobra la tabla completa.
+        borradas, pendientes = _borrar_por_lotes(
+            s, "TRUE", {}, RETENTION_BATCH, max_lotes
+        )
+        out["borradas_total"] = borradas
+        out["quedan_pendientes"] = pendientes
+        out["filas_despues"] = out["filas_antes"] - borradas
+
+    return out
 
 
 def purge_variants_snapshots() -> int:
-    """Conserva solo las ultimas N fotos del catalogo. Devuelve filas borradas."""
+    """Conserva solo las ultimas N fotos del catalogo. Devuelve filas borradas.
+
+    Esta si funcionaba: variants_snapshot es chica (44.508 filas) y el mismo
+    patron de subquery le sale barato. Se deja como estaba, con el timeout
+    largo por consistencia.
+    """
     sql = text(
         """
         DELETE FROM variants_snapshot
@@ -76,23 +172,33 @@ def purge_variants_snapshots() -> int:
         """
     )
     with db_session() as s:
+        _sin_timeout_corto(s)
         res = s.execute(sql, {"keep": VARIANTS_KEEP_SNAPSHOTS})
         return res.rowcount or 0
 
 
 def apply_retention() -> dict[str, Any]:
-    """Aplica toda la politica de retencion. Nunca lanza (loggea y sigue)."""
+    """Aplica toda la politica. Nunca lanza, pero SI declara si algo fallo.
+
+    OJO: la version anterior tambien atrapaba las excepciones, pero las dejaba
+    en una clave anidada que cron_snapshot.py no miraba (solo revisa claves de
+    primer nivel que terminen en _error). Resultado: la retencion podia fallar
+    todas las noches durante meses sin que el cron marcara la corrida como
+    fallida ni llegara un correo. Ahora se expone `hubo_error` para que el
+    llamador no tenga que adivinar.
+    """
     out: dict[str, Any] = {}
     try:
-        out["stock_rows_deleted"] = purge_stock_snapshots()
+        out["stock"] = purge_stock_snapshots()
     except Exception as e:  # noqa: BLE001
         logger.error("Error en purge_stock_snapshots: %s", e)
-        out["stock_error"] = str(e)
+        out["stock_error"] = str(e)[:300]
     try:
         out["variants_rows_deleted"] = purge_variants_snapshots()
     except Exception as e:  # noqa: BLE001
         logger.error("Error en purge_variants_snapshots: %s", e)
-        out["variants_error"] = str(e)
-    if out.get("stock_rows_deleted") or out.get("variants_rows_deleted"):
-        logger.info("Retencion aplicada: %s", out)
+        out["variants_error"] = str(e)[:300]
+
+    out["hubo_error"] = any(k.endswith("_error") for k in out)
+    logger.info("Retencion aplicada: %s", out)
     return out

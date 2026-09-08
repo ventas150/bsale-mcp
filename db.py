@@ -92,6 +92,40 @@ stock_snapshot = Table(
     Column("office_name", String(200)),
 )
 
+# ESTADO ACTUAL del stock. Una fila por (variante, sucursal), no una copia
+# entera del inventario por cada corrida.
+#
+# POR QUE SE CAMBIO (08-sep-2026). stock_snapshot era una serie de tiempo:
+# cada corrida del nocturno agregaba ~150.000 filas nuevas con un
+# snapshot_date distinto. Llego a 7.653.095 filas. Pero se reviso quien la
+# lee, archivo por archivo, y TODOS los consumidores piden solo la foto mas
+# reciente: digests.py con max(snapshot_date), sync_incremental.py idem, y el
+# status con max() y count(). Los tools de quiebres, proyeccion de compras y
+# sobrestockeos ni siquiera la tocan: leen stock EN VIVO de Bsale.
+#
+# O sea que se pagaban ~2 horas de nocturno y 7,6 millones de filas para
+# guardar un historico que nadie consulta. Con upsert son ~150.000 filas
+# fijas, sin crecimiento y sin politica de retencion que mantener.
+#
+# Beneficio secundario y no menor: desaparece el problema de la "foto
+# parcial". Antes, si la corrida moria a mitad, quedaba una foto incompleta
+# que por ser la mas reciente le GANABA a la completa del dia anterior. Con
+# estado actual no hay fotos: una corrida cortada deja algunas filas mas
+# viejas que otras, que es estrictamente mejor.
+stock_actual = Table(
+    "stock_actual",
+    metadata,
+    Column("variant_id", Integer, primary_key=True),
+    Column("office_id", Integer, primary_key=True),
+    Column("quantity", Float),
+    Column("variant_code", String(100), index=True),
+    Column("office_name", String(200)),
+    # updated_at es lo que permite limpiar lo que Bsale dejo de reportar: al
+    # terminar una corrida COMPLETA se borra todo lo que no se toco en ella.
+    Column("updated_at", DateTime(timezone=True), index=True),
+)
+
+
 # Line items de cada documento (1 row por linea de doc).
 # Esta tabla es la que permite calcular velocity, top sellers, allocation, etc.
 document_details_snapshot = Table(

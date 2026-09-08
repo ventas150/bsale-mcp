@@ -54,7 +54,7 @@ def _stock_photo_age_hours() -> float:
     from db import session as db_session
     try:
         with db_session() as s:
-            ts = s.execute(text("select max(snapshot_date) from stock_snapshot")).scalar()
+            ts = s.execute(text("select max(updated_at) from stock_actual")).scalar()
         if not ts:
             return float("inf")
         if ts.tzinfo is None:

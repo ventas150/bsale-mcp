@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, desc, func, select, text
 
 from db import (
     document_details_snapshot,
@@ -16,7 +16,7 @@ from db import (
     official_sale_supported,
     session as db_session,
     signed_amount,
-    stock_snapshot,
+    stock_actual,
     variants_snapshot,
 )
 # OJO: nightly_snapshot, snapshot_stock y snapshot_variants NO se importan
@@ -224,16 +224,143 @@ def register(mcp) -> None:  # noqa: ANN001
         )
 
     @mcp.tool()
+    def bsale_mcp_stock_actual_sembrar(
+        usar_snapshot_date: str | None = None,
+        solo_listar: bool = False,
+    ) -> dict[str, Any]:
+        """Siembra stock_actual con la ultima foto COMPLETA de stock_snapshot.
+
+        Se corre UNA vez, al migrar de la tabla vieja (serie de tiempo) a la
+        nueva (estado actual). Sin esto stock_actual arranca vacia y digests
+        reportaria cero stock hasta la proxima corrida nocturna, que tarda
+        ~2 horas.
+
+        OJO con cual foto se elige. La mas reciente NO sirve: puede ser una
+        corrida a medias (el 08-sep-2026 la mas reciente era justamente una en
+        curso). Se elige la de MAYOR cantidad de filas, y entre empates la mas
+        nueva. Esa es la unica forma de distinguir una foto completa de una
+        parcial, porque la tabla vieja nunca guardo esa marca.
+
+        Es idempotente: si stock_actual ya tiene datos, no hace nada.
+        """
+        from retention import RETENTION_TIMEOUT_MS
+
+        with db_session() as s:
+            s.execute(text(f"SET LOCAL statement_timeout = {RETENTION_TIMEOUT_MS}"))
+
+            ya = s.execute(text("SELECT count(*) FROM stock_actual")).scalar_one()
+            if ya:
+                return {
+                    "aplicado": False,
+                    "motivo": f"stock_actual ya tiene {ya} filas; no se toca.",
+                    "filas": ya,
+                }
+
+            candidatas = s.execute(text(
+                """
+                SELECT snapshot_date, count(*) AS filas
+                FROM stock_snapshot
+                GROUP BY snapshot_date
+                ORDER BY filas DESC, snapshot_date DESC
+                LIMIT 5
+                """
+            )).fetchall()
+            if not candidatas:
+                return {"aplicado": False, "motivo": "stock_snapshot esta vacia."}
+
+            top = [
+                {"snapshot_date": c.snapshot_date.isoformat(), "filas": int(c.filas)}
+                for c in candidatas
+            ]
+            if solo_listar:
+                # Sirve para elegir a mano: una corrida EN CURSO puede ser la
+                # de mas filas sin estar completa, y sembrar de ahi dejaria
+                # stock incompleto.
+                return {"aplicado": False, "candidatas": top}
+
+            if usar_snapshot_date:
+                elegida = next(
+                    (c for c in candidatas
+                     if c.snapshot_date.isoformat() == usar_snapshot_date),
+                    None,
+                )
+                if elegida is None:
+                    return {
+                        "aplicado": False,
+                        "motivo": f"{usar_snapshot_date} no esta entre las 5 mayores.",
+                        "candidatas": top,
+                    }
+            else:
+                elegida = candidatas[0]
+
+            s.execute(text(
+                """
+                INSERT INTO stock_actual
+                    (variant_id, office_id, quantity, variant_code,
+                     office_name, updated_at)
+                SELECT variant_id, office_id, quantity, variant_code,
+                       office_name, snapshot_date
+                FROM stock_snapshot
+                WHERE snapshot_date = :d
+                ON CONFLICT (variant_id, office_id) DO NOTHING
+                """
+            ), {"d": elegida.snapshot_date})
+
+            quedaron = s.execute(text("SELECT count(*) FROM stock_actual")).scalar_one()
+
+        return {
+            "aplicado": True,
+            "foto_usada": elegida.snapshot_date.isoformat(),
+            "filas_de_esa_foto": int(elegida.filas),
+            "filas_en_stock_actual": quedaron,
+            "candidatas": top,
+            "siguiente_paso": "bsale_mcp_retencion_run para vaciar la tabla vieja",
+        }
+
+    @mcp.tool()
+    def bsale_mcp_retencion_run(max_lotes: int = 20) -> dict[str, Any]:
+        """Aplica la politica de retencion a stock_snapshot. WRITE OP (DB local).
+
+        BORRA FILAS Y NO SE PUEDE DESHACER. Borra fotos de stock viejas segun
+        STOCK_DAILY_RETENTION_DAYS (7 por defecto). No toca documentos ni
+        detalle de linea: ahi vive el historico de ventas.
+
+        Por que existe: la retencion venia fallando en silencio desde hace
+        meses y stock_snapshot llego a 7,5 millones de filas creciendo 80.000
+        por noche. Eso es lo que hace que bsale_snapshot_status tarde 20
+        segundos en responder 4 numeros.
+
+        Args:
+            max_lotes: Lotes de 50.000 filas por llamada (default 20 = 1
+                millon). Existe por el timeout de 180 s del cliente MCP: si
+                queda trabajo, la respuesta trae quedan_pendientes=True y se
+                vuelve a llamar.
+        """
+        from retention import purge_stock_snapshots
+
+        if max_lotes > 40:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    f"max_lotes={max_lotes}. El tope es 40 (2 millones de "
+                    "filas) por el timeout de 180 s del cliente MCP. Llamar "
+                    "varias veces hasta quedan_pendientes=False."
+                ),
+            }
+        stock = purge_stock_snapshots(max_lotes=max_lotes)
+        return {"aplicado": True, "stock": stock}
+
+    @mcp.tool()
     def bsale_snapshot_status() -> dict[str, Any]:
         """Devuelve cuando fue el ultimo snapshot exitoso de cada tabla."""
         with db_session() as s:
             doc_max = s.execute(select(func.max(documents_snapshot.c.snapshot_date))).scalar()
-            stock_max = s.execute(select(func.max(stock_snapshot.c.snapshot_date))).scalar()
+            stock_max = s.execute(select(func.max(stock_actual.c.updated_at))).scalar()
             var_max = s.execute(select(func.max(variants_snapshot.c.snapshot_date))).scalar()
             det_max = s.execute(select(func.max(document_details_snapshot.c.fetched_at))).scalar()
 
             doc_count = s.execute(select(func.count()).select_from(documents_snapshot)).scalar()
-            stock_count = s.execute(select(func.count()).select_from(stock_snapshot)).scalar()
+            stock_count = s.execute(select(func.count()).select_from(stock_actual)).scalar()
             var_count = s.execute(select(func.count()).select_from(variants_snapshot)).scalar()
             det_count = s.execute(select(func.count()).select_from(document_details_snapshot)).scalar()
             det_docs_count = s.execute(

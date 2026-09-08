@@ -962,3 +962,105 @@ def test_los_tools_de_velocity_declaran_cobertura():
     assert "def cobertura_ultimos_dias" not in codigo, (
         "el helper va a nivel de modulo, no dentro de register()"
     )
+
+
+# ============================================================
+# La retencion tiene que poder terminar, y avisar si no termina
+# ============================================================
+# Medido el 08-sep-2026: stock_snapshot con 7.535.095 filas creciendo 80.000
+# por noche, con una politica que decia 30 dias (~94 fotos). En la MISMA
+# corrida variants_snapshot quedaba en exactamente 2 snapshots, o sea que la
+# retencion de variantes SI funcionaba. Mismo codigo, unica diferencia el
+# tamano de la tabla: el DELETE de stock llevaba adentro un
+# "NOT IN (SELECT max(...) GROUP BY ...)" que agrega la tabla entera en cada
+# ejecucion, y no cabia en el statement_timeout de 20 s de db.py.
+
+def test_el_stock_es_estado_actual_y_no_serie_de_tiempo():
+    """La tabla vieja acumulaba una copia entera del inventario por corrida.
+
+    Llego a 7.653.095 filas. Se reviso quien la leia: digests, sync_incremental
+    y el status pedian SOLO la foto mas reciente, y quiebres/proyeccion/
+    sobrestockeos leen stock en vivo de Bsale. O sea, historico que nadie
+    consultaba, a costa de ~2 horas de nocturno por noche.
+    """
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.snapshot_stock))
+
+    assert "pg_insert(stock_actual)" in codigo, "el stock va a la tabla de estado"
+    assert "on_conflict_do_update" in codigo, "tiene que pisar, no acumular"
+    assert "pg_insert(stock_snapshot)" not in codigo, "la tabla vieja quedo muerta"
+    assert '"snapshot_date": snapshot_ts' not in codigo
+
+
+def test_solo_se_da_de_baja_stock_tras_una_corrida_completa():
+    """Borrar lo no tocado tras una corrida a medias borraria stock real."""
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.snapshot_stock))
+
+    # la baja va en la rama del else, no en la de error
+    antes_del_else = codigo.split("else:")[0]
+    assert "_borrar_stock_no_reportado" not in antes_del_else, (
+        "la baja no puede correr cuando la corrida quedo incompleta"
+    )
+    assert "_borrar_stock_no_reportado" in codigo
+
+
+def test_ningun_consumidor_lee_la_tabla_vieja():
+    """Los que SIRVEN datos leen stock_actual.
+
+    Se exceptuan a proposito los dos que tienen que tocar la tabla vieja: el
+    tool de siembra (la lee una vez para migrar) y la retencion (la vacia).
+    """
+    import inspect
+
+    excepciones = ("bsale_mcp_stock_actual_sembrar", "purge_stock_snapshots")
+
+    for modulo in ("digests", "tools_snapshot", "tools_intelligence_db"):
+        mod = pytest.importorskip(modulo)
+        src = inspect.getsource(mod)
+        for nombre in excepciones:
+            if nombre in src:
+                # se corta el fuente en el def de la excepcion y se salta
+                partes = src.split("def " + nombre)
+                src = partes[0] + "".join(p.split("@mcp.tool()", 1)[-1] for p in partes[1:])
+        assert "FROM stock_snapshot" not in src, f"{modulo} sigue leyendo la vieja"
+        assert "stock_snapshot.c." not in src, f"{modulo} sigue leyendo la vieja"
+
+
+def test_la_retencion_tiene_su_propio_timeout():
+    """El de 20 s protege al web service; un mantenimiento no lo hereda."""
+    import inspect
+
+    retention = pytest.importorskip("retention")
+    src = inspect.getsource(retention)
+    assert "SET LOCAL statement_timeout" in src
+    assert "_sin_timeout_corto(s)" in src
+
+
+def test_un_fallo_de_retencion_se_ve():
+    """Anidado en un dict que nadie mira, un fallo no marca la corrida."""
+    import inspect
+
+    retention = pytest.importorskip("retention")
+    assert "hubo_error" in inspect.getsource(retention.apply_retention)
+
+    snapshot = pytest.importorskip("snapshot")
+    nocturno = _solo_codigo(inspect.getsource(snapshot.nightly_snapshot))
+    assert 'results["retention_error"]' in nocturno, (
+        "cron_snapshot.py solo mira claves de primer nivel que terminen en _error"
+    )
+
+
+def test_la_retencion_corre_antes_del_backfill_historico():
+    """Paso corto y critico no puede ir detras de uno largo y opcional."""
+    import inspect
+
+    snapshot = pytest.importorskip("snapshot")
+    codigo = _solo_codigo(inspect.getsource(snapshot.nightly_snapshot))
+    assert codigo.index("apply_retention") < codigo.index("oldest_first=True"), (
+        "si la corrida muere en el backfill, la retencion no corre esa noche"
+    )
