@@ -1,0 +1,42 @@
+# ENTRADA del lockfile, no lo que instala Render.
+# Render instala requirements.txt, que es el resultado COMPILADO de este
+# archivo para linux / Python 3.14 (lo que corre en Render) con hashes.
+# Para cambiar una version: editar ACA y recompilar desde el PC:
+#   .venv\Scripts\uv pip compile requirements.in --python-platform linux \
+#       --python-version 3.14 --generate-hashes -o requirements.txt
+# (uv esta instalado en el venv del PC; PyPI esta bloqueado desde Cowork).
+# En el PC (Windows) el venv se instala desde ESTE archivo, no del lock.
+#
+# Versiones fijas a proposito. Con `>=` el proximo rebuild de Render instala
+# lo que este ultimo ese dia, y un deploy a ciegas ya nos costo caro antes
+# (myscrubs-ml-mcp, ago-2026). Estas son las versiones con las que se probo el
+# codigo el 09-sep-2026 en Python 3.14.
+fastmcp==4.0.3
+httpx==0.28.1
+pydantic==2.13.5
+python-dotenv==1.2.3
+uvicorn==0.52.4
+sentry-sdk==2.68.1
+psycopg[binary]==3.3.5
+sqlalchemy==2.0.52
+
+# --- Transitivas que sostienen el candado y el transporte, pinneadas ---
+# fastmcp-slim[server] declara `starlette>=1.0.1` SIN techo, y server.py
+# importa starlette directamente: el unico middleware de autenticacion del
+# sistema es una subclase de BaseHTTPMiddleware. Con autoDeploy sobre main,
+# un `pip install` en Render podia traer otra Starlette sin que nadie
+# tocara el repo. Lo mismo el transporte MCP (`mcp<3.0.0,>=2.0.0`, un major
+# entero de ventana). Pinnear los 9 directos y dejar ~50 transitivos
+# flotando era aplicar la leccion a medias.
+starlette==1.6.0
+mcp==2.1.1
+mcp-types==2.1.1
+sse-starlette==3.4.11
+anyio==4.15.1
+h11==0.16.0
+httpcore==1.0.9
+pydantic-core==2.46.5
+pydantic-settings==2.15.0
+
+# apscheduler se saco: el snapshot dejo de correr in-process (server.py lo
+# dice). Era dependencia muerta en produccion.

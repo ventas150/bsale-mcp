@@ -45,7 +45,7 @@ source .venv/bin/activate  # Linux/Mac
 .venv\Scripts\activate     # Windows
 
 # 3. Instalar deps
-pip install -r requirements.txt
+pip install -r requirements.in   # en el PC; requirements.txt es el lock de linux que instala Render
 
 # 4. Configurar credentials
 cp .env.example .env

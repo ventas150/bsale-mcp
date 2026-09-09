@@ -3572,3 +3572,37 @@ def test_los_tools_en_vivo_retirados_no_vuelven():
             for m in __import__("re").finditer(nombre + r"(?!_fast)\b", src):
                 linea = src[src.rfind("\n", 0, m.start()) + 1: src.find("\n", m.end())]
                 assert "retir" in linea.lower(), f"{mod} nombra {nombre}: {linea.strip()[:80]}"
+
+# ===========================================================================
+# Lockfile: requirements.txt es el lock compilado de requirements.in
+# ===========================================================================
+
+def _pins(texto):
+    import re
+
+    return dict(re.findall(r"^([A-Za-z0-9_.\-\[\]]+)==([0-9][^\s\\;]*)", texto, re.M))
+
+
+def test_requirements_txt_es_el_lock_de_requirements_in():
+    """Render instala requirements.txt. Si alguien vuelve a editarlo a mano o
+    lo reemplaza por la lista corta, las ~50 transitivas vuelven a flotar."""
+    import os
+
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(aqui, "requirements.in"), encoding="utf-8") as fh:
+        entrada = fh.read()
+    with open(os.path.join(aqui, "requirements.txt"), encoding="utf-8") as fh:
+        lock = fh.read()
+
+    directos = _pins(entrada)
+    bloqueados = _pins(lock)
+    assert len(directos) >= 15, "requirements.in perdio los directos o las transitivas del candado"
+    for pkg, ver in directos.items():
+        base = pkg.split("[")[0].lower().replace("_", "-")
+        assert bloqueados.get(base) == ver, f"{pkg}=={ver} de requirements.in no esta igual en el lock"
+    assert len(bloqueados) > 60, "el lock tiene que traer las transitivas, no solo los directos"
+    assert lock.count("--hash=sha256:") >= len(bloqueados), "cada paquete con hash: pip en modo hash-checking"
+    assert "# via" in lock, "no parece un archivo compilado"
+    for solo_windows in ("pywin32", "colorama", "pywin32-ctypes"):
+        assert f"\n{solo_windows}==" not in lock, f"{solo_windows}: el lock se compilo para Windows, no para linux"
+    assert "apscheduler" not in lock.lower(), "dependencia muerta"
