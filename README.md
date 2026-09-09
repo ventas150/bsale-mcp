@@ -66,7 +66,7 @@ Ver `DEPLOY.md` para el paso a paso de deployment.
 1. Cowork → Settings → MCPs → Add Remote MCP
 2. URL: `https://bsale-mcp-myscrubs.onrender.com/mcp`
 3. Transport: `streamable-http`
-4. (No requiere auth header — el server identifica MyScrubs por el `BSALE_ACCESS_TOKEN` interno)
+4. (La credencial es `MCP_URL_SECRET`, embebida en la ruta: `/mcp/<secreto>`. Sin esa variable el servidor no arranca. Ver DEPLOY.md.)
 
 ## Roadmap
 

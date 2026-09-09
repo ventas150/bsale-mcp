@@ -1,7 +1,7 @@
 # Versiones fijas a proposito. Con `>=` el proximo rebuild de Render instala
 # lo que este ultimo ese dia, y un deploy a ciegas ya nos costo caro antes
 # (myscrubs-ml-mcp, ago-2026). Estas son las versiones con las que se probo el
-# codigo el 07-sep-2026 en Python 3.14.
+# codigo el 09-sep-2026 en Python 3.14.
 fastmcp==4.0.3
 httpx==0.28.1
 pydantic==2.13.5
@@ -10,4 +10,24 @@ uvicorn==0.52.4
 sentry-sdk==2.68.1
 psycopg[binary]==3.3.5
 sqlalchemy==2.0.52
-apscheduler==3.11.3
+
+# --- Transitivas que sostienen el candado y el transporte, pinneadas ---
+# fastmcp-slim[server] declara `starlette>=1.0.1` SIN techo, y server.py
+# importa starlette directamente: el unico middleware de autenticacion del
+# sistema es una subclase de BaseHTTPMiddleware. Con autoDeploy sobre main,
+# un `pip install` en Render podia traer otra Starlette sin que nadie
+# tocara el repo. Lo mismo el transporte MCP (`mcp<3.0.0,>=2.0.0`, un major
+# entero de ventana). Pinnear los 9 directos y dejar ~50 transitivos
+# flotando era aplicar la leccion a medias.
+starlette==1.6.0
+mcp==2.1.1
+mcp-types==2.1.1
+sse-starlette==3.4.11
+anyio==4.15.1
+h11==0.16.0
+httpcore==1.0.9
+pydantic-core==2.46.5
+pydantic-settings==2.15.0
+
+# apscheduler se saco: el snapshot dejo de correr in-process (server.py lo
+# dice). Era dependencia muerta en produccion.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import re
 import sys
 
 from fastmcp import FastMCP
@@ -23,11 +24,27 @@ if SENTRY_DSN:
     try:
         import sentry_sdk
 
+        def _sin_secreto_en_la_url(event, hint):  # noqa: ANN001
+            """La integracion ASGI adjunta request.url a cada evento, y aca la
+            URL ES la credencial (/mcp/<secreto>). access_log=False cerro la
+            puerta de uvicorn; esta es la misma puerta un piso mas arriba."""
+            req = event.get("request") or {}
+            for k in ("url", "query_string"):
+                v = req.get(k)
+                if isinstance(v, str):
+                    req[k] = re.sub(r"/mcp/[^/?#\s]+", "/mcp/<redacted>", v)
+            if req:
+                event["request"] = req
+            return event
+
         sentry_sdk.init(
             dsn=SENTRY_DSN,
             traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE", "0.1")),
             environment=os.getenv("ENVIRONMENT", "production"),
             release=os.getenv("RELEASE_VERSION", "0.3.0"),
+            send_default_pii=False,
+            before_send=_sin_secreto_en_la_url,
+            before_send_transaction=_sin_secreto_en_la_url,
         )
     except ImportError:
         pass  # sentry-sdk no instalado, seguir sin
@@ -67,6 +84,11 @@ mcp = FastMCP(
 # para que activarlo sea una decision consciente y coordinada con la config del
 # cliente MCP — no para dejarlo apagado.
 
+# 2 MB: un lote de 50 cambios de precio son ~5 KB; un listado grande de
+# respuesta no pasa por aqui (es salida, no entrada).
+MAX_REQUEST_BYTES = int(os.getenv("MCP_MAX_REQUEST_BYTES", str(2_000_000)))
+
+
 def _auth_token() -> str | None:
     tok = os.getenv("MCP_AUTH_TOKEN", "").strip()
     return tok or None
@@ -104,7 +126,13 @@ def _con_candado() -> bool:
 def _auth_ok(request) -> bool:  # noqa: ANN001
     validas = _credenciales_validas()
     if not validas:
-        return True  # sin candado configurado, no se exige (ver nota de arriba)
+        # FALLA CERRADO. Hasta el 09-sep-2026 esto devolvia True: sin
+        # MCP_URL_SECRET ni MCP_AUTH_TOKEN, todo quedaba publico, incluidos
+        # los tools de escritura sobre el ERP, y /health lo anunciaba con
+        # "auth: ABIERTO". Las dos variables son sync:false en el blueprint,
+        # o sea que un servicio creado desde ahi arrancaba abierto. Ahora sin
+        # credencial no entra nadie, y main() ni siquiera arranca.
+        return False
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         return False
@@ -132,12 +160,29 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):  # noqa: ANN001
         path = request.url.path
-        if path == "/health" or not _con_candado():
+        if path == "/health":
             return await call_next(request)
-        sec = _url_secret()
-        if sec:
-            esperado = _mcp_path()
-            if path == esperado or path.startswith(esperado + "/"):
+        # Tope de tamano de request ANTES de que Starlette parsee el body: el
+        # guardrail de 50 items se evalua despues del parseo, y la instancia
+        # es Starter (512 MB) compartida con /health.
+        try:
+            largo = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            largo = 0
+        if largo > MAX_REQUEST_BYTES:
+            from starlette.responses import JSONResponse
+            return JSONResponse(
+                {"error": "payload_too_large",
+                 "detail": f"El cuerpo supera {MAX_REQUEST_BYTES} bytes."},
+                status_code=413,
+            )
+        if _con_candado() and _url_secret():
+            # Comparacion en tiempo constante tambien en el camino de la URL,
+            # que es el unico que usa el conector de Cowork. _auth_ok ya lo
+            # hacia para el header; aca se comparaba con ==.
+            partes = path.split("/", 3)  # "", "mcp", "<secreto>", resto
+            if (len(partes) >= 3 and partes[1] == "mcp"
+                    and secrets.compare_digest(partes[2], _url_secret())):
                 return await call_next(request)
         if not _auth_ok(request):
             return _unauthorized()
@@ -375,10 +420,14 @@ def main() -> None:
         logger.info("Auth: %s (MCP montado en /mcp/<secreto>)"
                     if _url_secret() else "Auth: %s", _describir_auth())
     else:
-        logger.warning(
-            "Auth: NO HAY MCP_AUTH_TOKEN — el servidor acepta llamadas sin credenciales. "
-            "Definir MCP_AUTH_TOKEN en Render y mandarlo como 'Authorization: Bearer <token>'."
+        # Falla VISIBLE en el deploy en vez de servicio abierto en silencio.
+        # Este servidor da acceso de escritura al ERP de produccion.
+        logger.error(
+            "Auth: NO HAY MCP_URL_SECRET ni MCP_AUTH_TOKEN. Me niego a arrancar "
+            "abierto a internet. Definir MCP_URL_SECRET en Render (el conector "
+            "de Cowork usa /mcp/<secreto>) y redesplegar."
         )
+        sys.exit(1)
     if os.getenv("DATABASE_URL"):
         try:
             from db import init_db
@@ -413,6 +462,9 @@ def main() -> None:
         port=port,
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
         access_log=False,
+        # Un solo consumidor legitimo (el conector) y un healthcheck. 32 es
+        # holgado para eso y corta un agente en bucle antes del OOM.
+        limit_concurrency=int(os.getenv("MCP_LIMIT_CONCURRENCY", "32")),
     )
 
 if __name__ == "__main__":

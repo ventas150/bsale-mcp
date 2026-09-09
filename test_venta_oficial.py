@@ -233,12 +233,18 @@ def _limpiar_candado(monkeypatch):
     monkeypatch.delenv("MCP_URL_SECRET", raising=False)
 
 
-def test_sin_candado_todo_pasa(monkeypatch):
+def test_sin_candado_nada_pasa(monkeypatch):
+    """Hasta el 09-sep-2026 este test se llamaba test_sin_candado_todo_pasa y
+    afirmaba lo contrario: sin MCP_URL_SECRET ni MCP_AUTH_TOKEN, _auth_ok
+    devolvia True y el ERP quedaba escribible desde internet. Las dos
+    variables son sync:false en el blueprint. Ahora falla cerrado, y main()
+    ni siquiera arranca (ver test_main_no_arranca_sin_credencial)."""
     import server
     _limpiar_candado(monkeypatch)
     assert not server._con_candado()
     assert server._mcp_path() == "/mcp"
-    assert server._auth_ok(_Req())
+    assert server._auth_ok(_Req()) is False
+    assert server._auth_ok(_Req(headers={"authorization": "Bearer lo-que-sea"})) is False
 
 
 def test_url_secreta_cambia_la_ruta_del_mcp(monkeypatch):
@@ -2672,3 +2678,151 @@ def test_retencion_run_se_rehusa_con_stock_actual_vacia():
     cuerpo = src[i:j]
     assert "SELECT count(*) FROM stock_actual" in cuerpo
     assert "max_lotes: int = 4" in cuerpo
+
+
+# ===========================================================================
+# Segunda auditoria, 09-sep-2026 — Lote 3: seguridad y configuracion
+# ===========================================================================
+
+def test_main_no_arranca_sin_credencial(monkeypatch):
+    """Falla VISIBLE en el deploy en vez de servicio abierto en silencio."""
+    import server
+
+    _limpiar_candado(monkeypatch)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        server.main()
+    assert exc.value.code == 1
+
+
+def test_el_secreto_de_la_url_se_compara_en_tiempo_constante():
+    import inspect
+
+    import server
+
+    src = _solo_codigo(inspect.getsource(server.BearerAuthMiddleware.dispatch))
+    assert "secrets.compare_digest(partes[2]" in src
+    assert "path == esperado" not in src and "startswith(esperado" not in src
+
+
+def test_el_middleware_rechaza_cuerpos_gigantes(monkeypatch):
+    import asyncio
+
+    import server
+
+    monkeypatch.setenv("MCP_URL_SECRET", "abc123")
+    mw = server.BearerAuthMiddleware(app=None)
+    llamados = []
+
+    async def call_next(req):  # noqa: ANN001
+        llamados.append(req)
+        return "OK"
+
+    grande = _Req(headers={"content-length": str(server.MAX_REQUEST_BYTES + 1)}, path="/mcp/abc123")
+    resp = asyncio.run(mw.dispatch(grande, call_next))
+    assert getattr(resp, "status_code", None) == 413 and llamados == []
+
+    normal = _Req(headers={"content-length": "512"}, path="/mcp/abc123")
+    assert asyncio.run(mw.dispatch(normal, call_next)) == "OK"
+
+    # Y con el secreto equivocado en la URL, 401, no 200.
+    malo = _Req(headers={}, path="/mcp/abc124")
+    resp = asyncio.run(mw.dispatch(malo, call_next))
+    assert getattr(resp, "status_code", None) == 401
+
+
+def test_uvicorn_limita_la_concurrencia():
+    import inspect
+
+    import server
+
+    assert "limit_concurrency=" in _solo_codigo(inspect.getsource(server.main))
+
+
+def test_sentry_no_manda_la_url_con_el_secreto():
+    """La integracion ASGI adjunta request.url a cada evento, y aca la URL es
+    la credencial. access_log=False cerro uvicorn; esta es la misma puerta un
+    piso mas arriba."""
+    import inspect
+
+    import server
+
+    src = inspect.getsource(server)
+    i = src.index("sentry_sdk.init(")
+    bloque = src[i:i + 600]
+    assert "before_send=_sin_secreto_en_la_url" in bloque
+    assert "send_default_pii=False" in bloque
+    # El regex que usa, sobre una URL real
+    import re
+    assert "S3CR3T0" not in re.sub(r"/mcp/[^/?#\s]+", "/mcp/<redacted>",
+                                   "https://x.onrender.com/mcp/S3CR3T0/tools?x=1")
+    assert 're.sub(r"/mcp/[^/?#\\s]+"' in src
+
+
+def test_redact_censura_por_subcadena_y_por_valor():
+    """La lista vieja era de 11 nombres exactos: 'accessToken' (camelCase de
+    Bsale) pasaba en claro. Y un token dentro de una note tambien."""
+    from audit import _redact
+
+    out = _redact({
+        "accessToken": "abc", "Access-Token": "abc", "refresh_token": "abc",
+        "x-api-key": "abc", "clientSecret": "abc", "bearer": "abc",
+        "variantId": 117733, "quantity": 5, "note": "recepcion normal",
+        "details": [{"cost": 9500, "webhookSignature": "zzz"}],
+        "pegado": "token=abcdefghijklmnop123456",
+        "suelto": "dGhpcy1sb29rcy1saWtlLWEtdG9rZW4tMTIzNDU2",
+    })
+    for k in ("accessToken", "Access-Token", "refresh_token", "x-api-key", "clientSecret", "bearer"):
+        assert out[k] == "***REDACTED***", k
+    assert out["details"][0]["webhookSignature"] == "***REDACTED***"
+    assert out["pegado"] == "***REDACTED***" and out["suelto"] == "***REDACTED***"
+    # Lo inocente queda
+    assert out["variantId"] == 117733 and out["quantity"] == 5
+    assert out["note"] == "recepcion normal" and out["details"][0]["cost"] == 9500
+
+
+def test_get_client_y_get_cache_tienen_lock():
+    import inspect
+
+    import bsale_client
+    import cache
+
+    for fn, lock in ((bsale_client.get_client, "_client_lock"), (cache.get_cache, "_cache_lock")):
+        src = _solo_codigo(inspect.getsource(fn))
+        assert f"with {lock}:" in src, f"{fn.__name__} sigue siendo check-then-act sin lock"
+
+
+def test_la_cache_persiste_de_forma_atomica(tmp_path, monkeypatch):
+    import cache as c
+
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path))
+    fc = c.FileCache()
+    fc.set("k", {"v": 1}, ttl_seconds=60)
+    assert (tmp_path / "cache.json").exists()
+    assert not list(tmp_path.glob("*.tmp")), "no puede quedar un .tmp huerfano"
+    import inspect
+    assert "os.replace(" in _solo_codigo(inspect.getsource(c.FileCache._persist))
+
+
+def test_las_transitivas_que_sostienen_el_candado_estan_pinneadas():
+    """fastmcp-slim[server] declara starlette>=1.0.1 sin techo, y server.py
+    importa starlette directamente para el unico middleware de auth."""
+    import os
+
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(aqui, "requirements.txt"), encoding="utf-8") as fh:
+        req = fh.read()
+    for pkg in ("starlette==", "mcp==", "sse-starlette==", "anyio==", "h11=="):
+        assert pkg in req, f"{pkg} tiene que estar pinneada"
+    assert "apscheduler" not in req.lower().split("# apscheduler")[0], "dependencia muerta"
+
+
+def test_los_docs_no_ensenan_a_dejar_el_servidor_abierto():
+    import os
+
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    for nombre in ("DEPLOY.md", "README.md"):
+        with open(os.path.join(aqui, nombre), encoding="utf-8") as fh:
+            txt = fh.read()
+        assert "no requiere auth" not in txt.lower(), nombre
+        assert "MCP_URL_SECRET" in txt, f"{nombre} tiene que explicar la credencial"

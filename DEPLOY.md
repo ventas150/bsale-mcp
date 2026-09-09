@@ -15,16 +15,21 @@ Esta guia asume:
 
 Render detecta automaticamente el `render.yaml` y configura el web service.
 
-## Paso 2 — Setear el `BSALE_ACCESS_TOKEN`
+## Paso 2 — Setear `BSALE_ACCESS_TOKEN` y `MCP_URL_SECRET`
 
-CRITICAL: El token NO esta en el repo (esta en .gitignore). Hay que setearlo en Render.
+CRITICAL: ninguno de los dos esta en el repo (`.gitignore`). Los dos son `sync: false`
+en `render.yaml`: el blueprint NO los provee, hay que escribirlos a mano.
 
 1. En la pantalla de Blueprint config, veras la lista de env vars
-2. La unica que dice `Required` es `BSALE_ACCESS_TOKEN` (sync: false en render.yaml)
-3. Pegar el token en el campo de input
+2. `BSALE_ACCESS_TOKEN`: el token de la API de Bsale
+3. `MCP_URL_SECRET`: un secreto largo y aleatorio (por ejemplo `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+   **Sin esta variable el servidor se niega a arrancar.** Da acceso de escritura al ERP de
+   produccion; hasta el 09-sep-2026 arrancaba abierto a internet si faltaba.
 4. Click **"Apply"** (abajo)
 
-Las demas env vars ya estan setadas por el render.yaml.
+Las demas env vars vienen del `render.yaml`. OJO: los tres candados de escritura
+(`BSALE_PRICE_WRITES_ENABLED`, `BSALE_STOCK_WRITES_ENABLED`, `BSALE_CATALOG_WRITES_ENABLED`)
+tienen que quedar en `"0"`; hay un test que lo verifica sobre el yaml.
 
 ## Paso 3 — Esperar el primer deploy
 
@@ -50,10 +55,11 @@ Deberia devolver:
 
 ## Paso 5 — Probar el MCP endpoint
 
-El endpoint MCP esta en `/mcp`. Para validar que esta corriendo:
+El endpoint MCP esta en `/mcp/<MCP_URL_SECRET>`. El secreto va en la RUTA porque el conector
+de Cowork no permite headers. `/mcp` a secas devuelve 401. Para validar que esta corriendo:
 
 ```bash
-curl -X POST https://bsale-mcp-myscrubs.onrender.com/mcp \
+curl -X POST https://bsale-mcp-myscrubs.onrender.com/mcp/<MCP_URL_SECRET> \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{
@@ -69,9 +75,11 @@ Deberia devolver la lista de los ~17 tools de Bsale.
 
 1. Cowork → Settings → MCPs → **Add Remote MCP**
 2. **Name:** `bsale-myscrubs`
-3. **URL:** `https://bsale-mcp-myscrubs.onrender.com/mcp`
+3. **URL:** `https://bsale-mcp-myscrubs.onrender.com/mcp/<MCP_URL_SECRET>` (el secreto en la ruta)
 4. **Transport:** `streamable-http`
-5. **Headers:** (vacio, no requiere auth — el server ya tiene el token interno)
+5. **Headers:** vacio. La credencial ya viaja en la URL; el conector no soporta headers.
+   Si da 401, el secreto de la URL no coincide con `MCP_URL_SECRET` en Render. NUNCA se
+   arregla borrando la variable: sin ella el servidor no arranca.
 6. Click **Save**
 
 Esperar 5-10 segundos. Si conecta correctamente, Cowork mostrara los 17 tools disponibles.

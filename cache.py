@@ -82,12 +82,25 @@ class FileCache:
             self._data = {}
 
     def _persist(self) -> None:
-        """Persiste a disco (best-effort, no falla si hay error de IO)."""
+        """Persiste a disco de forma ATOMICA (best-effort, no falla por IO).
+
+        open("w") truncaba antes de escribir: un reinicio de Render a mitad
+        (que es el modo de falla documentado del web service) dejaba un JSON
+        truncado que se descartaba en el siguiente arranque. Ahora se escribe
+        a un .tmp y se hace os.replace, que es atomico en el mismo filesystem:
+        o queda el archivo viejo entero o el nuevo entero.
+        """
+        tmp = self.cache_file.with_suffix(".json.tmp")
         try:
-            with self.cache_file.open("w", encoding="utf-8") as f:
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(self._data, f)
+            os.replace(tmp, self.cache_file)
         except OSError as e:
             logger.warning("No se pudo persistir cache: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def get(self, key: str) -> Any | None:
         """Devuelve valor si existe y no esta expirado, sino None."""
@@ -146,11 +159,19 @@ class FileCache:
 
 
 _cache: FileCache | None = None
+_cache_lock = threading.Lock()
 
 
 def get_cache() -> FileCache:
-    """Singleton del cache global."""
+    """Singleton del cache global (thread-safe, doble chequeo).
+
+    Sin lock, dos hilos en frio creaban dos FileCache, cada uno con SU
+    threading.Lock, escribiendo el MISMO cache.json: los locks no se veian
+    entre si y el archivo quedaba intercalado.
+    """
     global _cache
     if _cache is None:
-        _cache = FileCache()
+        with _cache_lock:
+            if _cache is None:
+                _cache = FileCache()
     return _cache

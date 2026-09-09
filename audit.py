@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -137,31 +138,53 @@ def _escribir_en_postgres(event: dict[str, Any]) -> bool:
         return False
 
 
-_SENSIBLES = {
-    "password", "token", "access_token", "secret", "api_key",
-    "authorization", "apikey", "clientsecret", "client_secret",
-    "mcp_auth_token", "mcp_url_secret",
-}
+# Subcadenas, NO nombres exactos. Bsale es camelCase ("accessToken",
+# "Access-Token") y la lista vieja de 11 nombres exactos no matcheaba ninguno
+# de esos: pasaban en claro a stdout -> logs de Render -> columna JSONB sin
+# retencion. Cualquier clave que CONTENGA una de estas se censura.
+_SENSIBLES = (
+    "password", "passwd", "token", "secret", "api_key", "apikey",
+    "authorization", "credential", "bearer", "signature", "private_key",
+    "privatekey", "cookie", "session_id", "sessionid",
+)
+
+# Un valor que parece un token aunque la clave no lo diga: 24+ caracteres de
+# [A-Za-z0-9_-] sin espacios (token_urlsafe, JWT sin puntos, api keys). Un
+# RUT, un SKU o una nota no calzan; una URL firmada o un token pegado, si.
+_PARECE_TOKEN = re.compile(r"^[A-Za-z0-9_\-]{24,}$")
+_TOKEN_EMBEBIDO = re.compile(r"(?i)(token|secret|key|password|bearer)[=: ]+[A-Za-z0-9_\-]{12,}")
+
+
+def _clave_sensible(k: Any) -> bool:
+    kl = str(k).lower().replace("-", "_")
+    return any(s in kl for s in _SENSIBLES)
+
+
+def _valor_sensible(v: str) -> bool:
+    return bool(_PARECE_TOKEN.match(v) or _TOKEN_EMBEBIDO.search(v))
 
 
 def _redact(data: Any, _prof: int = 0) -> Any:
-    """Censura campos sensibles, TAMBIEN dentro de estructuras anidadas.
+    """Censura campos sensibles, TAMBIEN dentro de estructuras anidadas, y
+    tambien VALORES que parecen un token aunque la clave sea inocente.
 
     Antes solo recorria el primer nivel, y los bodies de escritura son
     anidados ({"details": [...]}). El audit va tambien a stdout y de ahi a los
     logs de Render y a Sentry, asi que cualquier campo sensible enterrado
-    quedaba en claro.
+    quedaba en claro. Y solo miraba claves por nombre exacto: "accessToken"
+    pasaba, y un token dentro de una `note` tambien.
     """
     if _prof > 8:
         return "***PROFUNDIDAD_MAXIMA***"
     if isinstance(data, dict):
         return {
-            k: ("***REDACTED***" if str(k).lower() in _SENSIBLES
-                else _redact(v, _prof + 1))
+            k: ("***REDACTED***" if _clave_sensible(k) else _redact(v, _prof + 1))
             for k, v in data.items()
         }
     if isinstance(data, (list, tuple)):
         return [_redact(v, _prof + 1) for v in data]
+    if isinstance(data, str) and _valor_sensible(data):
+        return "***REDACTED***"
     return data
 
 

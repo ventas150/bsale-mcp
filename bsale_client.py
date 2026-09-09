@@ -592,11 +592,21 @@ def _summarize_result(result: Any) -> dict[str, Any]:
 
 # Singleton global
 _client: BsaleClient | None = None
+_client_lock = threading.Lock()
 
 
 def get_client() -> BsaleClient:
-    """Devuelve la instancia global del cliente (lazy init)."""
+    """Devuelve la instancia global del cliente (lazy init, thread-safe).
+
+    Doble chequeo con lock, mismo patron que db.get_engine(). Era check-then-
+    act sin lock: FastMCP corre los tools sincronos en un threadpool y en frio
+    tras cada redeploy llegan varias llamadas a la vez, que creaban dos
+    httpx.Client con sus propios pools (uno huerfano, nunca cerrado) y
+    repartian los contadores de health_status entre las dos instancias.
+    """
     global _client
     if _client is None:
-        _client = BsaleClient()
+        with _client_lock:
+            if _client is None:
+                _client = BsaleClient()
     return _client
