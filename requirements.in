@@ -1,9 +1,10 @@
 # ENTRADA del lockfile, no lo que instala Render.
 # Render instala requirements.txt, que es el resultado COMPILADO de este
-# archivo para linux / Python 3.14 (lo que corre en Render) con hashes.
+# archivo en modo universal (web service en Python 3.11, cron en 3.14.3,
+# venv del PC en Windows) con hashes.
 # Para cambiar una version: editar ACA y recompilar desde el PC:
-#   .venv\Scripts\uv pip compile requirements.in --python-platform linux \
-#       --python-version 3.14 --generate-hashes -o requirements.txt
+#   .venv\Scripts\uv pip compile requirements.in --universal \
+#       --python-version 3.11 --generate-hashes -o requirements.txt
 # (uv esta instalado en el venv del PC; PyPI esta bloqueado desde Cowork).
 # En el PC (Windows) el venv se instala desde ESTE archivo, no del lock.
 #

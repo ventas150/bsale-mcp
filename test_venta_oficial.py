@@ -3603,6 +3603,16 @@ def test_requirements_txt_es_el_lock_de_requirements_in():
     assert len(bloqueados) > 60, "el lock tiene que traer las transitivas, no solo los directos"
     assert lock.count("--hash=sha256:") >= len(bloqueados), "cada paquete con hash: pip en modo hash-checking"
     assert "# via" in lock, "no parece un archivo compilado"
+    # Universal: lo de Windows va detras de un marcador, nunca a secas. Un lock
+    # compilado desde el venv de Windows sin --universal lo traeria sin marcador.
+    import re
+
     for solo_windows in ("pywin32", "colorama", "pywin32-ctypes"):
-        assert f"\n{solo_windows}==" not in lock, f"{solo_windows}: el lock se compilo para Windows, no para linux"
+        for m in re.finditer(rf"^{re.escape(solo_windows)}==[^\n]*", lock, re.M):
+            assert "sys_platform == 'win32'" in m.group(0), f"{solo_windows} sin marcador: lock de Windows"
+    # y lo que solo necesita 3.11 tiene que estar, porque el web service de
+    # Render corre 3.11 (el cron, 3.14): un lock solo-3.14 rompio el build.
+    assert re.search(r"^backports-tarfile==[^\n]*python_full_version < '3\.12'", lock, re.M), (
+        "falta backports-tarfile con marcador: el lock no es universal y el web service (3.11) no compila"
+    )
     assert "apscheduler" not in lock.lower(), "dependencia muerta"
