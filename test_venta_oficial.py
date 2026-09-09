@@ -1162,6 +1162,7 @@ def test_un_fallo_de_retencion_se_ve(monkeypatch):
 
     monkeypatch.setattr(rt, "purge_stock_snapshots", revienta)
     monkeypatch.setattr(rt, "purge_variants_snapshots", lambda: 0)
+    monkeypatch.setattr(rt, "purge_documents_raw", lambda **kw: {"minimizadas": 0})
     out = rt.apply_retention()
     assert out["hubo_error"] is True and "stock_error" in out
 
@@ -3198,3 +3199,203 @@ def test_sobrestockeos_rechaza_top_check_mayor_a_200(monkeypatch):
     tools = _tools_db_con(monkeypatch, [], {})
     r = tools["bsale_sobrestockeos_detectados"](top_check=201)
     assert r["aplicado"] is False and "200" in r["motivo"]
+
+
+# ===========================================================================
+# Retencion de documents_snapshot.raw (09-sep-2026, Ley 21.719)
+# ===========================================================================
+# raw guardaba la ficha completa del cliente de cada documento (nombre, RUT,
+# correo, telefono, direccion) sin politica. Pasados RAW_RETENTION_MONTHS
+# meses se minimiza a los campos de negocio; la fila y las columnas tipadas
+# quedan, asi que la venta oficial no cambia.
+
+_PII_EN_RAW = (
+    "firstName", "lastName", "email", "phone", "code", "company", "address",
+    "municipality", "city", "activity", "ted", "token", "urlPdf",
+    "urlPublicView", "urlPublicViewOriginal", "urlPdfOriginal", "urlXml",
+    "urlTimbre", "note", "responseMsgSii", "messageBodyFormat", "facebook",
+    "twitter",
+)
+
+
+def test_el_raw_minimizado_no_conserva_datos_del_cliente():
+    import retention as rt
+
+    sql = rt._sql_raw_minimo()
+    for k in _PII_EN_RAW:
+        assert f"'{k}'" not in sql, f"{k} sobrevive en el raw minimizado"
+    assert sql.startswith("jsonb_strip_nulls(jsonb_build_object(")
+    # del cliente queda solo el id (ya tipado) y dos flags que no identifican
+    assert "'client', jsonb_build_object('id', raw->'client'->'id'" in sql
+    for k in ("totalAmount", "netAmount", "emissionDate", "number", "state"):
+        assert f"'{k}', raw->'{k}'" in sql
+    assert f"'{rt.RAW_MARCA}', jsonb_build_object('minimizado', :ts, 'meses', :meses)" in sql
+    # el SQL sale de las tuplas: la lista que se audita es la que se aplica
+    for k in rt.RAW_CAMPOS_QUE_QUEDAN:
+        assert f"'{k}', raw->'{k}'" in sql
+    for padre, hijos in rt.RAW_SUBCAMPOS_QUE_QUEDAN.items():
+        for h in hijos:
+            assert f"'{h}', raw->'{padre}'->'{h}'" in sql
+    todos = set(rt.RAW_CAMPOS_QUE_QUEDAN) | {
+        h for hs in rt.RAW_SUBCAMPOS_QUE_QUEDAN.values() for h in hs
+    }
+    assert not (todos & set(_PII_EN_RAW))
+
+
+def test_el_corte_de_raw_es_al_dia_1_de_hace_n_meses():
+    """Al dia 1 para calzar con hist_end(), que relee cada mes cerrado una vez."""
+    from datetime import date
+
+    import retention as rt
+
+    assert rt.raw_corte(date(2026, 9, 9), 6) == date(2026, 3, 1)
+    assert rt.raw_corte(date(2026, 3, 15), 6) == date(2025, 9, 1)
+    assert rt.raw_corte(date(2026, 1, 1), 12) == date(2025, 1, 1)
+    assert rt.raw_corte(date(2026, 2, 28), 1) == date(2026, 1, 1)
+    assert rt.raw_corte(date(2026, 9, 9), 0) is None, "0 meses = apagado"
+    assert rt.raw_corte(date(2026, 9, 9)) == rt.raw_corte(date(2026, 9, 9), rt.RAW_RETENTION_MONTHS)
+
+
+def test_el_predicado_de_raw_y_su_indice_parcial_son_la_misma_expresion():
+    """Si difieren, el planner no usa el indice y cada corrida del cron vuelve
+    a recorrer 160k filas de JSONB para no encontrar nada."""
+    import retention as rt
+
+    marca = f"NOT (raw ? '{rt.RAW_MARCA}')"
+    assert marca in rt.RAW_PREDICADO and marca in rt.RAW_INDICE_SQL
+    assert "emission_date < :corte" in rt.RAW_PREDICADO
+    assert rt.RAW_INDICE_SQL.startswith("CREATE INDEX IF NOT EXISTS")
+
+
+def test_la_minimizacion_de_raw_es_un_update_no_un_delete():
+    import inspect
+
+    import retention as rt
+
+    src = _solo_codigo(inspect.getsource(rt._minimizar_raw_por_lotes))
+    assert "UPDATE documents_snapshot" in src and "SET raw =" in src
+    assert "DELETE" not in src
+    todo = _solo_codigo(inspect.getsource(rt))
+    assert "DELETE FROM documents_snapshot" not in todo
+    assert "DELETE FROM document_details_snapshot" not in todo
+
+
+class _SesionRaw:
+    """Sesion falsa: registra cada transaccion y responde por tipo de sentencia."""
+
+    abiertas: list = []
+
+    def __init__(self, rowcounts, count=None):
+        self._rowcounts = rowcounts
+        self._count = count
+        self.ejecutados = []
+
+    def __enter__(self):
+        _SesionRaw.abiertas.append(self)
+        if len(_SesionRaw.abiertas) > 50:
+            raise AssertionError("bucle sin salida: mas de 50 transacciones")
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        s = str(stmt)
+        self.ejecutados.append((s, params))
+        if "count(*)" in s:
+            return type("R", (), {"scalar_one": lambda self_: self._count})()
+        if s.startswith("UPDATE") or "UPDATE documents_snapshot" in s:
+            n = self._rowcounts.pop(0) if self._rowcounts else 0
+            return type("R", (), {"rowcount": n})()
+        return type("R", (), {"rowcount": 0})()
+
+
+def test_la_minimizacion_de_raw_commitea_por_lote(monkeypatch):
+    from datetime import date
+
+    import retention as rt
+
+    _SesionRaw.abiertas = []
+    filas = [5000, 5000, 7]  # dos lotes llenos y uno corto
+    monkeypatch.setattr(rt, "db_session", lambda: _SesionRaw(filas))
+
+    minimizadas, pendientes = rt._minimizar_raw_por_lotes(date(2026, 3, 1), 5000)
+
+    assert (minimizadas, pendientes) == (10007, False)
+    assert len(_SesionRaw.abiertas) == 3, "una sesion (= una transaccion) por lote"
+    for s in _SesionRaw.abiertas:
+        assert any("statement_timeout" in e[0] for e in s.ejecutados)
+        upd = [e for e in s.ejecutados if "UPDATE documents_snapshot" in e[0]]
+        assert len(upd) == 1
+        sql, params = upd[0]
+        assert rt.RAW_PREDICADO in sql and "LIMIT :batch" in sql
+        assert params["corte"] == date(2026, 3, 1) and params["batch"] == 5000
+        assert params["meses"] == rt.RAW_RETENTION_MONTHS
+
+
+def test_la_minimizacion_de_raw_respeta_max_lotes(monkeypatch):
+    from datetime import date
+
+    import retention as rt
+
+    _SesionRaw.abiertas = []
+    monkeypatch.setattr(rt, "db_session", lambda: _SesionRaw([5000] * 40))
+    minimizadas, pendientes = rt._minimizar_raw_por_lotes(date(2026, 3, 1), 5000, max_lotes=2)
+    assert (minimizadas, pendientes) == (10000, True)
+    assert len(_SesionRaw.abiertas) == 2
+
+
+def test_purge_documents_raw_apagado_no_toca_la_base(monkeypatch):
+    import retention as rt
+
+    def no_deberia(*a, **k):
+        raise AssertionError("con RAW_RETENTION_MONTHS=0 no se abre ninguna sesion")
+
+    monkeypatch.setattr(rt, "RAW_RETENTION_MONTHS", 0)
+    monkeypatch.setattr(rt, "db_session", no_deberia)
+    out = rt.purge_documents_raw()
+    assert out["aplicado"] is False and "apagada" in out["motivo"]
+
+
+def test_purge_documents_raw_crea_el_indice_cuenta_y_minimiza(monkeypatch):
+    import retention as rt
+
+    monkeypatch.setattr(rt, "RAW_RETENTION_MONTHS", 6)
+
+    # Sin pendientes: crea el indice, cuenta, y NO ejecuta ningun UPDATE.
+    _SesionRaw.abiertas = []
+    monkeypatch.setattr(rt, "db_session", lambda: _SesionRaw([], count=0))
+    out = rt.purge_documents_raw()
+    assert out["pendientes_antes"] == 0 and out["minimizadas"] == 0
+    assert out["quedan_pendientes"] is False and out["meses"] == 6
+    assert "corte_emission_date" in out
+    todo = [e[0] for s in _SesionRaw.abiertas for e in s.ejecutados]
+    assert any("CREATE INDEX IF NOT EXISTS ix_documents_raw_pendiente" in e for e in todo)
+    assert not any("UPDATE documents_snapshot" in e for e in todo)
+
+    # Con pendientes: minimiza y declara cuantas quedan.
+    _SesionRaw.abiertas = []
+    monkeypatch.setattr(rt, "db_session", lambda: _SesionRaw([5000, 5000], count=12345))
+    out = rt.purge_documents_raw(max_lotes=2)
+    assert out["minimizadas"] == 10000 and out["quedan_pendientes"] is True
+    assert out["pendientes_despues"] == 2345
+
+
+def test_apply_retention_incluye_raw_y_su_fallo_marca_la_corrida(monkeypatch):
+    import retention as rt
+
+    monkeypatch.setattr(rt, "purge_stock_snapshots", lambda **kw: {"borradas_total": 0})
+    monkeypatch.setattr(rt, "purge_variants_snapshots", lambda: 0)
+
+    def revienta(**kw):
+        raise RuntimeError("timeout simulado")
+
+    monkeypatch.setattr(rt, "purge_documents_raw", revienta)
+    out = rt.apply_retention(max_lotes=3)
+    assert out["hubo_error"] is True and "documents_raw_error" in out
+
+    visto = {}
+    monkeypatch.setattr(rt, "purge_documents_raw", lambda **kw: visto.update(kw) or {"minimizadas": 1})
+    out = rt.apply_retention(max_lotes=3)
+    assert out["hubo_error"] is False and out["documents_raw"] == {"minimizadas": 1}
+    assert visto == {"max_lotes": 3}, "el tope de lotes del cron llega hasta raw"

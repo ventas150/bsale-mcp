@@ -39,8 +39,13 @@ Reglas:
   stock_actual). Se VACIA por lotes hasta que quede en cero y despues es un
   no-op. No hay politica de horas ni de dias: la tabla entera sobra.
 - variants_snapshot: las ultimas VARIANTS_KEEP_SNAPSHOTS fotos (default 2).
-- documents_snapshot / document_details_snapshot: NO se tocan. Ahi vive el
-  historico de ventas que alimenta los comparativos.
+- documents_snapshot.raw: se MINIMIZA pasados RAW_RETENTION_MONTHS meses
+  (default 6). La fila se queda (ahi vive el historico de ventas que alimenta
+  los comparativos, y usa las columnas tipadas), pero el JSON crudo se reduce
+  a los campos de negocio: fuera nombre, RUT, correo, telefono, direccion,
+  el TED (que trae el RUT del receptor), el token y las URLs publicas del
+  documento. Ver purge_documents_raw. Ley 21.719, vigente desde dic-2026.
+- document_details_snapshot: NO se toca (no tiene datos de personas).
 
 Transaccionalidad (09-sep-2026): UNA transaccion POR LOTE. La version anterior
 abria la sesion afuera y pasaba la misma sesion a todos los lotes: ~153
@@ -54,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -69,6 +75,38 @@ RETENTION_TIMEOUT_MS = int(os.getenv("RETENTION_STATEMENT_TIMEOUT_MS", "600000")
 # Filas por lote. Acotado para que un lote entre holgado en el timeout y para
 # no tomar un lock largo sobre la tabla.
 RETENTION_BATCH = int(os.getenv("RETENTION_BATCH_ROWS", "50000"))
+
+# Meses que documents_snapshot.raw conserva los datos del cliente. 0 = apagado
+# (no minimiza nada; sirve de kill-switch, no de politica).
+RAW_RETENTION_MONTHS = int(os.getenv("RAW_RETENTION_MONTHS", "6"))
+# Filas por lote del UPDATE de raw. Es un UPDATE de JSONB (reescribe la fila
+# entera, ~10 KB cada una por el messageBodyFormat que Bsale mete en cada
+# document_type), no un DELETE por ctid: lote chico.
+RAW_RETENTION_BATCH = int(os.getenv("RAW_RETENTION_BATCH_ROWS", "5000"))
+
+# Lo UNICO que sobrevive en raw pasado el plazo. Todo lo que no este aca se
+# borra: nombre, RUT (client.code y el RR del TED), correo, telefono,
+# direccion/comuna/ciudad (del cliente y del documento), token y URLs
+# publicas, giro. Si un tool nuevo necesita algo mas de raw para documentos
+# viejos, se agrega aca A PROPOSITO y con el test de PII mirando.
+RAW_CAMPOS_QUE_QUEDAN: tuple[str, ...] = (
+    "id", "number", "emissionDate", "generationDate", "expirationDate",
+    "totalAmount", "netAmount", "taxAmount", "exemptAmount",
+    "state", "commercialState", "cancellationStatus", "cancellationDate",
+    "informedSii", "salesId",
+)
+RAW_SUBCAMPOS_QUE_QUEDAN: dict[str, tuple[str, ...]] = {
+    "document_type": ("id", "name", "use", "isSalesNote", "codeSii", "isCreditNote"),
+    "office": ("id", "name"),
+    # client.id ya esta tipado; companyOrPerson e isForeigner no identifican.
+    "client": ("id", "companyOrPerson", "isForeigner"),
+    "priceList": ("id",),
+    "user": ("id",),
+    "coin": ("id",),
+}
+# Marca que deja la minimizacion dentro de raw. El predicado de seleccion la
+# usa para no volver a pasar por la misma fila.
+RAW_MARCA = "_retencion"
 
 
 def _sin_timeout_corto(s) -> None:
@@ -181,6 +219,144 @@ def purge_variants_snapshots() -> int:
         return res.rowcount or 0
 
 
+# ============================
+# documents_snapshot.raw
+# ============================
+
+def _restar_meses(d: date, meses: int) -> date:
+    """d menos N meses calendario, al dia 1 del mes resultante.
+
+    Al dia 1 a proposito: el corte es "todo lo emitido antes del mes M", que
+    es facil de explicar y de auditar, y calza con el hist_end() del cron que
+    relee cada mes cerrado UNA vez, el 1 del siguiente. Un corte a mitad de
+    mes minimizaria filas que esa relectura vuelve a hidratar.
+    """
+    y, m = d.year, d.month - meses
+    while m <= 0:
+        m += 12
+        y -= 1
+    return date(y, m, 1)
+
+
+def raw_corte(hoy: date | None = None, meses: int | None = None) -> date | None:
+    """Fecha de emision desde la cual raw se conserva completo. None = apagado."""
+    meses = RAW_RETENTION_MONTHS if meses is None else meses
+    if meses <= 0:
+        return None
+    hoy = hoy or datetime.now(timezone.utc).date()
+    return _restar_meses(hoy, meses)
+
+
+def _sql_raw_minimo() -> str:
+    """Expresion jsonb con SOLO los campos de RAW_CAMPOS_QUE_QUEDAN.
+
+    Se construye desde las tuplas, no a mano: asi el test que prohibe PII mira
+    la misma lista que produce el SQL. jsonb_strip_nulls saca las claves que el
+    documento no traia (un cliente ausente queda como {} y no como nulls).
+    """
+    partes = [f"'{k}', raw->'{k}'" for k in RAW_CAMPOS_QUE_QUEDAN]
+    for padre, hijos in RAW_SUBCAMPOS_QUE_QUEDAN.items():
+        sub = ", ".join(f"'{h}', raw->'{padre}'->'{h}'" for h in hijos)
+        partes.append(f"'{padre}', jsonb_build_object({sub})")
+    partes.append(
+        f"'{RAW_MARCA}', jsonb_build_object('minimizado', :ts, 'meses', :meses)"
+    )
+    return "jsonb_strip_nulls(jsonb_build_object(" + ", ".join(partes) + "))"
+
+
+# Predicado de "todavia tiene el raw completo y ya vencio". Va en el UPDATE y
+# en el indice parcial: tiene que ser la MISMA expresion para que el planner
+# use el indice. El indice se vacia solo a medida que las filas se minimizan,
+# asi que la vuelta del cron sobre una tabla ya procesada cuesta cero.
+RAW_PREDICADO = f"emission_date < :corte AND NOT (raw ? '{RAW_MARCA}')"
+RAW_INDICE_SQL = (
+    "CREATE INDEX IF NOT EXISTS ix_documents_raw_pendiente "
+    "ON documents_snapshot (emission_date) "
+    f"WHERE NOT (raw ? '{RAW_MARCA}')"
+)
+
+
+def _minimizar_raw_por_lotes(
+    corte: date, batch: int, max_lotes: int | None = None
+) -> tuple[int, bool]:
+    """UPDATE por lotes, UNA TRANSACCION POR LOTE (igual que _borrar_por_lotes).
+    Devuelve (minimizadas, quedan_pendientes)."""
+    sql = text(
+        f"""
+        UPDATE documents_snapshot
+        SET raw = {_sql_raw_minimo()}
+        WHERE document_id IN (
+            SELECT document_id FROM documents_snapshot
+            WHERE {RAW_PREDICADO}
+            LIMIT :batch
+        )
+        """
+    )
+    ts = datetime.now(timezone.utc).isoformat()
+    params = {"corte": corte, "batch": batch, "ts": ts, "meses": RAW_RETENTION_MONTHS}
+    minimizadas = 0
+    lotes = 0
+    while True:
+        with db_session() as s:
+            _sin_timeout_corto(s)
+            res = s.execute(sql, params)
+            n = res.rowcount or 0
+        minimizadas += n
+        lotes += 1
+        if n < batch:
+            return minimizadas, False
+        if max_lotes is not None and lotes >= max_lotes:
+            return minimizadas, True
+
+
+def purge_documents_raw(max_lotes: int | None = None) -> dict[str, Any]:
+    """Minimiza documents_snapshot.raw para lo emitido antes del corte.
+
+    NO borra filas: la venta oficial, los comparativos y la conciliacion leen
+    las columnas tipadas (emission_date, office_id, document_type_*, montos,
+    state) y siguen iguales. Lo que se va es el JSON crudo con la ficha del
+    cliente que Bsale expande en cada documento (nombre, RUT, correo,
+    telefono, direccion), el TED (trae el RUT del receptor), el token y las
+    URLs publicas del PDF. Queda lo que esta en RAW_CAMPOS_QUE_QUEDAN.
+
+    Idempotente y re-aplicable: la marca `_retencion` dentro de raw evita
+    repasar filas. Si un backfill manual (bsale_snapshot_backfill_rango,
+    backfill.py) vuelve a hidratar el raw de un rango viejo, la siguiente
+    corrida del cron lo minimiza de nuevo: la politica se sostiene sola.
+
+    Efecto conocido: bsale_segmentacion_clientes_rfm_fast saca nombre y
+    empresa de raw->client; para clientes cuya ultima compra es anterior al
+    corte vienen en null. El client_id sigue, y la ficha se resuelve en vivo
+    con bsale_obtener_cliente cuando haga falta contactar a alguien.
+    """
+    out: dict[str, Any] = {"tabla": "documents_snapshot.raw", "meses": RAW_RETENTION_MONTHS}
+    corte = raw_corte()
+    if corte is None:
+        out["aplicado"] = False
+        out["motivo"] = "RAW_RETENTION_MONTHS=0: minimizacion apagada"
+        return out
+    out["corte_emission_date"] = corte.isoformat()
+
+    with db_session() as s:
+        _sin_timeout_corto(s)
+        s.execute(text(RAW_INDICE_SQL))
+        out["pendientes_antes"] = s.execute(
+            text(f"SELECT count(*) FROM documents_snapshot WHERE {RAW_PREDICADO}"),
+            {"corte": corte},
+        ).scalar_one()
+
+    if out["pendientes_antes"] == 0:
+        out["minimizadas"] = 0
+        out["quedan_pendientes"] = False
+        return out
+
+    minimizadas, pendientes = _minimizar_raw_por_lotes(corte, RAW_RETENTION_BATCH, max_lotes)
+    out["minimizadas"] = minimizadas
+    out["quedan_pendientes"] = pendientes
+    out["pendientes_despues"] = out["pendientes_antes"] - minimizadas
+    return out
+
+
 def apply_retention(max_lotes: int | None = None) -> dict[str, Any]:
     """Aplica toda la politica. Nunca lanza, pero SI declara si algo fallo.
 
@@ -202,6 +378,11 @@ def apply_retention(max_lotes: int | None = None) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.error("Error en purge_variants_snapshots: %s", e)
         out["variants_error"] = str(e)[:300]
+    try:
+        out["documents_raw"] = purge_documents_raw(max_lotes=max_lotes)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error en purge_documents_raw: %s", e)
+        out["documents_raw_error"] = str(e)[:300]
 
     out["hubo_error"] = any(k.endswith("_error") for k in out)
     logger.info("Retencion aplicada: %s", out)
