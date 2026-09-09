@@ -320,33 +320,47 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
     @mcp.tool()
-    def bsale_mcp_retencion_run(max_lotes: int = 20) -> dict[str, Any]:
-        """Aplica la politica de retencion a stock_snapshot. WRITE OP (DB local).
+    def bsale_mcp_retencion_run(max_lotes: int = 4) -> dict[str, Any]:
+        """VACIA stock_snapshot, la tabla LEGADA de stock. WRITE OP (DB local).
 
-        BORRA FILAS Y NO SE PUEDE DESHACER. Borra fotos de stock viejas segun
-        STOCK_DAILY_RETENTION_DAYS (7 por defecto). No toca documentos ni
-        detalle de linea: ahi vive el historico de ventas.
+        BORRA FILAS Y NO SE PUEDE DESHACER. No conserva 7 dias ni ninguna
+        ventana: borra la tabla ENTERA por lotes, porque desde el 08-sep-2026
+        el stock vive en stock_actual y nadie lee stock_snapshot. No toca
+        documentos ni detalle de linea: ahi vive el historico de ventas.
 
-        Por que existe: la retencion venia fallando en silencio desde hace
-        meses y stock_snapshot llego a 7,5 millones de filas creciendo 80.000
-        por noche. Eso es lo que hace que bsale_snapshot_status tarde 20
-        segundos en responder 4 numeros.
+        Se REHUSA si stock_actual esta vacia: bsale_mcp_stock_actual_sembrar
+        lee de stock_snapshot para sembrarla, y correr esto antes deja el
+        conector sin stock hasta la proxima corrida completa.
+
+        Corre en el web service, el mismo proceso que responde /health, asi
+        que el default es chico (4 lotes = 200.000 filas, unos segundos). Cada
+        lote commitea solo: si se corta, lo borrado queda borrado.
 
         Args:
-            max_lotes: Lotes de 50.000 filas por llamada (default 20 = 1
-                millon). Existe por el timeout de 180 s del cliente MCP: si
-                queda trabajo, la respuesta trae quedan_pendientes=True y se
-                vuelve a llamar.
+            max_lotes: Lotes de 50.000 filas por llamada. Tope 20. Si queda
+                trabajo, la respuesta trae quedan_pendientes=True y se vuelve
+                a llamar. El cron tambien avanza solo, 20 lotes por corrida.
         """
         from retention import purge_stock_snapshots
 
-        if max_lotes > 40:
+        if max_lotes > 20:
             return {
                 "aplicado": False,
                 "motivo": (
-                    f"max_lotes={max_lotes}. El tope es 40 (2 millones de "
-                    "filas) por el timeout de 180 s del cliente MCP. Llamar "
-                    "varias veces hasta quedan_pendientes=False."
+                    f"max_lotes={max_lotes}. El tope es 20 (1 millon de filas): "
+                    "esto corre en el proceso que sirve /health. Llamar varias "
+                    "veces hasta quedan_pendientes=False, o dejar que el cron "
+                    "lo termine solo."
+                ),
+            }
+        with db_session() as s:
+            hay_actual = s.execute(text("SELECT count(*) FROM stock_actual")).scalar_one()
+        if not hay_actual:
+            return {
+                "aplicado": False,
+                "motivo": (
+                    "stock_actual esta VACIA. Vaciar stock_snapshot ahora dejaria el "
+                    "conector sin stock: primero bsale_mcp_stock_actual_sembrar."
                 ),
             }
         stock = purge_stock_snapshots(max_lotes=max_lotes)
@@ -354,7 +368,23 @@ def register(mcp) -> None:  # noqa: ANN001
 
     @mcp.tool()
     def bsale_snapshot_status() -> dict[str, Any]:
-        """Devuelve cuando fue el ultimo snapshot exitoso de cada tabla."""
+        """Frescura y completitud de cada tabla del snapshot.
+
+        OJO con `stock`: `last_snapshot` es max(updated_at), que una corrida
+        CORTADA A MITAD tambien actualiza. Por eso viene ademas
+        `ultima_corrida`, leida de sync_estado, que es lo que dice si esa
+        corrida termino de leer todo Bsale (`completo`), si sigue en vuelo
+        (`en_curso`) o con que error se cayo. "Fresco" no es "completo".
+        """
+        ultima_corrida_stock = None
+        try:
+            with db_session() as s:
+                ultima_corrida_stock = s.execute(text(
+                    "select valor from sync_estado where clave = 'stock_ultima_corrida'"
+                )).scalar()
+        except Exception as e:  # noqa: BLE001
+            ultima_corrida_stock = {"error_al_leer": str(e)[:200]}
+
         with db_session() as s:
             doc_max = s.execute(select(func.max(documents_snapshot.c.snapshot_date))).scalar()
             stock_max = s.execute(select(func.max(stock_actual.c.updated_at))).scalar()
@@ -388,6 +418,11 @@ def register(mcp) -> None:  # noqa: ANN001
             "stock": {
                 "last_snapshot": stock_max.isoformat() if stock_max else None,
                 "total_rows": stock_count,
+                "ultima_corrida": ultima_corrida_stock,
+                "nota": (
+                    "last_snapshot es max(updated_at) y lo actualiza tambien una "
+                    "corrida cortada. Mirar ultima_corrida.completo."
+                ),
             },
             "variants": {
                 "last_snapshot": var_max.isoformat() if var_max else None,

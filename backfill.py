@@ -188,9 +188,18 @@ def backfill_details(batch_size: int = 300, pausa_s: float = 0.3) -> dict[str, A
             vueltas, res.get("docs_processed", 0), res.get("lines_inserted", 0),
             res.get("errors", 0), res.get("remaining_to_process", 0),
         )
-        # Si no procesó nada en esta vuelta, terminamos.
-        if res.get("docs_processed", 0) == 0:
+        # Cortar por el numero REAL de pendientes, no por la tanda. Antes
+        # `docs_processed == 0` terminaba el loop: una tanda entera fallida
+        # (racha de 429 de Bsale) daba un backfill "exitoso" que no cargo
+        # nada, con 51.000 documentos sin detalle.
+        if res.get("remaining_to_process", 0) == 0:
             break
+        if res.get("docs_processed", 0) == 0:
+            raise RuntimeError(
+                f"Vuelta {vueltas} completa fallida: {res.get('errors', 0)} errores, "
+                f"0 procesados, quedan {res.get('remaining_to_process')}. "
+                "Bsale esta frenando o hay un documento que revienta siempre."
+            )
         time.sleep(pausa_s)
 
     return {

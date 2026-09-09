@@ -370,6 +370,20 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
     _acumular(primera)
     total_bsale = int(primera.get("count") or 0)
 
+    # Estado AL ENTRAR, no solo al salir. Si el proceso muere a mitad (deploy
+    # sobre el cron, OOM), la escritura del final nunca ocurre y queda el
+    # `completo: true` de la corrida ANTERIOR. La siguiente ve foto fresca
+    # (updated_at de hace minutos, porque _flush commitea por lote) y estado
+    # completo, y no repite: medio inventario servido 12 horas. Con esto una
+    # corrida muerta deja `completo: false, en_curso: true`.
+    _registrar_estado("stock_ultima_corrida", {
+        "completo": False,
+        "en_curso": True,
+        "snapshot_ts": snapshot_ts.isoformat(),
+        "count_bsale": total_bsale,
+        "error": None,
+    })
+
     paginas_previstas = max(1, -(-total_bsale // PAGE)) if total_bsale else 1
     tope = min(paginas_previstas, max_pages)
     truncado = paginas_previstas > max_pages
@@ -463,6 +477,7 @@ def snapshot_stock(max_pages: int = 500) -> dict[str, Any]:
     # Lo lee sync_incremental para decidir si tiene que repetir la corrida.
     _registrar_estado("stock_ultima_corrida", {
         "completo": bool(completo),
+        "en_curso": False,
         "snapshot_ts": snapshot_ts.isoformat(),
         "filas": total_persisted,
         "filas_vistas": filas_vistas,
@@ -681,8 +696,34 @@ def snapshot_details(
     _DETALLE_WORKERS = int(os.getenv("BSALE_DETAIL_WORKERS", "4"))
     n_workers = max(1, min(_DETALLE_WORKERS, 10))
 
+    def _centinela(cand, line_id: int) -> dict[str, Any]:
+        """Fila marcadora para que el documento cuente como PROCESADO.
+
+        line_id -1: el documento no tiene lineas. line_id -2: tiene mas de
+        2.000 y no se cargo. Con variant_id NULL y quantity 0 no suma a ningun
+        agregado (todos filtran variant_id IS NOT NULL o suman cantidades), y
+        SI cuenta en la cobertura de detalle, que es lo correcto: el documento
+        fue leido.
+        """
+        return {
+            "document_id": cand.document_id,
+            "line_id": line_id,
+            "variant_id": None,
+            "variant_code": None,
+            "variant_description": "(sin lineas)" if line_id == -1 else "(mas de 2000 lineas, no cargado)",
+            "office_id": cand.office_id,
+            "emission_date": cand.emission_date,
+            "document_type_use": cand.document_type_use or 0,
+            "quantity": 0.0,
+            "net_amount": 0.0,
+            "total_amount": 0.0,
+            "fetched_at": datetime.now(timezone.utc),
+        }
+
     def _bajar(cand):
-        """Devuelve (doc_id, filas, hubo_error). No toca la base: solo red."""
+        """Devuelve (doc_id, filas, hubo_error). No toca la base: solo red.
+        hubo_error puede ser True, False, o "truncado" (se inserta el
+        centinela pero se cuenta aparte)."""
         doc_id = cand.document_id
         try:
             # Paginado: un GET suelto traia solo 50 lineas y, como el documento
@@ -703,11 +744,25 @@ def snapshot_details(
                 workers=1,
             )
             if fetch["truncated"]:
-                # no insertar parcial: se reintenta en la proxima corrida
-                return doc_id, [], True
+                # No insertar parcial. Pero tampoco dejarlo como candidato
+                # eterno: un documento de mas de 2.000 lineas volveria a la
+                # cabeza de la cola en cada corrida (oldest_first) y atascaria
+                # el backfill para siempre. Se marca con un centinela y se
+                # declara en el resultado; el detalle de ese documento queda
+                # pendiente de un tratamiento aparte.
+                return doc_id, [_centinela(cand, -2)], "truncado"
             items = fetch["items"] or []
         except Exception:  # noqa: BLE001
             return doc_id, [], True
+
+        if not items:
+            # Documento sin lineas insertables (pasa: anulados sin detalle,
+            # documentos de servicio). Antes devolvia [] y, como "procesado"
+            # se definia por tener filas en document_details_snapshot, volvia
+            # a ser candidato en la corrida siguiente. Con oldest_first, 2.000
+            # de estos en la cabeza de la cola = el cursor nunca avanza y el
+            # backfill se ve "trabajando" sin cerrar nunca.
+            return doc_id, [_centinela(cand, -1)], False
 
         filas = []
         for line in items:
@@ -751,12 +806,18 @@ def snapshot_details(
             rows_inserted += len(trozo)
         filas_dict.clear()
 
+    docs_sin_lineas = 0
+    docs_truncados = 0
     if todo:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             for _doc_id, filas, hubo_error in pool.map(_bajar, todo):
-                if hubo_error:
+                if hubo_error is True:
                     errors += 1
                     continue
+                if hubo_error == "truncado":
+                    docs_truncados += 1
+                elif filas and filas[0]["line_id"] == -1:
+                    docs_sin_lineas += 1
                 # Dedupe por (document_id, line_id), misma razon que en documentos.
                 for fila in filas:
                     pendientes_de_insertar[(fila["document_id"], fila["line_id"])] = fila
@@ -769,6 +830,8 @@ def snapshot_details(
         "docs_processed": docs_processed,
         "lines_inserted": rows_inserted,
         "errors": errors,
+        "docs_sin_lineas": docs_sin_lineas,
+        "docs_con_mas_de_2000_lineas": docs_truncados,
         "cap_efectivo": cap,
         "remaining_to_process": max(0, pendientes_antes - docs_processed),
         "candidates_total": pendientes_antes,

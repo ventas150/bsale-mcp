@@ -34,14 +34,21 @@ Dos cambios de fondo:
    que una consulta pesada no ocupe una de las 5 conexiones del web service;
    un mantenimiento nocturno no tiene por que heredarlo.
 
-Reglas (configurables por env var):
-- stock_snapshot:
-    * fotos de las ultimas STOCK_HOURLY_RETENTION_HOURS (default 48h): todas
-    * entre eso y STOCK_DAILY_RETENTION_DAYS (default 7d): la ultima de cada dia
-    * mas viejo que eso: se borra
-- variants_snapshot: las ultimas VARIANTS_KEEP_SNAPSHOTS fotos (default 2)
+Reglas:
+- stock_snapshot: tabla LEGADA desde el 08-sep-2026 (el stock vive en
+  stock_actual). Se VACIA por lotes hasta que quede en cero y despues es un
+  no-op. No hay politica de horas ni de dias: la tabla entera sobra.
+- variants_snapshot: las ultimas VARIANTS_KEEP_SNAPSHOTS fotos (default 2).
 - documents_snapshot / document_details_snapshot: NO se tocan. Ahi vive el
   historico de ventas que alimenta los comparativos.
+
+Transaccionalidad (09-sep-2026): UNA transaccion POR LOTE. La version anterior
+abria la sesion afuera y pasaba la misma sesion a todos los lotes: ~153
+vueltas de DELETE ... LIMIT 50000 dentro de una sola transaccion, con el
+commit en el __exit__. Cualquier corte (deploy, timeout, solapamiento) era un
+ROLLBACK completo y cero progreso, y media hora despues arrancaba de nuevo
+desde el principio. El docstring decia "cada vuelta toma un lock corto" y era
+falso. Ahora cada lote commitea solo: lo borrado queda borrado.
 """
 from __future__ import annotations
 
@@ -55,10 +62,6 @@ from db import session as db_session
 
 logger = logging.getLogger(__name__)
 
-STOCK_HOURLY_RETENTION_HOURS = int(os.getenv("STOCK_HOURLY_RETENTION_HOURS", "48"))
-# 7, no 30. Una foto de stock son ~80.000 filas; 30 dias son 2,4 millones que
-# ningun tool consulta. Los tools de stock leen la foto MAS RECIENTE.
-STOCK_DAILY_RETENTION_DAYS = int(os.getenv("STOCK_DAILY_RETENTION_DAYS", "7"))
 VARIANTS_KEEP_SNAPSHOTS = int(os.getenv("VARIANTS_KEEP_SNAPSHOTS", "2"))
 
 # Timeout propio del mantenimiento. El de db.py (20 s) protege al web service.
@@ -77,17 +80,18 @@ def _sin_timeout_corto(s) -> None:
 
 
 def _borrar_por_lotes(
-    s, where_sql: str, params: dict[str, Any], batch: int, max_lotes: int | None = None
+    where_sql: str, params: dict[str, Any], batch: int, max_lotes: int | None = None
 ) -> tuple[int, bool]:
-    """Borra en lotes acotados por ctid. Devuelve (borradas, quedan_pendientes).
+    """Borra en lotes acotados por ctid, UNA TRANSACCION POR LOTE.
+    Devuelve (borradas, quedan_pendientes).
 
     El DELETE ... WHERE ctid IN (SELECT ctid ... LIMIT n) es la forma de acotar
-    un borrado masivo en Postgres: cada vuelta toma un lock corto y el planner
-    puede usar el indice del WHERE para juntar el lote.
+    un borrado masivo en Postgres. Cada vuelta abre su propia sesion, toma su
+    propio SET LOCAL statement_timeout y commitea al salir: si la corrida se
+    corta en el lote 80, los 79 anteriores ya estan borrados.
 
-    max_lotes existe para poder llamar esto desde un tool MCP sin pasarse del
-    timeout de 180 s del cliente. Con None corre hasta terminar (es lo que
-    hace el cron, que no tiene ese tope).
+    max_lotes acota el tiempo total: desde el cron (ventana de 30 min) y desde
+    un tool MCP (corte de 180 s del cliente). None corre hasta terminar.
     """
     borradas = 0
     lotes = 0
@@ -102,8 +106,10 @@ def _borrar_por_lotes(
         """
     )
     while True:
-        res = s.execute(sql, {**params, "batch": batch})
-        n = res.rowcount or 0
+        with db_session() as s:
+            _sin_timeout_corto(s)
+            res = s.execute(sql, {**params, "batch": batch})
+            n = res.rowcount or 0
         borradas += n
         lotes += 1
         if n < batch:
@@ -135,19 +141,17 @@ def purge_stock_snapshots(max_lotes: int | None = None) -> dict[str, Any]:
             text("SELECT count(*) FROM stock_snapshot")
         ).scalar_one()
 
-        if out["filas_antes"] == 0:
-            out["borradas_total"] = 0
-            out["quedan_pendientes"] = False
-            return out
+    if out["filas_antes"] == 0:
+        out["borradas_total"] = 0
+        out["quedan_pendientes"] = False
+        return out
 
-        # Sin WHERE que dependa de fechas: sobra la tabla completa.
-        borradas, pendientes = _borrar_por_lotes(
-            s, "TRUE", {}, RETENTION_BATCH, max_lotes
-        )
-        out["borradas_total"] = borradas
-        out["quedan_pendientes"] = pendientes
-        out["filas_despues"] = out["filas_antes"] - borradas
-
+    # Sin WHERE que dependa de fechas: sobra la tabla completa. Cada lote
+    # commitea solo (ver _borrar_por_lotes).
+    borradas, pendientes = _borrar_por_lotes("TRUE", {}, RETENTION_BATCH, max_lotes)
+    out["borradas_total"] = borradas
+    out["quedan_pendientes"] = pendientes
+    out["filas_despues"] = out["filas_antes"] - borradas
     return out
 
 
@@ -177,7 +181,7 @@ def purge_variants_snapshots() -> int:
         return res.rowcount or 0
 
 
-def apply_retention() -> dict[str, Any]:
+def apply_retention(max_lotes: int | None = None) -> dict[str, Any]:
     """Aplica toda la politica. Nunca lanza, pero SI declara si algo fallo.
 
     OJO: la version anterior tambien atrapaba las excepciones, pero las dejaba
@@ -189,7 +193,7 @@ def apply_retention() -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     try:
-        out["stock"] = purge_stock_snapshots()
+        out["stock"] = purge_stock_snapshots(max_lotes=max_lotes)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en purge_stock_snapshots: %s", e)
         out["stock_error"] = str(e)[:300]

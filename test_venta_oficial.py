@@ -1123,7 +1123,7 @@ def test_el_backfill_historico_vive_donde_el_cron_lo_ejecuta():
     import inspect
 
     sync = pytest.importorskip("sync_incremental")
-    codigo = _solo_codigo(inspect.getsource(sync.run))
+    codigo = _solo_codigo(inspect.getsource(sync._run))
 
     assert "snapshot_details(" in codigo, (
         "el backfill historico de detalle tiene que estar en sync_incremental.run(), "
@@ -1143,7 +1143,7 @@ def test_el_presupuesto_por_corrida_cabe_en_la_cadencia():
     import inspect
 
     sync = pytest.importorskip("sync_incremental")
-    codigo = _solo_codigo(inspect.getsource(sync.run))
+    codigo = _solo_codigo(inspect.getsource(sync._run))
     assert 'DETALLE_HISTORICO_POR_CORRIDA", "2000"' in codigo
 
 
@@ -1428,7 +1428,7 @@ def test_el_modo_auto_mira_completitud_ademas_de_antiguedad():
     import inspect
 
     sync = pytest.importorskip("sync_incremental")
-    codigo = _solo_codigo(inspect.getsource(sync.run))
+    codigo = _solo_codigo(inspect.getsource(sync._run))
 
     assert "_ultima_corrida_stock_completa" in codigo, (
         "auto tiene que repetir la corrida si la anterior quedo a medias"
@@ -1442,10 +1442,16 @@ def test_la_corrida_de_stock_registra_que_quedo_completa(monkeypatch):
 
     snapshot.snapshot_stock(max_pages=6000)
 
-    assert len(REGISTROS_STOCK) == 1
-    clave, valor = REGISTROS_STOCK[0]
+    # Dos registros: al ENTRAR (en_curso, completo=False) y al SALIR. Si el
+    # proceso muere entre los dos, queda el primero, y la corrida siguiente
+    # sabe que tiene que repetir. Antes solo existia el del final.
+    assert len(REGISTROS_STOCK) == 2
+    clave0, entrada = REGISTROS_STOCK[0]
+    assert clave0 == "stock_ultima_corrida"
+    assert entrada["completo"] is False and entrada["en_curso"] is True
+    clave, valor = REGISTROS_STOCK[-1]
     assert clave == "stock_ultima_corrida"
-    assert valor["completo"] is True
+    assert valor["completo"] is True and valor["en_curso"] is False
     assert valor["filas_vistas"] == 1000
     assert valor["error"] is None
 
@@ -1456,9 +1462,9 @@ def test_la_corrida_de_stock_registra_que_quedo_incompleta(monkeypatch):
 
     snapshot.snapshot_stock(max_pages=6000)
 
-    clave, valor = REGISTROS_STOCK[0]
+    clave, valor = REGISTROS_STOCK[-1]
     assert clave == "stock_ultima_corrida"
-    assert valor["completo"] is False
+    assert valor["completo"] is False and valor["en_curso"] is False
     assert valor["error"], "el registro tiene que decir por que"
 
 
@@ -1472,7 +1478,7 @@ def test_el_cron_tambien_crea_su_esquema():
     import inspect
 
     sync = pytest.importorskip("sync_incremental")
-    codigo = _solo_codigo(inspect.getsource(sync.run))
+    codigo = _solo_codigo(inspect.getsource(sync._run))
 
     assert "init_db" in codigo
 
@@ -1681,7 +1687,7 @@ def test_el_cron_y_el_sync_usan_el_mismo_criterio():
     sync = pytest.importorskip("sync_incremental")
     cron = pytest.importorskip("cron_snapshot")
 
-    assert "recolectar_errores" in _solo_codigo(inspect.getsource(sync.run))
+    assert "recolectar_errores" in _solo_codigo(inspect.getsource(sync._run))
     assert "recolectar_errores" in _solo_codigo(inspect.getsource(cron.run))
 
 
@@ -2503,3 +2509,166 @@ def test_solo_codigo_funciona_sobre_un_tool_anidado():
     assert "adjustments.json" not in _solo_codigo(fuente_tool), (
         "_solo_codigo tiene que borrar el docstring aunque el fuente venga indentado"
     )
+
+
+# ===========================================================================
+# Segunda auditoria, 09-sep-2026 — Lote 2: batch y base
+# ===========================================================================
+
+def test_la_corrida_de_stock_registra_su_estado_al_entrar():
+    """El estado "completo" se escribia solo al FINAL. Un proceso muerto a mitad
+    dejaba el completo:true de la corrida anterior, y la siguiente no repetia:
+    medio inventario servido 12 horas. Ahora se escribe al entrar, tras la
+    pagina 0, con completo:False y en_curso:True."""
+    import inspect
+
+    sn = pytest.importorskip("snapshot")
+    src = _solo_codigo(inspect.getsource(sn.snapshot_stock))
+    primera = src.index('_registrar_estado("stock_ultima_corrida"')
+    ultima = src.rindex('_registrar_estado("stock_ultima_corrida"')
+    assert primera != ultima, "tiene que registrarse dos veces: al entrar y al salir"
+    # La primera va ANTES del pool de descarga y dice en_curso.
+    assert primera < src.index("ThreadPoolExecutor(max_workers=workers)")
+    assert '"en_curso": True' in src[primera:primera + 400]
+    assert '"en_curso": False' in src[ultima:ultima + 400]
+
+
+def test_la_retencion_commitea_por_lote(monkeypatch):
+    """Una sola transaccion para 153 lotes: cualquier corte era rollback total
+    y cero progreso. Ahora cada lote abre su sesion y commitea al salir."""
+    import retention as rt
+
+    sesiones_abiertas = []
+
+    class Sesion:
+        def __init__(self):
+            self.ejecutados = []
+
+        def __enter__(self):
+            sesiones_abiertas.append(self)
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            self.ejecutados.append((str(stmt), params))
+            # 3 lotes llenos y uno corto
+            n = 50000 if len(sesiones_abiertas) <= 3 else 7
+            return type("R", (), {"rowcount": n})()
+
+    monkeypatch.setattr(rt, "db_session", lambda: Sesion())
+    borradas, pendientes = rt._borrar_por_lotes("TRUE", {}, 50000)
+
+    assert borradas == 150007 and pendientes is False
+    assert len(sesiones_abiertas) == 4, "una sesion (= una transaccion) por lote"
+    for s in sesiones_abiertas:
+        assert any("statement_timeout" in e[0] for e in s.ejecutados), "cada lote con su SET LOCAL"
+
+
+def test_la_retencion_respeta_max_lotes(monkeypatch):
+    import retention as rt
+
+    class Sesion:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt, params=None):
+            return type("R", (), {"rowcount": 50000})()
+
+    monkeypatch.setattr(rt, "db_session", lambda: Sesion())
+    borradas, pendientes = rt._borrar_por_lotes("TRUE", {}, 50000, max_lotes=3)
+    assert borradas == 150000 and pendientes is True
+
+
+def test_el_cron_toma_un_candado_y_se_salta_si_esta_ocupado(monkeypatch):
+    """Sin candado, una corrida incompleta se auto-solapaba cada 30 min:
+    4+4 = 8 conexiones contra el umbral de 6 de Bsale."""
+    sync = pytest.importorskip("sync_incremental")
+
+    corrio = []
+    monkeypatch.setattr(sync, "_run", lambda modo: corrio.append(modo) or 0)
+
+    monkeypatch.setattr(sync, "_tomar_candado_de_corrida", lambda: (None, "ocupado"))
+    assert sync.run("auto") == 0
+    assert corrio == [], "con el candado tomado por otra corrida, esta no corre"
+
+    soltados = []
+    monkeypatch.setattr(sync, "_tomar_candado_de_corrida", lambda: ("CONN", "ok"))
+    monkeypatch.setattr(sync, "_soltar_candado_de_corrida", lambda c: soltados.append(c))
+    assert sync.run("auto") == 0
+    assert corrio == ["auto"] and soltados == ["CONN"]
+
+    # Sin poder consultar Postgres se sigue SIN candado, no se convierte el
+    # cron en un no-op permanente.
+    monkeypatch.setattr(sync, "_tomar_candado_de_corrida", lambda: (None, "error"))
+    assert sync.run("auto") == 0
+    assert corrio == ["auto", "auto"]
+
+
+def test_el_candado_es_un_advisory_lock_de_sesion():
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    src = _solo_codigo(inspect.getsource(sync._tomar_candado_de_corrida))
+    assert "pg_try_advisory_lock" in src, "tiene que ser try_: nunca esperar al otro"
+    assert "pg_advisory_xact_lock" not in src, "de sesion, no de transaccion"
+
+
+def test_un_documento_sin_lineas_queda_marcado_como_procesado():
+    """Devolver [] lo dejaba como candidato eterno; con oldest_first, 2.000 de
+    esos en la cabeza de la cola = el backfill nunca avanza."""
+    import inspect
+
+    sn = pytest.importorskip("snapshot")
+    src = _solo_codigo(inspect.getsource(sn.snapshot_details))
+    assert "_centinela(cand, -1)" in src, "documento sin lineas -> centinela -1"
+    assert "_centinela(cand, -2)" in src, "documento truncado -> centinela -2, no candidato eterno"
+    assert "docs_sin_lineas" in src and "docs_con_mas_de_2000_lineas" in src
+
+
+def test_el_backfill_de_detalle_corta_por_pendientes_y_no_por_la_tanda():
+    import inspect
+
+    bf = pytest.importorskip("backfill")
+    src = _solo_codigo(inspect.getsource(bf.backfill_details))
+    assert 'get("remaining_to_process", 0) == 0' in src
+    assert "raise RuntimeError" in src, "una tanda entera fallida no puede ser un backfill exitoso"
+
+
+def test_la_retencion_si_marca_la_corrida_y_el_codigo_lo_dice():
+    """Comentario y codigo decian lo contrario. Se decidio por el codigo."""
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    src = inspect.getsource(sync._run)
+    assert "NO marcan la corrida" not in src
+    assert 'results["retention_error"]' in _solo_codigo(src)
+    assert 'results["retention_warning"]' not in _solo_codigo(src)
+
+
+def test_el_status_expone_la_ultima_corrida_de_stock():
+    import inspect
+
+    ts = pytest.importorskip("tools_snapshot")
+    src = _solo_codigo(inspect.getsource(ts.register))
+    i = src.index("def bsale_snapshot_status")
+    j = src.index("def bsale_ventas_fast")
+    cuerpo = src[i:j]
+    assert "stock_ultima_corrida" in cuerpo
+    assert '"ultima_corrida": ultima_corrida_stock' in cuerpo
+
+
+def test_retencion_run_se_rehusa_con_stock_actual_vacia():
+    import inspect
+
+    ts = pytest.importorskip("tools_snapshot")
+    src = _solo_codigo(inspect.getsource(ts.register))
+    i = src.index("def bsale_mcp_retencion_run")
+    j = src.index("def bsale_snapshot_status")
+    cuerpo = src[i:j]
+    assert "SELECT count(*) FROM stock_actual" in cuerpo
+    assert "max_lotes: int = 4" in cuerpo

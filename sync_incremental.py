@@ -296,7 +296,82 @@ def sync_variantes() -> dict[str, Any]:
     return {"variants": snapshot_variants(max_pages=2000)}
 
 
+# Clave del advisory lock de Postgres que evita dos corridas del cron a la vez.
+# Un bigint cualquiera, fijo. Lo unico que importa es que sea el mismo en todos
+# los procesos que corren este sync.
+CRON_LOCK_KEY = 76187337
+
+
+def _tomar_candado_de_corrida():
+    """Toma el advisory lock de sesion. Devuelve la conexion que lo sostiene, o
+    None si otra corrida lo tiene.
+
+    No habia ningun candado. En operacion normal las corridas no se solapaban
+    porque do_stock salia False, pero apenas una corrida de stock terminaba
+    INCOMPLETA, do_stock quedaba True para todas las siguientes: a los 30
+    minutos arrancaba otra con la anterior en vuelo, 4+4 = 8 conexiones
+    contra el umbral de 6 de Bsale, las dos acumulaban 429, las dos terminaban
+    incompletas, y el bucle se reforzaba solo. Ademas _borrar_stock_no_reportado
+    solo es correcto con una corrida a la vez.
+
+    Lock de SESION (no de transaccion): se suelta solo cuando el proceso muere,
+    que es exactamente lo que hace falta cuando un deploy mata el cron.
+
+    Devuelve (conexion, "ok") con el lock tomado; (None, "ocupado") si otra
+    corrida lo tiene; (None, "error") si no se pudo ni preguntar. Los dos
+    ultimos se tratan distinto: "ocupado" se salta en silencio, "error" sigue
+    sin candado y lo dice, porque un fallo de conexion no puede convertir el
+    cron en un no-op permanente sin que nadie se entere.
+    """
+    from sqlalchemy import text
+    from db import get_engine
+    try:
+        conn = get_engine().connect()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudo abrir conexion para el candado: %s", e)
+        return None, "error"
+    try:
+        got = conn.execute(text("select pg_try_advisory_lock(:k)"), {"k": CRON_LOCK_KEY}).scalar()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pg_try_advisory_lock fallo: %s", e)
+        conn.close()
+        return None, "error"
+    if not got:
+        conn.close()
+        return None, "ocupado"
+    return conn, "ok"
+
+
+def _soltar_candado_de_corrida(conn) -> None:
+    from sqlalchemy import text
+    try:
+        conn.execute(text("select pg_advisory_unlock(:k)"), {"k": CRON_LOCK_KEY})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run(modo: str) -> int:
+    candado, estado = _tomar_candado_de_corrida()
+    if estado == "ocupado":
+        # Otra corrida esta en vuelo. No es un error: es la razon de ser del
+        # candado. Salir en 0 para que Render no lo pinte de rojo.
+        logger.warning("Hay otra corrida del sync en vuelo (advisory lock %s tomado). "
+                       "Esta corrida se salta.", CRON_LOCK_KEY)
+        return 0
+    if estado == "error":
+        logger.warning("Sin candado de corrida (no se pudo consultar Postgres). Se sigue.")
+    try:
+        return _run(modo)
+    finally:
+        if candado is not None:
+            _soltar_candado_de_corrida(candado)
+
+
+def _run(modo: str) -> int:
     results: dict[str, Any] = {}
     now = datetime.now(timezone.utc)
 
@@ -402,14 +477,20 @@ def run(modo: str) -> int:
         results["digests_error"] = str(e)
 
     # Retencion: purga fotos viejas de stock/variantes para que la DB no
-    # crezca sin limite (incidente storage ago-2026). Barato; corre siempre.
-    # Los errores de retencion NO marcan la corrida como fallida.
+    # crezca sin limite (incidente storage ago-2026). Corre siempre, con tope
+    # de lotes para no comerse la ventana de 30 minutos.
+    #
+    # Un fallo de retencion SI marca la corrida: antes el comentario decia que
+    # no y el codigo hacia que si (apply_retention devuelve hubo_error y
+    # recolectar_errores lo matchea a cualquier profundidad). Se decidio por
+    # el codigo: una retencion que falla es una base que crece sin limite, y
+    # eso ya fue un incidente. Por eso la clave es *_error y no *_warning.
     try:
         from retention import apply_retention
-        results["retention"] = apply_retention()
+        results["retention"] = apply_retention(max_lotes=int(os.getenv("RETENTION_MAX_LOTES", "20")))
     except Exception as e:  # noqa: BLE001
         logger.error("Error en retention: %s", e)
-        results["retention_warning"] = str(e)
+        results["retention_error"] = str(e)
 
     # Stock AL FINAL: es el paso lento (~2h por la API de Bsale) y no debe
     # bloquear ventas, backfill ni digests si la corrida se corta.
