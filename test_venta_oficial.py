@@ -3399,3 +3399,288 @@ def test_apply_retention_incluye_raw_y_su_fallo_marca_la_corrida(monkeypatch):
     out = rt.apply_retention(max_lotes=3)
     assert out["hubo_error"] is False and out["documents_raw"] == {"minimizadas": 1}
     assert visto == {"max_lotes": 3}, "el tope de lotes del cron llega hasta raw"
+
+
+# ===========================================================================
+# bsale_ventas_fast y bsale_conciliacion_venta SE EJECUTAN (09-sep-2026)
+# ===========================================================================
+# Son los dos tools que mas se miran y hasta hoy ningun test los corria. Se
+# ejecutan con una sesion falsa que responde por FORMA de consulta (la SQL
+# compilada en dialecto Postgres) y un cliente falso: sin red, sin base.
+# official_sale_conditions() llama a la API (sales_note_type_ids): se
+# monkeypatchea SIEMPRE.
+
+_NOTAS_DE_VENTA = frozenset({3, 23, 24, 26, 27})
+
+
+def _compilar_con_params(stmt):
+    from sqlalchemy.dialects import postgresql
+
+    c = stmt.compile(dialect=postgresql.dialect())
+    return str(c), dict(c.params)
+
+
+class _SesionVentas:
+    """Responde a cada select de bsale_ventas_fast por su forma."""
+
+    def __init__(self, total, by_office=(), by_doctype=(), by_day=(), excluidos=None, docs=()):
+        self.total, self.by_office, self.by_doctype = total, list(by_office), list(by_doctype)
+        self.by_day, self.excluidos, self.docs = list(by_day), excluidos, list(docs)
+        self.consultas = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        sql, p = _compilar_con_params(stmt)
+        self.consultas.append((sql, p))
+        if "date_trunc" in sql:
+            filas, uno = self.by_day, None
+        elif "GROUP BY documents_snapshot.office_id" in sql:
+            filas, uno = self.by_office, None
+        elif "GROUP BY documents_snapshot.document_type_id" in sql:
+            filas, uno = self.by_doctype, None
+        elif "NOT (" in sql:
+            filas, uno = None, self.excluidos
+        elif "ORDER BY documents_snapshot.emission_date DESC" in sql:
+            filas, uno = self.docs, None
+        else:
+            filas, uno = None, self.total
+
+        class R:
+            def all(self_):
+                return filas
+
+            def one(self_):
+                return uno
+
+        return R()
+
+
+def _ventas_fast_con(monkeypatch, sesion, lag=2.0):
+    ts = pytest.importorskip("tools_snapshot")
+    import bsale_client as _bc
+    import db as _db
+
+    monkeypatch.setattr(_bc, "sales_note_type_ids", lambda: _NOTAS_DE_VENTA)
+    monkeypatch.setattr(ts, "db_session", lambda: sesion)
+    monkeypatch.setattr(_db, "snapshot_lag_hours", lambda: lag)
+    return _tools_de(ts)["bsale_ventas_fast"]
+
+
+def test_ventas_fast_arma_la_respuesta_desde_el_snapshot(monkeypatch):
+    from datetime import datetime, timezone
+
+    sesion = _SesionVentas(
+        total=_Fila(docs=10, nc=2, total=1_000_000.0, neto=840_336.0),
+        by_office=[_Fila(office_id=1, office_name="E-Commerce ", docs=7, nc=1, total=700_000.0),
+                   _Fila(office_id=3, office_name="Dos Caracoles", docs=3, nc=1, total=300_000.0)],
+        by_doctype=[_Fila(document_type_id=1, document_type_name="BOLETA ELECTRÓNICA T", docs=9, total=900_000.0),
+                    _Fila(document_type_id=9, document_type_name="NOTA DE CRÉDITO ELECTRÓNICA T", docs=0, total=-50_000.0)],
+        by_day=[_Fila(day=datetime(2026, 8, 1, tzinfo=timezone.utc), docs=10, total=1_000_000.0)],
+        excluidos=_Fila(docs=4, total=-12_345.0),
+    )
+    fast = _ventas_fast_con(monkeypatch, sesion, lag=2.0)
+
+    r = fast(start_date="2026-08-01", end_date="2026-08-31")
+
+    assert r["source"] == "snapshot" and r["snapshot_advertencia"] is None
+    assert r["documentos_de_venta"] == 10 and r["notas_de_credito"] == 2
+    assert r["venta_oficial"] == 1_000_000.0 and r["venta_oficial_sin_iva"] == 840_336.0
+    assert r["ticket_promedio"] == 100_000, "total / documentos de venta (sin NC)"
+    assert r["by_office"][0] == {"office_id": 1, "office_name": "E-Commerce", "count": 7,
+                                "notas_de_credito": 1, "amount": 700_000.0}
+    assert r["by_document_type"][1]["amount"] == -50_000.0
+    assert r["by_day"] == [{"day": "2026-08-01", "count": 10, "amount": 1_000_000.0}]
+    assert r["excluidos"]["documentos"] == 4 and r["excluidos"]["monto_con_signo"] == -12_345.0
+    assert "guias no estan en el snapshot" in r["excluidos"]["detalle"]
+    assert r["documentos"] == [] and "incluir_documentos=True" in r["nota_documentos"]
+    assert "BRUTO" in r["unidad"]["venta_oficial"] and "sin IVA" in r["unidad"]["venta_oficial_sin_iva"]
+
+    # Lo que le pidio a la base: 5 consultas (total, sucursal, tipo, dia, excluidos)
+    assert len(sesion.consultas) == 5
+    sql_total, p_total = sesion.consultas[0]
+    assert "FILTER (WHERE documents_snapshot.document_type_use !=" in sql_total, "cuenta sin NC"
+    assert "FILTER (WHERE documents_snapshot.document_type_use =" in sql_total, "cuenta las NC aparte"
+    assert "THEN -documents_snapshot.total_amount" in sql_total, "la NC resta"
+    assert "THEN -documents_snapshot.net_amount" in sql_total
+    valores = set(v for v in p_total.values() if not isinstance(v, (list, tuple)))
+    assert datetime(2026, 8, 1, tzinfo=timezone.utc) in valores
+    assert datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc) in valores, "el fin incluye el dia entero"
+    for sql, _ in sesion.consultas:
+        assert "documents_snapshot.document_type_use !=" in sql, "excluye guias"
+        assert "documents_snapshot.document_type_id NOT IN" in sql, "excluye notas de venta"
+        assert "documents_snapshot.state =" in sql, "excluye anulados"
+        assert "documents_snapshot.emission_date BETWEEN" in sql
+        assert "documents_snapshot.office_id =" not in sql, "sin office_id no filtra sucursal"
+    assert "NOT (" in sesion.consultas[4][0], "excluidos = la negacion de la regla"
+    ids_nv = [v for v in p_total.values() if isinstance(v, (list, tuple))]
+    assert ids_nv and set(ids_nv[0]) == set(_NOTAS_DE_VENTA), "los tipos de nota de venta vienen del monkeypatch"
+
+
+def test_ventas_fast_filtra_sucursal_lista_documentos_y_avisa_atraso(monkeypatch):
+    from datetime import datetime, timezone
+
+    sesion = _SesionVentas(
+        total=_Fila(docs=0, nc=0, total=0.0, neto=0.0),
+        excluidos=_Fila(docs=0, total=0.0),
+        docs=[_Fila(document_id=9050, emission_date=datetime(2026, 8, 2, tzinfo=timezone.utc),
+                    office_id=3, office_name="Dos Caracoles", document_type_name="NC ",
+                    client_id=77, signed_total=-50.0, total_amount=50.0, net_amount=42.0)],
+    )
+    fast = _ventas_fast_con(monkeypatch, sesion, lag=30.5)
+
+    r = fast(date_from="2026-08-01", date_to="2026-08-31", office_id=3,
+             incluir_documentos=True, limit=5)
+
+    assert r["period"] == {"start": "2026-08-01", "end": "2026-08-31"}, "date_from/date_to son alias"
+    assert r["office_id"] == 3
+    assert r["ticket_promedio"] is None, "sin documentos no se divide por cero"
+    assert "30.5h" in r["snapshot_advertencia"]
+    assert r["nota_documentos"] is None
+    assert r["documentos"] == [{
+        "document_id": 9050, "emission_date": "2026-08-02T00:00:00+00:00", "office_id": 3,
+        "office_name": "Dos Caracoles", "document_type_name": "NC", "client_id": 77,
+        "amount_signed": -50.0, "total_amount": 50.0, "net_amount": 42.0,
+    }]
+    assert len(sesion.consultas) == 6
+    for sql, p in sesion.consultas:
+        assert "documents_snapshot.office_id =" in sql and 3 in p.values()
+    sql_docs, p_docs = sesion.consultas[5]
+    assert "LIMIT" in sql_docs and 5 in p_docs.values()
+
+
+def test_ventas_fast_sin_fechas_no_abre_sesion(monkeypatch):
+    ts = pytest.importorskip("tools_snapshot")
+
+    def no_deberia():
+        raise AssertionError("sin fechas no se consulta nada")
+
+    monkeypatch.setattr(ts, "db_session", no_deberia)
+    fast = _tools_de(ts)["bsale_ventas_fast"]
+    assert "error" in fast()
+    assert "error" in fast(start_date="2026-08-01")
+
+
+class _ClienteConciliacion:
+    def __init__(self, docs, truncated=False, total_count=None):
+        self.docs, self.truncated = docs, truncated
+        self.total_count = len(docs) if total_count is None else total_count
+        self.llamadas = []
+
+    def paginated_fetch(self, path, params=None, max_items=None, **k):
+        self.llamadas.append((path, dict(params or {}), max_items))
+        return {"items": self.docs, "truncated": self.truncated,
+                "total_count": self.total_count, "fetched": len(self.docs)}
+
+
+class _SesionConciliacion:
+    def __init__(self, filas):
+        self.filas, self.consultas = filas, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        self.consultas.append(_compilar_con_params(stmt))
+        filas = self.filas
+
+        class R:
+            def all(self_):
+                return filas
+
+        return R()
+
+
+def _conciliacion_con(monkeypatch, docs_vivo, filas_snap, **kw):
+    ts = pytest.importorskip("tools_snapshot")
+    import bsale_client as _bc
+
+    cliente = _ClienteConciliacion(docs_vivo, **kw)
+    sesion = _SesionConciliacion(filas_snap)
+    monkeypatch.setattr(_bc, "sales_note_type_ids", lambda: _NOTAS_DE_VENTA)
+    monkeypatch.setattr(_bc, "get_client", lambda: cliente)
+    monkeypatch.setattr(ts, "db_session", lambda: sesion)
+    return _tools_de(ts)["bsale_conciliacion_venta"], cliente, sesion
+
+
+def test_conciliacion_explica_la_brecha_documento_a_documento(monkeypatch):
+    from datetime import datetime, timezone
+
+    # Vivo: boleta 100, factura 200, NC 50 (resta), boleta 150 que el snapshot
+    # no tiene; y tres que la regla deja fuera: guia, nota de venta, anulada.
+    vivo = [BOLETA, FACTURA, NOTA_CREDITO, _doc(1, 0, 0, 150),
+            GUIA, _doc(3, 0, 1, 300), _doc(1, 0, 0, 400, state=1)]
+    # Snapshot: los tres comunes (la factura con OTRO monto) y uno que sobra.
+    snap = [_Fila(document_id=1100, monto=100.0), _Fila(document_id=6200, monto=260.0),
+            _Fila(document_id=9050, monto=-50.0), _Fila(document_id=7777, monto=70.0)]
+    conc, cliente, sesion = _conciliacion_con(monkeypatch, vivo, snap, total_count=7)
+
+    r = conc(start_date="2026-08-01", end_date="2026-08-31")
+
+    assert r["venta_oficial_vivo"] == 400, "100 + 200 - 50 + 150; guia, nota de venta y anulada fuera"
+    assert r["venta_oficial_snapshot"] == 380 and r["diferencia"] == -20
+    assert r["diferencia_pct"] == -5.0
+    assert r["documentos_vivo"] == 4 and r["documentos_snapshot"] == 4
+    assert r["brecha"]["faltan_en_snapshot"] == {"count": 1, "monto": 150, "ejemplos": [1150]}
+    assert r["brecha"]["sobran_en_snapshot"] == {"count": 1, "monto": 70.0, "ejemplos": [7777]}
+    assert r["brecha"]["monto_distinto"] == {"count": 1, "ejemplos": [{"document_id": 6200, "vivo": 200, "snapshot": 260.0}]}
+    assert r["truncado_lado_vivo"] is False and r["documentos_en_bsale"] == 7
+
+    # Lo que le pidio a Bsale: rango en epoch, vigentes, tope por defecto
+    path, params, max_items = cliente.llamadas[0]
+    assert path == "/v1/documents.json" and max_items == 40000
+    ini = int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp())
+    fin = int(datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp())
+    assert params["emissiondaterange"] == f"{ini},{fin}"
+    assert params["state"] == 0 and params["officeid"] is None
+    assert "document_type" in params["expand"]
+    # Lo que le pidio al snapshot: la misma regla de venta oficial
+    sql, p = sesion.consultas[0]
+    assert "THEN -documents_snapshot.total_amount" in sql
+    assert "documents_snapshot.document_type_use !=" in sql
+    assert "documents_snapshot.document_type_id NOT IN" in sql
+    assert "documents_snapshot.state =" in sql
+    assert "documents_snapshot.office_id =" not in sql
+
+
+def test_conciliacion_pasa_sucursal_tope_y_truncado(monkeypatch):
+    conc, cliente, sesion = _conciliacion_con(monkeypatch, [BOLETA], [], truncated=True, total_count=99)
+
+    r = conc(start_date="2026-08-01", end_date="2026-08-31", office_id=3, max_documents=10)
+
+    assert r["truncado_lado_vivo"] is True, "un lado vivo cortado no puede pasar por completo"
+    assert r["documentos_en_bsale"] == 99 and r["office_id"] == 3
+    assert r["brecha"]["faltan_en_snapshot"]["ejemplos"] == [1100]
+    assert r["diferencia_pct"] == -100.0
+    _, params, max_items = cliente.llamadas[0]
+    assert params["officeid"] == 3 and max_items == 10
+    sql, p = sesion.consultas[0]
+    assert "documents_snapshot.office_id =" in sql and 3 in p.values()
+
+
+def test_conciliacion_rechaza_mas_de_92_dias_sin_tocar_bsale(monkeypatch):
+    ts = pytest.importorskip("tools_snapshot")
+    import bsale_client as _bc
+
+    def no_deberia():
+        raise AssertionError("con el rango rechazado no se llama a Bsale")
+
+    monkeypatch.setattr(_bc, "get_client", no_deberia)
+    monkeypatch.setattr(ts, "db_session", no_deberia)
+    conc = _tools_de(ts)["bsale_conciliacion_venta"]
+    r = conc(start_date="2026-01-01", end_date="2026-04-30")
+    assert r.get("aplicado") is False and "92" in str(r)
+    assert "error" in conc(start_date="2026-08-31", end_date="2026-08-01")
+
+
+def test_conciliacion_sin_venta_en_vivo_no_divide_por_cero(monkeypatch):
+    conc, _, _ = _conciliacion_con(monkeypatch, [], [_Fila(document_id=1, monto=10.0)])
+    r = conc(start_date="2026-08-01", end_date="2026-08-31")
+    assert r["diferencia_pct"] is None and r["diferencia"] == 10.0
