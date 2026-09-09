@@ -2194,3 +2194,39 @@ def test_el_iva_es_configurable(monkeypatch):
     assert g.con_iva(1000) == 1000.0
     monkeypatch.setenv("BSALE_IVA_PCT", "19")
     assert g.con_iva(1000) == 1190.0
+
+
+def test_la_escritura_de_stock_esta_apagada_por_default(monkeypatch):
+    """Las cuatro escrituras de stock nunca corrieron contra la API real.
+
+    El camino read-then-delta supone que `quantity` en receptions/consumptions
+    es la cantidad a mover y no un saldo final. Esa pregunta esta abierta con
+    Bsale. Si el supuesto estuviera al reves el inventario queda mal en las 11
+    sucursales y Bsale no tiene idempotencia para deshacerlo, asi que el default
+    tiene que ser apagado, igual que los precios y el catalogo.
+    """
+    g = pytest.importorskip("guardrails")
+    monkeypatch.delenv("BSALE_STOCK_WRITES_ENABLED", raising=False)
+    assert g.stock_writes_enabled() is False
+
+    with pytest.raises(g.GuardrailError):
+        g.guard_stock_write()
+
+
+def test_las_cuatro_escrituras_de_stock_respetan_el_candado(monkeypatch):
+    """Que el default sea 0 no sirve si algun tool no consulta el candado."""
+    monkeypatch.delenv("BSALE_STOCK_WRITES_ENABLED", raising=False)
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(1, 1): 10.0})
+
+    r = tools["bsale_recepcionar_stock"](variant_id=1, office_id=1, quantity=5, cost=9500)
+    assert r["aplicado"] is False
+    r = tools["bsale_consumir_stock"](variant_id=1, office_id=1, quantity=5)
+    assert r["aplicado"] is False
+    r = tools["bsale_ajustar_stock"](variant_id=1, office_id=1, quantity=12, cost=9500)
+    assert r["aplicado"] is False
+    r = tools["bsale_crear_traspaso_stock"](
+        variant_id=1, office_origin_id=1, office_destination_id=2, quantity=5
+    )
+    assert r["aplicado"] is False
+
+    assert cli.llamadas == [], "ninguna escritura de stock puede llegar a Bsale"

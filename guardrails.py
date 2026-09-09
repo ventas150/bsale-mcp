@@ -44,8 +44,20 @@ def price_writes_enabled() -> bool:
 
 
 def stock_writes_enabled() -> bool:
-    """Kill-switch de escritura de stock. Encendido por default (es operativo)."""
-    return _flag("BSALE_STOCK_WRITES_ENABLED", "1")
+    """Kill-switch de escritura de stock. APAGADO por default desde el 09-sep-2026.
+
+    Estuvo encendido por ser "operativo", pero ninguna de las cuatro escrituras
+    de stock se ha ejecutado nunca contra la API real: solo contra fakes en los
+    tests. El camino depende de que `quantity` en receptions/consumptions sea la
+    cantidad a mover y no un saldo final; esa pregunta esta en el correo abierto
+    a Bsale y hasta que respondan no se escribe stock por esta via. Si el supuesto
+    estuviera al reves, el error no se nota hasta que el inventario ya esta mal en
+    las 11 sucursales, y Bsale no tiene claves de idempotencia para deshacerlo.
+
+    Para habilitar un movimiento puntual: BSALE_STOCK_WRITES_ENABLED=1 en Render,
+    se aplica, y se vuelve a apagar. Mismo procedimiento que los precios.
+    """
+    return _flag("BSALE_STOCK_WRITES_ENABLED", "0")
 
 
 def guard_variant_write(descripcion: str = "") -> None:
