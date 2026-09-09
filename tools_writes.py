@@ -52,6 +52,28 @@ def _stock_actual_de(client, variant_id: int, office_id: int):
     return None
 
 
+def _costo_promedio_de(client, variant_id: int):
+    """Costo promedio de una variante segun Bsale. None si no se pudo leer.
+
+    Bsale expone GET /v1/variants/{id}/costs.json con `averageCost` (y
+    `lastCost`). Si el endpoint cambia, no responde o trae 0, devolvemos None
+    y el llamador BLOQUEA en vez de recepcionar a costo 0: es preferible no
+    mover stock a contaminar el costo promedio para siempre.
+    """
+    try:
+        data = client.get(f"/v1/variants/{int(variant_id)}/costs.json", use_cache=False)
+    except Exception:  # noqa: BLE001
+        return None
+    for clave in ("averageCost", "average_cost", "lastCost", "last_cost"):
+        v = data.get(clave) if isinstance(data, dict) else None
+        try:
+            if v is not None and float(v) > 0:
+                return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de escritura."""
 
@@ -223,19 +245,29 @@ def register(mcp) -> None:  # noqa: ANN001
         """Recepciona stock (entrada). WRITE OPERATION.
 
         Util para reflejar compras a proveedor, devoluciones de clientes, etc.
+
+        `cost` es OBLIGATORIO. Una recepcion sin costo entra a costo 0 y
+        arrastra el costo promedio de la variante en Bsale hacia abajo de forma
+        permanente: Bsale no recalcula hacia atras, y todo reporte de margen
+        posterior queda mal. bsale_ajustar_stock ya lo exigia; este tool lo
+        dejaba pasar por la puerta de al lado.
         """
         try:
             guard_stock_write()
             quantity = validar_cantidad(quantity)
-            if cost is not None:
-                cost = validar_costo(cost)
+            if cost is None:
+                raise GuardrailError(
+                    "Una recepcion sin `cost` entra a costo 0 y arrastra el costo "
+                    "promedio de la variante en Bsale hacia abajo para siempre. "
+                    "Pasar el costo unitario (neto) de la mercaderia que entra. "
+                    "No se escribio nada."
+                )
+            cost = validar_costo(cost)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
         client = get_client()
-        detail: dict[str, Any] = {"variantId": variant_id, "quantity": quantity}
-        if cost is not None:
-            detail["cost"] = cost
+        detail: dict[str, Any] = {"variantId": variant_id, "quantity": quantity, "cost": cost}
         body = {
             "officeId": office_id,
             "note": note,
@@ -250,10 +282,19 @@ def register(mcp) -> None:  # noqa: ANN001
         office_destination_id: int,
         quantity: float,
         note: str = "Traspaso via MCP",
+        cost: float | None = None,
     ) -> dict[str, Any]:
         """Traspasa stock entre sucursales. WRITE OPERATION.
 
-        Hace consumo en sucursal origen + recepcion en destino, en una operacion.
+        Son DOS movimientos, NO atomicos: consumo en origen y recepcion en
+        destino. Si la recepcion falla se intenta compensar en origen y el
+        resultado lo dice; leer `accion_requerida` si `aplicado` es False.
+
+        `cost` es el costo unitario (neto) con que entra a destino. Si no se
+        pasa, se lee el costo promedio de la variante en Bsale; si eso no se
+        puede, el traspaso se BLOQUEA. Nunca se recepciona sin costo: entra a
+        costo 0 y arrastra el costo promedio de la variante hacia abajo para
+        siempre, que es el daño que bsale_ajustar_stock ya se negaba a hacer.
 
         Args:
             variant_id: SKU a mover.
@@ -261,6 +302,7 @@ def register(mcp) -> None:  # noqa: ANN001
             office_destination_id: Sucursal de destino.
             quantity: Unidades a mover.
             note: Nota que queda en historial.
+            cost: Costo unitario neto. Opcional si Bsale entrega el promedio.
 
         Returns:
             Dict con resultado de consumo y recepcion.
@@ -268,6 +310,17 @@ def register(mcp) -> None:  # noqa: ANN001
         client = get_client()
         try:
             guard_stock_write()
+            quantity = validar_cantidad(quantity)
+            if cost is None:
+                cost = _costo_promedio_de(client, variant_id)
+            if cost is None:
+                raise GuardrailError(
+                    "No se pudo leer el costo promedio de la variante en Bsale y "
+                    "no se paso `cost`. Un traspaso sin costo recepciona a costo 0 "
+                    "en destino y contamina el costo promedio para siempre. Pasar "
+                    "`cost` explicito. No se escribio nada."
+                )
+            cost = validar_costo(cost)
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
 
@@ -276,8 +329,6 @@ def register(mcp) -> None:  # noqa: ANN001
                 "aplicado": False,
                 "bloqueado_por": "Origen y destino son la misma sucursal; el traspaso no hace nada.",
             }
-        if quantity <= 0:
-            return {"aplicado": False, "bloqueado_por": f"Cantidad invalida: {quantity}."}
 
         # 1. Consumo en origen
         consumption_body = {
@@ -294,7 +345,7 @@ def register(mcp) -> None:  # noqa: ANN001
         reception_body = {
             "officeId": office_destination_id,
             "note": f"[Traspaso] {note} <- office {office_origin_id}",
-            "details": [{"variantId": variant_id, "quantity": quantity}],
+            "details": [{"variantId": variant_id, "quantity": quantity, "cost": cost}],
         }
         try:
             reception = client.post("/v1/stocks/receptions.json", json_body=reception_body)
@@ -307,7 +358,7 @@ def register(mcp) -> None:  # noqa: ANN001
                     json_body={
                         "officeId": office_origin_id,
                         "note": f"[Traspaso REVERTIDO] fallo la recepcion en {office_destination_id}",
-                        "details": [{"variantId": variant_id, "quantity": quantity}],
+                        "details": [{"variantId": variant_id, "quantity": quantity, "cost": cost}],
                     },
                 )
             except Exception as e2:  # noqa: BLE001

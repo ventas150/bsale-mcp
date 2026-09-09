@@ -47,8 +47,16 @@ services:
         value: "0"
       - key: BSALE_WRITABLE_PRICE_LISTS
         value: ""
+      # Stock y catalogo tambien apagados. Ninguna de las cuatro escrituras de
+      # stock se ha ejecutado contra la API real, y adjustments.json / la
+      # semantica de quantity siguen sin respuesta de Bsale. Mismo
+      # procedimiento que precios: "1", aplicar, "0". Hay un test que lee este
+      # archivo y exige los tres candados en "0" para que sincronizar el
+      # blueprint no reabra nada.
       - key: BSALE_STOCK_WRITES_ENABLED
-        value: "1"
+        value: "0"
+      - key: BSALE_CATALOG_WRITES_ENABLED
+        value: "0"
 
       # --- Ajustes que el codigo ya leia pero no estaban declarados -------
       - key: BSALE_MAX_RETRIES

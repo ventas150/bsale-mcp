@@ -357,7 +357,7 @@ def register(mcp) -> None:  # noqa: ANN001
         rows = []
         for oid, sinfo in stock_by_office.items():
             v_total = velocity_by_office.get(oid, 0)
-            v_per_day = v_total / lookback_days
+            v_per_day = v_total / lookback_days if lookback_days > 0 else 0
             stock = sinfo["stock"]
             coverage_days = stock / v_per_day if v_per_day > 0 else (9999 if stock > 0 else 0)
             rows.append({
@@ -479,7 +479,7 @@ def register(mcp) -> None:  # noqa: ANN001
         recommendations = []
         for vid, vinfo in variant_info.items():
             v_total = velocity.get(vid, 0)
-            v_per_day = v_total / lookback_days
+            v_per_day = v_total / lookback_days if lookback_days > 0 else 0
             if v_per_day < 0.05:  # ignorar variantes muertas
                 continue
             stock = stock_total.get(vid, 0)
@@ -674,10 +674,17 @@ def register(mcp) -> None:  # noqa: ANN001
             if not cid:
                 continue
             amount = doc_revenue_signed(doc)
-            emit_ts = doc.get("emissionDate", 0)
-            if emit_ts and emit_ts > client_rfm[cid]["last_purchase_ts"]:
-                client_rfm[cid]["last_purchase_ts"] = emit_ts
-            client_rfm[cid]["frequency"] += 1
+            # Una nota de credito (use=1) RESTA plata pero NO es una compra:
+            # no suma frecuencia ni mueve la recencia. Sin esto, un cliente
+            # que devolvio ayer salia como Champion con 1 dia de recencia y
+            # se le mandaba campana. El _fast ya lo hacia asi
+            # (count().filter(document_type_use != 1)).
+            es_nc = (doc.get("document_type") or {}).get("use") == 1
+            if not es_nc:
+                emit_ts = doc.get("emissionDate", 0)
+                if emit_ts and emit_ts > client_rfm[cid]["last_purchase_ts"]:
+                    client_rfm[cid]["last_purchase_ts"] = emit_ts
+                client_rfm[cid]["frequency"] += 1
             client_rfm[cid]["monetary"] += amount
             client_rfm[cid]["name"] = (
                 f"{client_ref.get('firstName', '')} {client_ref.get('lastName', '')}".strip()

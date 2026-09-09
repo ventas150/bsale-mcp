@@ -245,6 +245,8 @@ def register(mcp) -> None:  # noqa: ANN001
         product_revenue: dict[str, float] = defaultdict(float)
         product_names: dict[str, str] = {}
 
+        docs_con_lineas_truncadas = 0
+        docs_con_error = 0
         for doc in docs:
             doc_id = doc.get("id")
             if not doc_id:
@@ -252,11 +254,20 @@ def register(mcp) -> None:  # noqa: ANN001
             doctype = doc.get("document_type") or {}
             sign = -1.0 if doctype.get("use") == 1 else 1.0
             try:
-                details = client.get(
+                # Paginado, NO un GET suelto con limit=50: una factura
+                # institucional a una clinica trae 100-200 lineas (uniformes por
+                # talla y color) y con el GET suelto solo entraban las primeras
+                # 50 al ranking. Es el mismo bug que se arreglo en
+                # snapshot_details; aqui seguia vivo en el tool que decide que
+                # se repone. workers=1 para no anidar pools.
+                fetch_det = client.paginated_fetch(
                     f"/v1/documents/{doc_id}/details.json",
                     params={"limit": 50, "expand": "[variant,product]"},
+                    max_items=2000, workers=1,
                 )
-                for detail in details.get("items", []):
+                if fetch_det.get("truncated"):
+                    docs_con_lineas_truncadas += 1
+                for detail in fetch_det.get("items", []):
                     variant = detail.get("variant") or {}
                     code = variant.get("code") or f"variant_{variant.get('id', '?')}"
                     qty = float(detail.get("quantity", 0) or 0) * sign
@@ -265,6 +276,7 @@ def register(mcp) -> None:  # noqa: ANN001
                     product_revenue[code] += amount
                     product_names[code] = variant.get("description") or "Sin nombre"
             except Exception:  # noqa: BLE001
+                docs_con_error += 1
                 continue
 
         top = [
@@ -280,6 +292,9 @@ def register(mcp) -> None:  # noqa: ANN001
         return {
             "period": {"start": start_date, "end": end_date},
             "documentos_de_venta_analizados": len(docs),
+            "documentos_con_lineas_truncadas": docs_con_lineas_truncadas,
+            "documentos_sin_detalle_por_error": docs_con_error,
+            "unidad_revenue": "CLP bruto con IVA (totalAmount de la linea), NC restadas",
             "top_products": top,
             **_truncation_note(fetch),
         }

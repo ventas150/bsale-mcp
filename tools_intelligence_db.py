@@ -55,8 +55,28 @@ def _stock_de_variantes(
     cuando es. La regla de la casa es que un numero que no declara su cobertura
     es un numero que miente, y aca la cobertura es temporal.
     """
+    # Una variante que NO esta en la tabla NO es una variante con stock 0.
+    # Con la foto a medias (corrida cancelada, variante creada despues de la
+    # ultima foto) el camino viejo la saltaba; devolverla como 0 hace que el
+    # briefing invente quiebres y la proyeccion invente compras. Por eso el
+    # dict solo trae las que tienen fila, y las ausentes van declaradas en
+    # stock_meta["variantes_sin_dato"]: el llamador las salta.
+    meta: dict[str, Any] = {
+        "fuente": "stock_actual (Postgres)",
+        "variantes_pedidas": len(vids),
+        "variantes_con_fila": 0,
+        "variantes_sin_dato": [],
+        "actualizado_desde": None,
+        "nota": (
+            "Stock leido del snapshot, no de Bsale en vivo: 0 llamadas a la API "
+            "en vez de una por variante. La cuota de Bsale es compartida con "
+            "Loadingplay y la app de documentos. Las variantes sin fila en el "
+            "snapshot se SALTAN, no se cuentan como 0. Para el numero al "
+            "segundo, pasar stock_live=True."
+        ),
+    }
     if not vids:
-        return {}, {"fuente": "stock_actual", "variantes": 0, "actualizado": None}
+        return {}, meta
 
     stmt = select(
         stock_actual.c.variant_id,
@@ -79,19 +99,24 @@ def _stock_de_variantes(
             if row.updated_at is not None and (mas_viejo is None or row.updated_at < mas_viejo):
                 mas_viejo = row.updated_at
 
-    meta = {
-        "fuente": "stock_actual (Postgres)",
-        "variantes_pedidas": len(vids),
-        "variantes_con_stock": len(por_variante),
-        "actualizado_desde": mas_viejo.isoformat() if mas_viejo else None,
-        "nota": (
-            "Stock leido del snapshot, no de Bsale en vivo: 0 llamadas a la API "
-            "en vez de una por variante. La cuota de Bsale es compartida con "
-            "Loadingplay y la app de documentos. Para el numero al segundo, "
-            "pasar stock_live=True."
-        ),
-    }
+    meta["variantes_con_fila"] = len(por_variante)
+    meta["variantes_sin_dato"] = [v for v in vids if v not in por_variante]
+    meta["actualizado_desde"] = mas_viejo.isoformat() if mas_viejo else None
     return dict(por_variante), meta
+
+
+def _meta_stock_live(vids: list[int]) -> dict[str, Any]:
+    """stock_meta con la MISMA forma que el camino snapshot, para que un
+    consumidor no reviente segun el camino. La frescura es 'ahora'."""
+    return {
+        "fuente": "Bsale en vivo",
+        "variantes_pedidas": len(vids),
+        "variantes_con_fila": None,
+        "variantes_sin_dato": [],
+        "actualizado_desde": datetime.now(timezone.utc).isoformat(),
+        "llamadas_api": len(vids),
+        "nota": "Una llamada a la API por variante, contra la cuota compartida.",
+    }
 
 
 def _service_variant_ids_subquery():
@@ -256,6 +281,10 @@ def register(mcp) -> None:  # noqa: ANN001
                 snapshot, que el resultado declara en stock_meta.
         """
         now = datetime.now(timezone.utc)
+        if lookback_days <= 0:
+            return {"aplicado": False,
+                    "motivo": "lookback_days tiene que ser mayor que 0 "
+                              f"(recibido {lookback_days})."}
         lookback_cutoff = now - timedelta(days=lookback_days)
 
         # velocity firmada: las notas de credito (use=1) restan unidades
@@ -295,7 +324,7 @@ def register(mcp) -> None:  # noqa: ANN001
         vids = [r.variant_id for r in vel_rows]
         snap: dict[int, dict[int, dict[str, Any]]] = {}
         if stock_live:
-            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+            stock_meta = _meta_stock_live(vids)
         else:
             snap, stock_meta = _stock_de_variantes(vids, office_id)
 
@@ -303,6 +332,8 @@ def register(mcp) -> None:  # noqa: ANN001
         risks = []
         for r in vel_rows:
             vid = r.variant_id
+            if not stock_live and vid not in snap:
+                continue  # sin dato NO es cero: va declarado en stock_meta
             if stock_live:
                 try:
                     stock_params = {"variantid": vid, "limit": 50, "expand": "[office]"}
@@ -377,6 +408,10 @@ def register(mcp) -> None:  # noqa: ANN001
         miles de docs). Stock siempre actualizado, velocity precalculada.
         """
         now = datetime.now(timezone.utc)
+        if lookback_days <= 0:
+            return {"aplicado": False,
+                    "motivo": "lookback_days tiene que ser mayor que 0 "
+                              f"(recibido {lookback_days})."}
         lookback_cutoff = now - timedelta(days=lookback_days)
 
         # 1. Stock LIVE de Bsale (1 API call - rapido y siempre actualizado)
@@ -485,6 +520,10 @@ def register(mcp) -> None:  # noqa: ANN001
         vivo; el resultado declara siempre cual se uso y de cuando es el dato.
         """
         now = datetime.now(timezone.utc)
+        if lookback_days <= 0:
+            return {"aplicado": False,
+                    "motivo": "lookback_days tiene que ser mayor que 0 "
+                              f"(recibido {lookback_days})."}
         lookback_cutoff = now - timedelta(days=lookback_days)
 
         qty = signed_amount(
@@ -519,7 +558,7 @@ def register(mcp) -> None:  # noqa: ANN001
         vids = [r.variant_id for r in vel_rows]
         snap: dict[int, dict[int, dict[str, Any]]] = {}
         if stock_live:
-            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+            stock_meta = _meta_stock_live(vids)
         else:
             snap, stock_meta = _stock_de_variantes(vids)
 
@@ -527,6 +566,8 @@ def register(mcp) -> None:  # noqa: ANN001
         recs = []
         for r in vel_rows:
             vid = r.variant_id
+            if not stock_live and vid not in snap:
+                continue  # sin dato NO es cero: seria una compra inventada
             if stock_live:
                 try:
                     stock_data = client.get(
@@ -604,6 +645,10 @@ def register(mcp) -> None:  # noqa: ANN001
             Lista de SKUs sobrestockeados con capital_tied calculado.
         """
         now = datetime.now(timezone.utc)
+        if lookback_days <= 0:
+            return {"aplicado": False,
+                    "motivo": "lookback_days tiene que ser mayor que 0 "
+                              f"(recibido {lookback_days})."}
         lookback_cutoff = now - timedelta(days=lookback_days)
 
         qty = signed_amount(
@@ -644,7 +689,7 @@ def register(mcp) -> None:  # noqa: ANN001
         vids = [r.variant_id for r in vel_rows]
         snap: dict[int, dict[int, dict[str, Any]]] = {}
         if stock_live:
-            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+            stock_meta = _meta_stock_live(vids)
         else:
             snap, stock_meta = _stock_de_variantes(vids)
 
@@ -1014,9 +1059,11 @@ def register(mcp) -> None:  # noqa: ANN001
         compras_urgentes = []
         for r in top_vel:
             vid = r.variant_id
+            if vid not in snap_briefing:
+                continue  # sin dato NO es cero: seria un quiebre inventado
             vtot = float(r.units or 0)
             vpd = vtot / 30
-            stock_total = sum(d["stock"] for d in snap_briefing.get(vid, {}).values())
+            stock_total = sum(d["stock"] for d in snap_briefing[vid].values())
 
             days_to_stockout = stock_total / vpd if vpd > 0 else 9999
             if days_to_stockout <= 14:

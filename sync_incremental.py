@@ -267,7 +267,14 @@ def sync_ventas() -> dict[str, Any]:
     # El docstring de snapshot_documents ya decia "NO bajar a 1"; el arreglo de
     # los 14 dias se habia aplicado a nightly_snapshot(), que ningun cron corre.
     # El upsert es por document_id, asi que releer dias ya cargados no duplica.
-    out["documents"] = snapshot_documents(days_back=14, max_pages=600)
+    #
+    # Y 30, NO 14: la boleta 1273799 tiene emissionDate 18-jul y
+    # generationDate 05-ago, DIECIOCHO dias de desfase. Con 14 quedaba fuera,
+    # y como hist_end() relee cada mes cerrado una sola vez (el 1 del
+    # siguiente), julio no se volvia a mirar jamas. 30 dias son ~7.200
+    # documentos a ~1 s por pagina de 50: ~2,5 min mas por corrida, contra
+    # perder plata para siempre. max_pages sube en proporcion.
+    out["documents"] = snapshot_documents(days_back=30, max_pages=1000)
     # Ventana de 90 dias: cada corrida procesa hasta 400 documentos sin detalle,
     # asi el cron va completando el backlog historico de ~90 dias por si solo
     # (de lo mas reciente a lo mas viejo). Cuando esta al dia, solo mantiene lo nuevo.

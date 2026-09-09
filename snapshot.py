@@ -525,11 +525,22 @@ def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
     client = get_client()
     snapshot_ts = datetime.now(timezone.utc)
 
-    items = client.paginated_get(
+    # paginated_fetch y no paginated_get: este catalogo alimenta
+    # _service_variant_ids_subquery(). Un catalogo cortado en silencio hace
+    # que los servicios (unlimitedStock=1) no se reconozcan y se cuelen en
+    # quiebres y proyeccion de compras como si fueran scrubs.
+    fetch = client.paginated_fetch(
         "/v1/variants.json",
         params={"limit": 50},
-        max_pages=max_pages,
+        max_items=max_pages * 50,
     )
+    items = fetch["items"]
+    if fetch.get("truncated"):
+        logger.error(
+            "snapshot_variants TRUNCADO: %s de %s (faltan %s). El catalogo queda "
+            "incompleto y los servicios pueden colarse en quiebres.",
+            fetch.get("fetched"), fetch.get("total_count"), fetch.get("faltantes"),
+        )
 
     rows = []
     seen = set()
@@ -559,7 +570,14 @@ def snapshot_variants(max_pages: int = 100) -> dict[str, Any]:
                 stmt = stmt.on_conflict_do_nothing(index_elements=["snapshot_date", "variant_id"])
                 s.execute(stmt)
 
-    return {"snapshot_ts": snapshot_ts.isoformat(), "rows": len(rows)}
+    return {
+        "snapshot_ts": snapshot_ts.isoformat(),
+        "rows": len(rows),
+        "count_bsale": fetch.get("total_count"),
+        "truncado": bool(fetch.get("truncated")),
+        # Clave *_error para que recolectar_errores() pinte la corrida.
+        **({"variants_error": "catalogo truncado"} if fetch.get("truncated") else {}),
+    }
 
 
 def snapshot_details(

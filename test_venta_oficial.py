@@ -858,38 +858,43 @@ def _solo_codigo(src: str) -> str:
     asserts sobre codigo que SI estaba presente daban falso.
 
     Ahora se tokeniza y se blanquea por posicion, que es exacto.
+
+    Segunda trampa, encontrada el 09-sep-2026: inspect.getsource de cualquier
+    @mcp.tool viene INDENTADO (todos viven dentro de register()), ast.parse
+    tiraba IndentationError, el except lo tragaba y los docstrings NO se
+    borraban, sin aviso. Un test sobre un tool anidado probaba el docstring.
+    Ahora se hace dedent y un fuente que no parsea hace FALLAR el test en vez
+    de pasar sobre texto sin filtrar.
     """
     import ast
     import io
+    import textwrap
     import tokenize
 
+    src = textwrap.dedent(src)
     lineas = src.splitlines(keepends=True)
     borrar = []
 
-    try:
-        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-            if tok.type == tokenize.COMMENT:
-                borrar.append((tok.start, tok.end))
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        pass
+    # Sin try/except: un fuente que no tokeniza o no parsea es un error del
+    # test, no algo que se tapa. Antes se tragaba y el filtro no filtraba.
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            borrar.append((tok.start, tok.end))
 
-    try:
-        arbol = ast.parse(src)
-        contenedores = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-        for n in ast.walk(arbol):
-            if not isinstance(n, contenedores):
-                continue
-            cuerpo = getattr(n, "body", None)
-            if (
-                cuerpo
-                and isinstance(cuerpo[0], ast.Expr)
-                and isinstance(cuerpo[0].value, ast.Constant)
-                and isinstance(cuerpo[0].value.value, str)
-            ):
-                c = cuerpo[0].value
-                borrar.append(((c.lineno, c.col_offset), (c.end_lineno, c.end_col_offset)))
-    except SyntaxError:
-        pass
+    arbol = ast.parse(src)
+    contenedores = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for n in ast.walk(arbol):
+        if not isinstance(n, contenedores):
+            continue
+        cuerpo = getattr(n, "body", None)
+        if (
+            cuerpo
+            and isinstance(cuerpo[0], ast.Expr)
+            and isinstance(cuerpo[0].value, ast.Constant)
+            and isinstance(cuerpo[0].value.value, str)
+        ):
+            c = cuerpo[0].value
+            borrar.append(((c.lineno, c.col_offset), (c.end_lineno, c.end_col_offset)))
 
     # De atras hacia adelante, para que borrar no corra los offsets restantes.
     for (l1, c1), (l2, c2) in sorted(borrar, reverse=True):
@@ -1549,19 +1554,25 @@ def test_el_secreto_de_la_url_no_se_escribe_en_el_log_de_acceso():
 
 
 # ------------------------------------------- 2. ventana de documentos y HIST_END
-def test_el_cron_mira_catorce_dias_no_dos():
-    """La boleta 1280257: emitida el 03-sep, generada el 07-sep.
+def test_el_cron_mira_treinta_dias_no_catorce_ni_dos():
+    """La boleta 1280257: emitida el 03-sep, generada el 07-sep (4 dias).
+    La boleta 1273799: emitida el 18-jul, generada el 05-ago (18 dias).
 
-    Con la ventana de 2 dias nunca entro al snapshot ($101.970). El arreglo de
-    los 14 dias existia, pero en nightly_snapshot(), que ningun cron corre.
+    Con 2 dias se perdio la primera ($101.970). Con 14 se perdia la segunda,
+    y el comentario que fijaba los 14 citaba justamente ese caso de 18. Como
+    hist_end() relee cada mes cerrado UNA sola vez, lo que la ventana no
+    alcanza se pierde para siempre. La ventana tiene que cubrir el peor
+    desfase visto con margen: 30.
     """
     import inspect
+    import re
 
     sync = pytest.importorskip("sync_incremental")
     codigo = _solo_codigo(inspect.getsource(sync.sync_ventas))
 
-    assert "days_back=14" in codigo
-    assert "days_back=2" not in codigo
+    m = re.search(r"snapshot_documents\(days_back=(\d+)", codigo)
+    assert m, "sync_ventas tiene que llamar snapshot_documents(days_back=N)"
+    assert int(m.group(1)) >= 30, f"days_back={m.group(1)} no cubre los 18 dias de la 1273799"
 
 
 def test_el_backfill_historico_no_se_cierra_para_siempre(monkeypatch):
@@ -2230,3 +2241,265 @@ def test_las_cuatro_escrituras_de_stock_respetan_el_candado(monkeypatch):
     assert r["aplicado"] is False
 
     assert cli.llamadas == [], "ninguna escritura de stock puede llegar a Bsale"
+
+
+# ===========================================================================
+# Segunda auditoria, 09-sep-2026 — Lote 1
+# ===========================================================================
+
+def test_render_yaml_no_reabre_ningun_candado():
+    """render.yaml declaraba BSALE_STOCK_WRITES_ENABLED: "1". El codigo habia
+    pasado a "0" el mismo dia, con dos tests que lo fijaban, pero ningun test
+    miraba el yaml, que es lo que Render aplica. Sincronizar el blueprint
+    (que es lo que DEPLOY.md manda para montar el disco) reabria las cuatro
+    escrituras de stock por un camino que nadie relaciona con escritura."""
+    import os
+    import re
+
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(aqui, "render.yaml"), encoding="utf-8") as fh:
+        yaml_src = fh.read()
+
+    for var in ("BSALE_PRICE_WRITES_ENABLED", "BSALE_STOCK_WRITES_ENABLED",
+                "BSALE_CATALOG_WRITES_ENABLED"):
+        m = re.search(r"key:\s*" + var + r"\s*\n\s*value:\s*\"?(\w+)\"?", yaml_src)
+        assert m, f"{var} tiene que estar declarada en render.yaml, en 0"
+        assert m.group(1) == "0", f"render.yaml declara {var}={m.group(1)}: sincronizar el blueprint reabre el candado"
+
+
+class _SesionStockFalsa:
+    """Emula db.session() para _stock_de_variantes: devuelve filas de stock_actual."""
+
+    def __init__(self, filas):
+        self.filas = filas
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt):
+        from datetime import datetime, timezone
+        Row = type("Row", (), {})
+        out = []
+        for vid, oid, q in self.filas:
+            r = Row()
+            r.variant_id, r.office_id, r.quantity = vid, oid, q
+            r.office_name, r.updated_at = f"suc{oid}", datetime(2026, 9, 8, tzinfo=timezone.utc)
+            out.append(r)
+        return out
+
+
+def test_una_variante_ausente_del_snapshot_no_es_stock_cero(monkeypatch):
+    """Bug del commit 680d19c: snap.get(vid, {}) daba {} y sum({}) es 0.0,
+    indistinguible de un cero real. Con la foto a medias, el briefing
+    inventaba quiebres y la proyeccion inventaba compras. El camino viejo
+    (una llamada a la API por variante) saltaba la variante ante un error.
+    Ahora la ausente NO esta en el dict y va declarada en stock_meta."""
+    tdb = pytest.importorskip("tools_intelligence_db")
+    monkeypatch.setattr(tdb, "db_session", lambda: _SesionStockFalsa([(7, 1, 5.0), (7, 2, 0.0)]))
+
+    snap, meta = tdb._stock_de_variantes([7, 99])
+
+    assert 7 in snap and snap[7][1]["stock"] == 5.0
+    assert 99 not in snap, "la ausente no puede aparecer como {} (= stock 0)"
+    assert meta["variantes_sin_dato"] == [99]
+    assert meta["variantes_con_fila"] == 1
+    assert meta["actualizado_desde"].startswith("2026-09-08")
+
+
+def test_los_tres_tools_saltan_la_variante_sin_dato():
+    """Que el helper la excluya no sirve si el tool hace snap.get(vid, {})."""
+    import inspect
+
+    tdb = pytest.importorskip("tools_intelligence_db")
+    src = _solo_codigo(inspect.getsource(tdb.register))
+    # Los tres sitios que interpretan 0 como "compra ya"
+    assert src.count("vid not in snap") >= 2, "quiebres y proyeccion tienen que saltar la ausente"
+    assert "vid not in snap_briefing" in src, "el briefing tiene que saltar la ausente"
+    assert "snap_briefing.get(vid, {})" not in src, "el briefing no puede tratar la ausente como {}"
+
+
+def test_stock_meta_tiene_la_misma_forma_por_los_dos_caminos(monkeypatch):
+    """Tres formas distintas de stock_meta segun el camino: un consumidor que
+    lea variantes_pedidas reventaba con lista vacia, y el camino live -el que
+    existe para cuando la frescura importa- no declaraba ninguna frescura."""
+    tdb = pytest.importorskip("tools_intelligence_db")
+    monkeypatch.setattr(tdb, "db_session", lambda: _SesionStockFalsa([]))
+
+    _, vacia = tdb._stock_de_variantes([])
+    _, snapshot = tdb._stock_de_variantes([1])
+    live = tdb._meta_stock_live([1, 2])
+
+    claves = {"fuente", "variantes_pedidas", "variantes_con_fila", "variantes_sin_dato",
+              "actualizado_desde", "nota"}
+    for m in (vacia, snapshot, live):
+        assert claves <= set(m), f"faltan claves: {claves - set(m)}"
+    assert live["actualizado_desde"] is not None, "el camino live tiene que declarar frescura"
+
+
+def test_recepcionar_sin_costo_se_bloquea(monkeypatch):
+    """Una recepcion sin cost entra a costo 0 y arrastra el costo promedio para
+    siempre. ajustar_stock ya lo exigia; recepcionar lo dejaba pasar."""
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(1, 1): 10.0})
+
+    r = tools["bsale_recepcionar_stock"](variant_id=1, office_id=1, quantity=5)
+    assert r["aplicado"] is False and "costo 0" in r["bloqueado_por"]
+    assert cli.llamadas == []
+
+    r = tools["bsale_recepcionar_stock"](variant_id=1, office_id=1, quantity=5, cost=9500)
+    assert r["aplicado"] is True
+    assert cli.llamadas[0][2]["details"][0]["cost"] == 9500.0
+
+
+def test_el_traspaso_recepciona_con_costo_o_no_recepciona(monkeypatch):
+    """El traspaso hacia consumo + recepcion SIN costo en destino: la operacion
+    rutinaria de las 11 tiendas contaminaba el costo promedio en cada
+    movimiento. Ahora lee el promedio de Bsale, y si no puede, se bloquea."""
+    import tools_writes as tw
+
+    monkeypatch.setenv("BSALE_STOCK_WRITES_ENABLED", "1")
+    tools, cli = _tools_de_escritura(monkeypatch, stock={(1, 1): 10.0})
+
+    # Sin costo y sin poder leerlo -> bloqueado, nada escrito.
+    monkeypatch.setattr(tw, "_costo_promedio_de", lambda c, v: None)
+    r = tools["bsale_crear_traspaso_stock"](variant_id=1, office_origin_id=1,
+                                           office_destination_id=2, quantity=3)
+    assert r["aplicado"] is False and "costo 0" in r["bloqueado_por"]
+    assert cli.llamadas == []
+
+    # Con costo leido de Bsale -> dos POST y la recepcion lo lleva.
+    monkeypatch.setattr(tw, "_costo_promedio_de", lambda c, v: 8200.0)
+    r = tools["bsale_crear_traspaso_stock"](variant_id=1, office_origin_id=1,
+                                           office_destination_id=2, quantity=3)
+    paths = [c[1] for c in cli.llamadas]
+    assert paths == ["/v1/stocks/consumptions.json", "/v1/stocks/receptions.json"]
+    assert cli.llamadas[1][2]["details"][0]["cost"] == 8200.0
+
+    # NaN e infinito: antes pasaban (NaN <= 0 es False).
+    for mala in (float("nan"), float("inf")):
+        cli.llamadas.clear()
+        r = tools["bsale_crear_traspaso_stock"](variant_id=1, office_origin_id=1,
+                                               office_destination_id=2, quantity=mala)
+        assert r["aplicado"] is False and cli.llamadas == []
+
+
+def test_validar_costo_rechaza_infinito():
+    """`c != c or c < 0` dejaba pasar inf: inf < 0 es False."""
+    g = pytest.importorskip("guardrails")
+    for mala in (float("inf"), float("-inf"), float("nan"), -1):
+        with pytest.raises(g.GuardrailError):
+            g.validar_costo(mala)
+    assert g.validar_costo(0) == 0.0 and g.validar_costo("9500") == 9500.0
+
+
+def test_paginado_declara_truncado_si_bsale_devuelve_menos_de_lo_que_dice():
+    """truncated se calculaba solo como total_count > max_items. Una pagina
+    del medio vacia -documentado: "Bsale bajo carga devuelve 200 con items
+    vacio, sin error"- pasaba como completa, y este fetch alimenta
+    snapshot_documents: el hueco quedaba en Postgres con cara de total."""
+    c = _client_con_paginas(total=396)
+    get_real = c.get
+
+    def get_con_hueco(path, params=None, use_cache=False):  # noqa: ANN001
+        r = get_real(path, params=params, use_cache=use_cache)
+        if int((params or {}).get("offset", 0)) == 100:
+            return {"count": 396, "items": []}  # pagina 3 vacia
+        return r
+
+    c.get = get_con_hueco  # type: ignore[method-assign]
+    r = c.paginated_fetch("/v1/documents.json", params={"limit": 50}, max_items=40000)
+    assert r["fetched"] == 346
+    assert r["truncated"] is True, "faltan 50 documentos y decia truncado: False"
+    assert r["faltantes"] == 50
+
+
+def test_paginado_declara_truncado_si_la_primera_pagina_viene_corta():
+    c = _client_con_paginas(total=396)
+
+    def get_corta(path, params=None, use_cache=False):  # noqa: ANN001
+        return {"count": 396, "items": [{"id": i} for i in range(30)]}
+
+    c.get = get_corta  # type: ignore[method-assign]
+    r = c.paginated_fetch("/v1/documents.json", params={"limit": 50}, max_items=40000)
+    assert r["truncated"] is True and r["faltantes"] == 366
+
+
+def test_el_backfill_historico_no_bota_el_flag_de_truncado():
+    """backfill.py seguia en paginated_get, que devuelve solo ["items"]. Es el
+    bug de los 4.101 documentos de marzo-2025, en el archivo que escribe el
+    historico. Lo mismo snapshot_variants, del que depende el filtro de
+    servicios."""
+    import inspect
+
+    bf = pytest.importorskip("backfill")
+    sn = pytest.importorskip("snapshot")
+    for fn in (bf.backfill_documents, sn.snapshot_variants):
+        src = _solo_codigo(inspect.getsource(fn))
+        assert "paginated_get(" not in src, f"{fn.__name__} sigue botando el flag de truncado"
+        assert "paginated_fetch(" in src
+        assert "truncated" in src, f"{fn.__name__} tiene que MIRAR el flag, no solo obtenerlo"
+
+
+def test_el_rfm_en_vivo_no_cuenta_la_nota_de_credito_como_compra(monkeypatch):
+    """Cliente con dos boletas y una NC: frequency 2, no 3, y la recencia es la
+    de la ultima boleta, no la de la devolucion. El _fast ya lo hacia asi; el
+    vivo marcaba Champion a alguien que devolvio ayer."""
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    src = _solo_codigo(inspect.getsource(ti.register))
+    # El monto sigue restando; frecuencia y recencia solo con documentos que no son NC.
+    assert "es_nc" in src and 'get("use") == 1' in src
+    i_nc = src.index("if not es_nc:")
+    i_freq = src.index('["frequency"] += 1')
+    i_mon = src.index('["monetary"] += amount')
+    assert i_nc < i_freq < i_mon, "frequency tiene que quedar dentro del if not es_nc, y monetary fuera"
+
+
+def test_lookback_days_cero_no_revienta():
+    """ZeroDivisionError en cinco tools con lookback_days=0, que el schema
+    acepta. El agente veia un 500 sin causa."""
+    import inspect
+
+    tdb = pytest.importorskip("tools_intelligence_db")
+    ti = pytest.importorskip("tools_intelligence")
+    src_db = _solo_codigo(inspect.getsource(tdb.register))
+    src_vivo = _solo_codigo(inspect.getsource(ti.register))
+    assert src_db.count("if lookback_days <= 0:") >= 4
+    assert "v_total / lookback_days\n" not in src_vivo, "division sin guardia en el vivo"
+    assert src_vivo.count("/ lookback_days if lookback_days > 0 else 0") >= 3
+
+
+def test_top_productos_pagina_el_detalle_de_cada_documento():
+    """Un GET suelto con limit=50 por documento dejaba fuera del ranking las
+    lineas 51+ de las facturas institucionales, que son justo las largas."""
+    import inspect
+
+    ta = pytest.importorskip("tools_analytics")
+    src = _solo_codigo(inspect.getsource(ta.register))
+    i = src.index("def bsale_top_productos")
+    j = src.index("def bsale_comparativo_meses")
+    cuerpo = src[i:j]
+    assert "paginated_fetch(" in cuerpo and "/details.json" in cuerpo
+    assert 'client.get(\n                    f"/v1/documents/{doc_id}/details.json"' not in cuerpo
+    assert "documentos_con_lineas_truncadas" in cuerpo
+
+
+def test_solo_codigo_funciona_sobre_un_tool_anidado():
+    """inspect.getsource de un @mcp.tool viene indentado; ast.parse tiraba
+    IndentationError y el except lo tragaba: los docstrings no se borraban.
+    "adjustments.json" solo esta en el docstring de bsale_ajustar_stock."""
+    import inspect
+
+    tw = pytest.importorskip("tools_writes")
+    src_register = inspect.getsource(tw.register)
+    i = src_register.index("    def bsale_ajustar_stock")
+    j = src_register.index("    @mcp.tool()", i)
+    fuente_tool = src_register[i:j]  # viene con 4 espacios de indentacion
+    assert "adjustments.json" in fuente_tool  # esta en el docstring
+    assert "adjustments.json" not in _solo_codigo(fuente_tool), (
+        "_solo_codigo tiene que borrar el docstring aunque el fuente venga indentado"
+    )

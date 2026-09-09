@@ -117,7 +117,24 @@ def backfill_documents(desde: date, hasta: date | None = None) -> dict[str, Any]
         }
         # 400 paginas = 20.000 docs/mes. Con 80 (4.000) cortaba cada mes a la
         # mitad en silencio: el promedio real de MyScrubs es ~7.200 docs/mes.
-        docs = client.paginated_get("/v1/documents.json", params=params, max_pages=400)
+        #
+        # paginated_fetch, no paginated_get: el segundo devuelve solo ["items"]
+        # y BOTA el flag de truncado. Era literalmente el bug de los 4.101
+        # documentos de marzo-2025, vivo en el archivo que escribe el
+        # historico de plata. Un mes truncado ahora aborta el backfill en vez
+        # de seguir al siguiente con el hueco adentro.
+        fetch = client.paginated_fetch("/v1/documents.json", params=params, max_items=400 * 50)
+        if fetch.get("truncated"):
+            msg = (
+                f"Mes {start_iso}..{end_iso} TRUNCADO: bajados {fetch.get('fetched')} de "
+                f"{fetch.get('total_count')} (faltan {fetch.get('faltantes')}). "
+                "No se sigue al mes siguiente: un hueco en el historico no se "
+                "vuelve a mirar nunca."
+            )
+            logger.error(msg)
+            return {"documentos_total": total, "desde": desde.isoformat(),
+                    "hasta": hasta.isoformat(), "truncado_en": start_iso, "error": msg}
+        docs = fetch["items"]
         rows = []
         for doc in docs:
             if not is_sales_doc(doc):  # excluye guías (use=2)

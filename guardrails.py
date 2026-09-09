@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import threading
@@ -117,7 +118,12 @@ def validar_costo(cost) -> float:
         c = float(cost)
     except (TypeError, ValueError):
         raise GuardrailError(f"cost no es numerico: {cost!r}. No se escribio nada.")
-    if c != c or c < 0:
+    # math.isfinite cubre NaN e infinito de una vez. Antes era `c != c or c < 0`,
+    # que dejaba pasar inf: `inf < 0` es False. validar_cantidad si lo cubria,
+    # y eran la misma familia de validadores con dos criterios.
+    if not math.isfinite(c):
+        raise GuardrailError(f"cost no es un numero valido: {cost!r}. No se escribio nada.")
+    if c < 0:
         raise GuardrailError(f"cost no puede ser negativo (llego {cost!r}). No se escribio nada.")
     return c
 

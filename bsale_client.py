@@ -487,7 +487,11 @@ class BsaleClient:
                 "items": items[:target] if target else items,
                 "total_count": total_count,
                 "fetched": min(len(items), target) if target else len(items),
-                "truncated": bool(total_count > max_items or total_desconocido),
+                # Una primera pagina corta con count grande es un hueco, no un
+                # final: Bsale bajo carga devuelve 200 con menos items sin error.
+                "truncated": bool(total_count > max_items or total_desconocido
+                                  or len(items) < target),
+                "faltantes": max(0, target - len(items)),
                 "total_count_desconocido": total_desconocido,
                 "pages": 1,
             }
@@ -515,7 +519,14 @@ class BsaleClient:
             "items": merged[:target],
             "total_count": total_count,
             "fetched": min(len(merged), target),
-            "truncated": bool(total_count > max_items or total_desconocido),
+            # Comparar lo bajado contra lo declarado. Sin esto una pagina del
+            # medio vacia (documentado: "Bsale bajo carga devuelve 200 con items
+            # vacio, sin error") pasaba como completa, y este mismo fetch
+            # alimenta snapshot_documents: el hueco quedaba en Postgres con
+            # cara de total.
+            "truncated": bool(total_count > max_items or total_desconocido
+                              or len(merged) < target),
+            "faltantes": max(0, target - len(merged)),
             "total_count_desconocido": total_desconocido,
             "pages": len(pages),
         }
