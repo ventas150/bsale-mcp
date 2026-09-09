@@ -3616,3 +3616,247 @@ def test_requirements_txt_es_el_lock_de_requirements_in():
         "falta backports-tarfile con marcador: el lock no es universal y el web service (3.11) no compila"
     )
     assert "apscheduler" not in lock.lower(), "dependencia muerta"
+
+
+# ===========================================================================
+# 09-sep-2026 (tarde) — tools compactos para el cruce con Shopify
+# ===========================================================================
+
+class _SesionStock:
+    """Responde el select de stock_actual con filas fijas y el sync_estado."""
+
+    def __init__(self, filas, completo=True):
+        self.filas, self.completo, self.consultas = filas, completo, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        filas, completo = self.filas, self.completo
+        self.consultas.append(str(stmt))
+
+        class R:
+            def scalar(self_):
+                return {"completo": completo}
+
+            def fetchall(self_):
+                return filas
+
+        return R()
+
+
+class _ClienteStock:
+    def __init__(self):
+        self.llamadas = []
+
+    def get(self, path, params=None, **k):
+        self.llamadas.append((path, dict(params or {})))
+        if path == "/v1/variants.json":
+            return {"items": [{"id": 9928, "code": params["code"]}]}
+        return {"count": 2, "items": [
+            {"quantity": 10, "office": {"id": 4, "name": "Outlet "}},
+            {"quantity": 237, "office": {"id": 1, "name": "E-Commerce "}},
+        ]}
+
+
+def test_stock_variante_lee_el_snapshot_compacto_y_sin_bsale(monkeypatch):
+    from datetime import datetime, timezone
+    import tools_stocks as tst
+    import db as _db
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    t0 = datetime(2026, 9, 9, 7, 2, tzinfo=timezone.utc)
+    sesion = _SesionStock([
+        _Fila(variant_id=9928, variant_code="724841188979", office_id=1, office_name="E-Commerce ", quantity=237.0, updated_at=t0),
+        _Fila(variant_id=9928, variant_code="724841188979", office_id=4, office_name="Outlet ", quantity=11.0, updated_at=t0),
+    ])
+    monkeypatch.setattr(_db, "session", lambda: sesion)
+    cli = _ClienteStock()
+    monkeypatch.setattr(tst, "get_client", lambda: cli)
+
+    r = _tools_de(tst)["bsale_stock_variante"](code="724841188979")
+
+    assert cli.llamadas == [], "el default no puede pegarle a Bsale"
+    assert r["variant_id"] == 9928 and r["total_unidades"] == 248.0
+    assert r["sucursales"] == [
+        {"office_id": 1, "office_name": "E-Commerce", "quantity": 237.0},
+        {"office_id": 4, "office_name": "Outlet", "quantity": 11.0},
+    ]
+    assert r["actualizado_desde"] == t0.isoformat() and r["ultima_corrida_completa"] is True
+    assert "stock_actual.variant_code =" in sesion.consultas[-1]
+
+
+def test_stock_variante_ausente_no_es_cero(monkeypatch):
+    import tools_stocks as tst
+    import db as _db
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.setattr(_db, "session", lambda: _SesionStock([]))
+    r = _tools_de(tst)["bsale_stock_variante"](variant_id=424242)
+    assert "error" in r and "sucursales" not in r and "total_unidades" not in r
+    assert "error" in _tools_de(tst)["bsale_stock_variante"]()
+
+
+def test_stock_variante_en_vivo_resuelve_el_code_y_compacta(monkeypatch):
+    import tools_stocks as tst
+
+    cli = _ClienteStock()
+    monkeypatch.setattr(tst, "get_client", lambda: cli)
+    r = _tools_de(tst)["bsale_stock_variante"](code="724841188979", stock_live=True)
+    assert [p for p, _ in cli.llamadas] == ["/v1/variants.json", "/v1/stocks.json"]
+    assert cli.llamadas[1][1]["variantid"] == 9928
+    assert r["sucursales"][0] == {"office_id": 1, "office_name": "E-Commerce", "quantity": 237.0}
+    assert r["total_unidades"] == 247.0 and r["truncado"] is False
+
+
+def _doc_pesado(id_, office_id=4, sales_id=None, use=0, type_id=1, gen=1788971408):
+    return {
+        "id": id_, "number": 612420, "emissionDate": 1788912000, "generationDate": gen,
+        "totalAmount": 23992, "netAmount": 20161, "state": 0, "salesId": sales_id,
+        "trackingNumber": "abc", "urlPublicView": "https://v", "urlPdf": "https://p",
+        "ted": "<TED>" + "x" * 800 + "</TED>", "urlTimbre": "t", "urlXml": "x",
+        "urlPublicViewOriginal": "o", "urlPdfOriginal": "po",
+        "document_type": {"id": type_id, "name": "BOLETA", "codeSii": "39", "use": use, "isSalesNote": 0,
+                          "messageBodyFormat": "<p>" + "y" * 2000 + "</p>", "thermalPrinter": 1},
+        "office": {"id": office_id, "name": "Outlet ", "address": "NUEVA DE LYON 45", "email": "o@m.cl"},
+        "coin": {"href": "c"}, "user": {"href": "u"}, "priceList": {"href": "p"},
+        "references": {"href": "r"}, "details": {"href": "d"},
+    }
+
+
+def test_documentos_compactos_sacan_el_html_y_el_ted_y_conservan_la_regla(monkeypatch):
+    import json
+    import tools_documents as td
+
+    pesado = _doc_pesado(1280456)
+    pesado_nc = _doc_pesado(1, use=1, type_id=9)
+
+    class Cli:
+        def get(self, path, params=None, **k):
+            return {"count": 2, "items": [pesado, pesado_nc]}
+
+    monkeypatch.setattr(td, "get_client", lambda: Cli())
+    tools = _tools_de(td)
+    r = tools["bsale_listar_documentos"](start_date="2026-09-09", end_date="2026-09-09")
+    d = r["items"][0]
+    assert "ted" not in d and "messageBodyFormat" not in d["document_type"] and "coin" not in d
+    assert d["salesId"] is None and d["urlPublicView"] == "https://v" and d["monto_firmado"] == 23992
+    assert d["office"] == {"id": 4, "name": "Outlet"}
+    assert d["document_type"]["use"] == 0 and d["document_type"]["isSalesNote"] == 0
+    assert "references" not in d, "un href solo no informa nada"
+    assert r["items"][1]["monto_firmado"] == -23992, "la NC se firmo ANTES de compactar"
+    assert len(json.dumps(d)) < len(json.dumps(pesado)) / 5
+
+    crudo = tools["bsale_listar_documentos"](start_date="2026-09-09", end_date="2026-09-09", compacto=False)
+    assert "ted" in crudo["items"][0] and "messageBodyFormat" in crudo["items"][0]["document_type"]
+
+
+def test_obtener_documento_compacto_conserva_lineas_y_cliente(monkeypatch):
+    import tools_documents as td
+
+    doc = _doc_pesado(1280457)
+    doc["details"] = {"href": "d", "items": [{"id": 1, "quantity": 1, "variant": {"id": 9928}}]}
+    doc["client"] = {"id": 95925, "firstName": "R"}
+
+    class Cli:
+        def get(self, path, params=None, **k):
+            return doc
+
+    monkeypatch.setattr(td, "get_client", lambda: Cli())
+    r = _tools_de(td)["bsale_obtener_documento"](document_id=1280457)
+    assert r["details"]["items"][0]["variant"]["id"] == 9928 and r["client"]["id"] == 95925
+    assert "ted" not in r and "messageBodyFormat" not in r["document_type"]
+
+
+class _ClienteCruce:
+    def __init__(self, docs, truncated=False):
+        self.docs, self.truncated, self.llamadas = docs, truncated, []
+
+    def paginated_fetch(self, path, params=None, max_items=None, **k):
+        self.llamadas.append((path, dict(params or {}), max_items))
+        return {"items": self.docs, "truncated": self.truncated, "total_count": len(self.docs), "fetched": len(self.docs)}
+
+
+def _pedido(nombre, *locs):
+    return {"id": "gid://shopify/Order/1", "name": nombre, "createdAt": "x",
+            "fulfillmentOrders": {"nodes": [
+                {"id": "gid://shopify/FulfillmentOrder/1",
+                 "assignedLocation": {"location": {"id": f"gid://shopify/Location/{l}", "name": n}}}
+                for l, n in locs]}}
+
+
+def test_cruce_boletas_vs_shopify_cuadra_por_sucursal(monkeypatch):
+    import tools_cruce_shopify as tc
+
+    # Bsale: 2 boletas web en E-Commerce, 1 web en Outlet, 1 de caja en Outlet, 1 NC
+    docs = [_doc_pesado(1, office_id=1, sales_id="73540330"), _doc_pesado(2, office_id=1, sales_id="73540331"),
+            _doc_pesado(3, office_id=4, sales_id="73540332"), _doc_pesado(4, office_id=4),
+            _doc_pesado(5, office_id=4, use=1, type_id=9), _doc_pesado(6, office_id=4, use=2, type_id=8)]
+    cli = _ClienteCruce(docs)
+    monkeypatch.setattr(tc, "get_client", lambda: cli)
+    # Shopify: 2 FO en Bodega, 1 en Outlet, 1 en una ubicacion desconocida
+    pedidos = [_pedido("#1", (104335016258, "Myscrubs Bodega")), _pedido("#2", (104335016258, "Myscrubs Bodega"), (117047886146, "Outlet")),
+               _pedido("#3", (999, "Rara"))]
+    monkeypatch.setenv("SHOPIFY_SHOP", "x.myshopify.com")
+    monkeypatch.setenv("SHOPIFY_ADMIN_TOKEN", "shpat")
+    vistos = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"orders": {"nodes": pedidos, "pageInfo": {"hasNextPage": False}}}}
+
+    def post(url, json=None, headers=None, timeout=None):
+        vistos.append((url, json["variables"], headers))
+        return Resp()
+
+    monkeypatch.setattr(tc.httpx, "post", post)
+
+    r = _tools_de(tc)["bsale_boletas_vs_shopify"](fecha="2026-09-09")
+
+    assert r["cruce_hecho"] is True and r["cuadra"] is True
+    por = {f["office_id"]: f for f in r["por_sucursal"]}
+    assert por[1]["boletas_con_salesId"] == 2 and por[1]["fo_shopify"] == 2 and por[1]["diferencia"] == 0
+    assert por[4]["boletas_con_salesId"] == 1 and por[4]["boletas_sin_salesId"] == 1 and por[4]["diferencia"] == 0
+    assert por[4]["notas_de_credito"] == 1, "la NC no entra en la comparacion pero se declara"
+    assert r["shopify"]["fo_sin_mapear"] == [{"pedido": "#3", "location_id": 999, "location": "Rara"}]
+    assert r["bsale"]["venta_oficial"] == 5, "la guia queda fuera"
+    # El query a Shopify cubre el dia de Chile (UTC-3 en septiembre) y solo pagados
+    url, variables, headers = vistos[0]
+    q = variables["q"]
+    assert "created_at:>='2026-09-09T03:00:00Z'" in q and "created_at:<'2026-09-10T03:00:00Z'" in q
+    assert "financial_status:paid" in q
+    assert url.startswith("https://x.myshopify.com/admin/api/") and headers["X-Shopify-Access-Token"] == "shpat"
+    # A Bsale le pidio el dia en epoch, vigentes, con tope
+    path, params, max_items = cli.llamadas[0]
+    assert path == "/v1/documents.json" and params["state"] == 0 and max_items == 2000
+
+
+def test_cruce_sin_token_entrega_solo_bsale_y_no_inventa_ceros(monkeypatch):
+    import tools_cruce_shopify as tc
+
+    monkeypatch.delenv("SHOPIFY_SHOP", raising=False)
+    monkeypatch.delenv("SHOPIFY_ADMIN_TOKEN", raising=False)
+    monkeypatch.setattr(tc, "get_client", lambda: _ClienteCruce([_doc_pesado(1, office_id=1, sales_id="1")]))
+    r = _tools_de(tc)["bsale_boletas_vs_shopify"](fecha="2026-09-09")
+    assert r["cruce_hecho"] is False and r["cuadra"] is None and "SHOPIFY" in r["motivo_sin_cruce"]
+    fila = r["por_sucursal"][0]
+    assert fila["boletas_con_salesId"] == 1 and fila["fo_shopify"] is None and fila["diferencia"] is None
+
+
+def test_cruce_detecta_la_boleta_que_falta(monkeypatch):
+    import tools_cruce_shopify as tc
+
+    monkeypatch.setattr(tc, "get_client", lambda: _ClienteCruce([_doc_pesado(1, office_id=1, sales_id="1")]))
+    monkeypatch.setattr(tc, "fulfillment_orders_shopify", lambda fecha: {
+        "disponible": True, "pedidos_pagados": 2, "fulfillment_orders": 2, "truncado": False,
+        "fo_por_office": {1: 2}, "fo_sin_mapear": []})
+    r = _tools_de(tc)["bsale_boletas_vs_shopify"](fecha="2026-09-09", incluir_documentos=True)
+    assert r["cuadra"] is False
+    assert r["por_sucursal"][0]["diferencia"] == -1
+    assert r["por_sucursal"][0]["documentos"][0]["generado"] == "13:30:08", "hora de Chile, para ver si es reciente"

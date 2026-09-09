@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 from bsale_client import get_client
@@ -78,12 +79,123 @@ def _stock_agregado_desde_snapshot(officeid: int | None) -> dict[str, Any]:
              "quantity": float(r.quantity or 0)}
             for r in peores
         ],
-        "nota": "Para el numero al segundo de UNA variante, bsale_listar_stock(variantid=...).",
+        "nota": "Para UNA variante por sucursal, bsale_stock_variante(code=...) (compacto; stock_live=True para el numero al segundo).",
+    }
+
+
+def _fila_compacta(office_id: int, office_name: str | None, quantity: Any) -> dict[str, Any]:
+    return {
+        "office_id": int(office_id),
+        "office_name": (office_name or "").strip(),
+        "quantity": float(quantity or 0),
+    }
+
+
+def _stock_variante_desde_snapshot(variant_id: int | None, code: str | None) -> dict[str, Any]:
+    """Las 11 filas de UNA variante desde stock_actual, sin llamar a Bsale.
+
+    Existe porque bsale_listar_stock(variantid=...) devuelve ~7.000 tokens
+    por variante: Bsale repite el objeto variant y el objeto office completos
+    en cada una de las 11 filas. Para "cuanto hay de esta talla en cada
+    tienda" bastan 11 pares (sucursal, cantidad). Es la consulta que hace la
+    conciliacion Bsale vs Shopify, y se hace muchas veces.
+    """
+    from sqlalchemy import select, text
+    from db import session as db_session, stock_actual
+
+    with db_session() as s:
+        try:
+            ultima = s.execute(text(
+                "select valor from sync_estado where clave = 'stock_ultima_corrida'"
+            )).scalar()
+        except Exception:  # noqa: BLE001
+            ultima = None
+        where = (stock_actual.c.variant_id == variant_id) if variant_id else (stock_actual.c.variant_code == code)
+        filas = s.execute(
+            select(stock_actual.c.variant_id, stock_actual.c.variant_code,
+                   stock_actual.c.office_id, stock_actual.c.office_name,
+                   stock_actual.c.quantity, stock_actual.c.updated_at)
+            .where(where).order_by(stock_actual.c.office_id)
+        ).fetchall()
+
+    if not filas:
+        return {
+            "fuente": "stock_actual (Postgres)",
+            "error": f"sin filas en el snapshot para {'variant_id=' + str(variant_id) if variant_id else 'code=' + str(code)}",
+            "nota": "Ausente NO es cero: la variante puede ser nueva o Bsale no la reporta. "
+                    "Para el dato en vivo, stock_live=True.",
+        }
+    mas_viejo = min((f.updated_at for f in filas if f.updated_at), default=None)
+    return {
+        "fuente": "stock_actual (Postgres), 0 llamadas a Bsale",
+        "variant_id": int(filas[0].variant_id),
+        "variant_code": filas[0].variant_code,
+        "actualizado_desde": mas_viejo.isoformat() if mas_viejo else None,
+        "ultima_corrida_completa": bool(ultima.get("completo")) if isinstance(ultima, dict) else None,
+        "total_unidades": float(sum(float(f.quantity or 0) for f in filas)),
+        "sucursales": [_fila_compacta(f.office_id, f.office_name, f.quantity) for f in filas],
+    }
+
+
+def _stock_variante_en_vivo(variant_id: int | None, code: str | None) -> dict[str, Any]:
+    """Mismo formato compacto, leyendo Bsale (1-2 requests). Si viene `code`
+    primero resuelve el variant_id."""
+    client = get_client()
+    if not variant_id:
+        v = client.get("/v1/variants.json", params={"code": code, "limit": 1})
+        items = v.get("items") or []
+        if not items:
+            return {"fuente": "Bsale en vivo", "error": f"Bsale no tiene variante con code={code}"}
+        variant_id = int(items[0]["id"])
+    data = client.get("/v1/stocks.json", params={"variantid": variant_id, "limit": 50, "expand": "[office]"})
+    items = data.get("items") or []
+    filas = [
+        _fila_compacta((i.get("office") or {}).get("id", 0), (i.get("office") or {}).get("name"), i.get("quantity"))
+        for i in items
+    ]
+    filas.sort(key=lambda f: f["office_id"])
+    return {
+        "fuente": "Bsale en vivo",
+        "variant_id": variant_id,
+        "variant_code": code,
+        "actualizado_desde": datetime.now(timezone.utc).isoformat(),
+        "truncado": bool(data.get("count", 0) > len(items)),
+        "total_unidades": float(sum(f["quantity"] for f in filas)),
+        "sucursales": filas,
     }
 
 
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de stock."""
+
+    @mcp.tool()
+    def bsale_stock_variante(
+        code: str | None = None,
+        variant_id: int | None = None,
+        stock_live: bool = False,
+    ) -> dict[str, Any]:
+        """Stock de UNA variante en cada sucursal, en formato compacto.
+
+        Devuelve 11 filas {office_id, office_name, quantity} mas la fecha
+        del dato. Por default lee stock_actual (Postgres): 0 llamadas a
+        Bsale y ~200 tokens, contra ~7.000 de bsale_listar_stock. Es el
+        tool para cruzar contra Shopify (get-inventory-levels) sucursal por
+        sucursal.
+
+        stock_live=True lee Bsale (1-2 requests) para el numero al segundo:
+        usarlo cuando el snapshot (cada 12 h) no alcanza, por ejemplo para
+        medir el retraso de Loadingplay despues de una venta.
+
+        Args:
+            code: SKU / codigo de barras de la variante (ej. 724841188979).
+            variant_id: id de la variante en Bsale. Uno de los dos es obligatorio.
+            stock_live: True = Bsale en vivo; False (default) = snapshot.
+        """
+        if not code and not variant_id:
+            return {"error": "hay que pasar code o variant_id"}
+        if stock_live or not os.getenv("DATABASE_URL"):
+            return _stock_variante_en_vivo(variant_id, code)
+        return _stock_variante_desde_snapshot(variant_id, code)
 
     @mcp.tool()
     def bsale_listar_stock(

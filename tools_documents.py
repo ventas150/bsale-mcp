@@ -14,6 +14,41 @@ from bsale_client import (
 )
 
 
+# Campos que Bsale manda en cada documento y que ningun agente usa: el HTML
+# del correo de notificacion (messageBodyFormat, ~600 tokens), el TED (el XML
+# del timbre, ~400 tokens), las URLs duplicadas y el bloque de configuracion del
+# tipo de documento. Medido el 09-sep-2026: bsale_listar_documentos costaba
+# ~1.200 tokens por documento, o sea ~7.000 por pagina de 6. Con esto queda en
+# ~150 por documento. `compacto=False` devuelve el JSON crudo de Bsale.
+_DOC_CAMPOS_FUERA = frozenset({
+    "ted", "urlTimbre", "urlXml", "urlPublicViewOriginal", "urlPdfOriginal",
+    "exportTotalAmount", "exportNetAmount", "exportTaxAmount", "exportExemptAmount",
+    "commissionRate", "commissionNetAmount", "commissionTaxAmount", "commissionTotalAmount",
+    "percentageTaxWithheld", "purchaseTaxAmount", "purchaseTotalAmount",
+    "coin", "user", "priceList", "book_type", "sellers", "attributes", "payments",
+    "document_taxes",
+})
+_TIPO_CAMPOS_DENTRO = ("id", "name", "codeSii", "use", "isSalesNote", "isCreditNote", "isElectronicDocument")
+
+
+def _compactar_documento(d: dict[str, Any]) -> dict[str, Any]:
+    """Saca lo que pesa y no informa. Conserva id/numero/fechas/montos/estado,
+    salesId, trackingNumber, urlPublicView y urlPdf, y deja document_type y
+    office reducidos a lo que la regla de venta oficial necesita."""
+    out = {k: v for k, v in d.items() if k not in _DOC_CAMPOS_FUERA}
+    tipo = d.get("document_type")
+    if isinstance(tipo, dict):
+        out["document_type"] = {k: tipo.get(k) for k in _TIPO_CAMPOS_DENTRO if k in tipo}
+    office = d.get("office")
+    if isinstance(office, dict):
+        out["office"] = {"id": office.get("id"), "name": (office.get("name") or "").strip()}
+    for k in ("references", "details"):
+        v = d.get(k)
+        if isinstance(v, dict) and "items" not in v:
+            out.pop(k, None)  # solo el href: no informa nada
+    return out
+
+
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de documentos."""
 
@@ -29,6 +64,7 @@ def register(mcp) -> None:  # noqa: ANN001
         solo_venta_oficial: bool = True,
         incluir_cliente: bool = False,
         emissiondate_range: str | None = None,
+        compacto: bool = True,
     ) -> dict[str, Any]:
         """Lista documentos de Bsale, filtrados a VENTA OFICIAL por default.
 
@@ -49,6 +85,9 @@ def register(mcp) -> None:  # noqa: ANN001
             solo_venta_oficial: True (default) aplica la regla de venta oficial.
             incluir_cliente: True agrega la ficha completa del cliente (pesa mucho).
             emissiondate_range: Alias legacy "YYYY-MM-DD,YYYY-MM-DD".
+            compacto: True (default) saca el HTML del correo, el TED y las
+                URLs duplicadas (~1.200 -> ~150 tokens por documento). False
+                devuelve el JSON crudo de Bsale.
         """
         client = get_client()
         rango = None
@@ -78,6 +117,8 @@ def register(mcp) -> None:  # noqa: ANN001
             items = [d for d in items if is_official_sale(d)]
         for d in items:
             d["monto_firmado"] = doc_revenue_signed(d)
+        if compacto:
+            items = [_compactar_documento(d) for d in items]
 
         return {
             "regla": (
@@ -95,13 +136,19 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
     @mcp.tool()
-    def bsale_obtener_documento(document_id: int) -> dict[str, Any]:
-        """Obtiene detalle de un documento (incluye items, totales, cliente)."""
+    def bsale_obtener_documento(document_id: int, compacto: bool = True) -> dict[str, Any]:
+        """Obtiene detalle de un documento (incluye items, totales, cliente).
+
+        compacto=True (default) saca el HTML del correo, el TED y las URLs
+        duplicadas; las lineas (details.items) y el cliente quedan enteros.
+        compacto=False devuelve el JSON crudo de Bsale.
+        """
         client = get_client()
-        return client.get(
+        d = client.get(
             f"/v1/documents/{document_id}.json",
             params={"expand": "[document_type,office,client,details,references]"},
         )
+        return _compactar_documento(d) if compacto and isinstance(d, dict) else d
 
     @mcp.tool()
     def bsale_obtener_detalle_documento(

@@ -366,6 +366,7 @@ import tools_clients
 import tools_analytics
 import tools_writes
 import tools_diagnostics
+import tools_cruce_shopify
 
 tools_products.register(mcp)
 tools_stocks.register(mcp)
@@ -375,6 +376,7 @@ tools_clients.register(mcp)
 tools_analytics.register(mcp)
 tools_writes.register(mcp)
 tools_diagnostics.register(mcp)
+tools_cruce_shopify.register(mcp)
 
 # Snapshot + mapping + intelligence-DB tools si DB configurada
 if os.getenv("DATABASE_URL"):
