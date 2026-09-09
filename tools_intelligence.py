@@ -189,7 +189,9 @@ def register(mcp) -> None:  # noqa: ANN001
         office_id: int | None = None,
         min_velocity: float = 0.5,
     ) -> dict[str, Any]:
-        """Predice variantes que se quebraran en los proximos N dias. EN VIVO.
+        """DEPRECADO: usar bsale_quiebres_proyectados_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Predice variantes que se quebraran en los proximos N dias. EN VIVO.
 
         Calcula velocity (unidades/dia) basado en consumo ultimos lookback_days
         y proyecta dias_hasta_quiebre = stock_actual / velocity.
@@ -306,7 +308,9 @@ def register(mcp) -> None:  # noqa: ANN001
         variant_id: int,
         lookback_days: int = 60,
     ) -> dict[str, Any]:
-        """Sugiere como distribuir stock entre sucursales basado en velocity historica.
+        """DEPRECADO: usar bsale_sugerencia_allocation_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Sugiere como distribuir stock entre sucursales basado en velocity historica.
 
         Compara velocity por sucursal vs stock actual por sucursal y devuelve:
         - Sucursales sobre-stockeadas (sugerencia: mover OUT)
@@ -426,7 +430,9 @@ def register(mcp) -> None:  # noqa: ANN001
         lookback_days: int = 90,
         producttypeid: int | None = None,
     ) -> dict[str, Any]:
-        """Proyecta cuanto comprar de cada variante para mantener N dias de cobertura.
+        """DEPRECADO: usar bsale_proyeccion_compras_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Proyecta cuanto comprar de cada variante para mantener N dias de cobertura.
 
         compra_sugerida = max(0, (velocity_per_day * target_coverage_days) - stock_total)
 
@@ -524,7 +530,9 @@ def register(mcp) -> None:  # noqa: ANN001
         days_back: int = 30,
         max_documents: int = 40000,
     ) -> dict[str, Any]:
-        """Ranking de sucursales por revenue, ticket promedio, y volumen de docs.
+        """DEPRECADO: usar bsale_ranking_sucursales_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Ranking de sucursales por revenue, ticket promedio, y volumen de docs.
 
         Lee Bsale EN VIVO. Para periodos largos preferir
         bsale_ranking_sucursales_fast, que lee el snapshot y es sub-segundo.
@@ -641,7 +649,9 @@ def register(mcp) -> None:  # noqa: ANN001
     def bsale_segmentacion_clientes_rfm(
         days_back: int = 365,
     ) -> dict[str, Any]:
-        """Segmenta clientes por RFM (Recency, Frequency, Monetary).
+        """DEPRECADO: usar bsale_segmentacion_clientes_rfm_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Segmenta clientes por RFM (Recency, Frequency, Monetary).
 
         Categoriza en: Champions, Loyal, At Risk, Lost, New, Promising.
 

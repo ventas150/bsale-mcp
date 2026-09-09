@@ -900,18 +900,6 @@ def test_precios_abortan_si_falta_el_id_del_detalle(monkeypatch):
 # silencio, y remaining_to_process se calculaba restando el tope, o sea daba
 # 0 con 129.000 documentos pendientes.
 
-def test_el_nocturno_cierra_el_hueco_historico():
-    import inspect
-
-    snapshot = pytest.importorskip("snapshot")
-    src = inspect.getsource(snapshot.nightly_snapshot)
-
-    assert "oldest_first=True" in src, (
-        "sin oldest_first el backfill se queda masticando lo reciente y nunca "
-        "llega a los periodos viejos"
-    )
-    assert "details_historico" in src
-
 
 def _solo_codigo(src: str) -> str:
     """Descarta docstrings y comentarios de un fuente.
@@ -1181,22 +1169,9 @@ def test_un_fallo_de_retencion_se_ve(monkeypatch):
     out = rt.apply_retention()
     assert out["hubo_error"] is False
 
-    snapshot = pytest.importorskip("snapshot")
-    nocturno = _solo_codigo(inspect.getsource(snapshot.nightly_snapshot))
-    assert 'results["retention_error"]' in nocturno, (
-        "cron_snapshot.py solo mira claves de primer nivel que terminen en _error"
-    )
-
-
-def test_la_retencion_corre_antes_del_backfill_historico():
-    """Paso corto y critico no puede ir detras de uno largo y opcional."""
-    import inspect
-
-    snapshot = pytest.importorskip("snapshot")
-    codigo = _solo_codigo(inspect.getsource(snapshot.nightly_snapshot))
-    assert codigo.index("apply_retention") < codigo.index("oldest_first=True"), (
-        "si la corrida muere en el backfill, la retencion no corre esa noche"
-    )
+    # La corrida real (sync_incremental._run) guarda el fallo en retention_error
+    sync = pytest.importorskip("sync_incremental")
+    assert 'results["retention_error"]' in _solo_codigo(inspect.getsource(sync._run))
 
 
 # ============================================================
@@ -1237,14 +1212,17 @@ def test_el_presupuesto_por_corrida_cabe_en_la_cadencia():
     assert 'DETALLE_HISTORICO_POR_CORRIDA", "2000"' in codigo
 
 
-def test_nightly_snapshot_declara_que_no_lo_corre_el_cron():
-    """Para que nadie vuelva a agregar un paso automatico en codigo muerto."""
-    import inspect
+def test_no_vuelve_el_codigo_muerto_del_nocturno():
+    """nightly_snapshot() y cron_snapshot.py se borraron el 09-sep-2026:
+    verificado en el dashboard de Render que el cron corre
+    `python sync_incremental.py --modo auto`. Cinco tests protegian un
+    camino que nadie ejecutaba. Para que nadie lo vuelva a agregar."""
+    import os
 
     snapshot = pytest.importorskip("snapshot")
-    doc = inspect.getdoc(snapshot.nightly_snapshot) or ""
-    assert "NINGUN CRON" in doc.upper()
-    assert "sync_incremental" in doc
+    assert not hasattr(snapshot, "nightly_snapshot")
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    assert not os.path.exists(os.path.join(aqui, "cron_snapshot.py"))
 
 
 # ============================================================
@@ -1800,17 +1778,6 @@ def test_un_digest_caido_marca_la_corrida():
     assert sync.recolectar_errores({"digests": {"ventas_hoy": "ok"}}) == []
 
 
-def test_el_cron_y_el_sync_usan_el_mismo_criterio():
-    import inspect
-
-    sync = pytest.importorskip("sync_incremental")
-    cron = pytest.importorskip("cron_snapshot")
-
-    assert "recolectar_errores" in _solo_codigo(inspect.getsource(sync._run))
-    assert "recolectar_errores" in _solo_codigo(inspect.getsource(cron.run))
-
-
-# ------------------------------------------------- 4. cobertura declarada
 def test_los_tools_de_decision_ya_no_usan_el_paginado_que_tira_el_truncado():
     """paginated_get devuelve ["items"] y descarta el aviso de truncado.
 

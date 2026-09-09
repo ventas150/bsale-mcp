@@ -91,7 +91,9 @@ def register(mcp) -> None:  # noqa: ANN001
         max_documents: int = DEFAULT_MAX_DOCUMENTS,
         incluir_notas_de_venta: bool = False,
     ) -> dict[str, Any]:
-        """Venta oficial entre dos fechas (YYYY-MM-DD), leida de Bsale en vivo.
+        """DEPRECADO: usar bsale_ventas_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Venta oficial entre dos fechas (YYYY-MM-DD), leida de Bsale en vivo.
 
         Args:
             start_date: Fecha inicio YYYY-MM-DD.
@@ -230,7 +232,9 @@ def register(mcp) -> None:  # noqa: ANN001
         top_n: int = 20,
         max_documents: int = 2000,
     ) -> dict[str, Any]:
-        """Top N productos vendidos en un periodo (YYYY-MM-DD), en vivo.
+        """DEPRECADO: usar bsale_top_productos_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
+
+        Top N productos vendidos en un periodo (YYYY-MM-DD), en vivo.
 
         Las notas de credito RESTAN unidades y monto (una devolucion no es una
         venta). Se excluyen guias, notas de venta y anulados.

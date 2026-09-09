@@ -20,7 +20,7 @@ from db import (
     variants_snapshot,
 )
 # OJO: nightly_snapshot, snapshot_stock y snapshot_variants NO se importan
-# aca a proposito. Corren solo en el cron nocturno (cron_snapshot.py), que es
+# aca a proposito. Corren solo en el cron (sync_incremental.py --modo auto), que es
 # un proceso aparte. Tenerlos importados en el web service invita a volver a
 # llamarlos desde un tool, que es exactamente lo que tumbo el servicio el
 # 07-sep-2026.
