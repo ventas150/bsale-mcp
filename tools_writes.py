@@ -12,6 +12,7 @@ from typing import Any
 from bsale_client import get_client
 from guardrails import (
     GuardrailError,
+    con_iva,
     guard_price_write,
     guard_stock_write,
     guard_variant_write,
@@ -414,6 +415,10 @@ def register(mcp) -> None:  # noqa: ANN001
         Args:
             price_list_id: ID de la lista de precios (tiene que estar en la allowlist).
             updates: Lista de dicts con las claves `variant_id` y `new_price`.
+                OJO: `new_price` es el precio NETO, SIN IVA, que es lo que
+                guarda Bsale en variantValue. Para dejar un producto a $29.990
+                en vitrina hay que mandar 25.201,68, no 29.990. La tabla de
+                cambios devuelve las dos cifras para poder revisarlo.
             dry_run: True (default) solo simula y devuelve la tabla de cambios.
             confirm_token: El token que devolvio el dry_run. Obligatorio para escribir.
             max_delta_pct: Tope de variacion permitida por variante. Sobre eso, aborta.
@@ -441,6 +446,17 @@ def register(mcp) -> None:  # noqa: ANN001
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e), "cambios": 0}
 
+        # El precio de vitrina al lado del neto. Sin esto, la tabla que
+        # Roberto aprueba esta en una moneda distinta a la que el piensa: los
+        # precios de MyScrubs se hablan CON IVA ($29.990) y Bsale los guarda
+        # SIN IVA (25.201,68). Aprobar 32.990 "para dejarlo en 32.990" dejaria
+        # la vitrina en $39.258.
+        for fila in tabla:
+            fila["precio_actual_con_iva"] = (
+                con_iva(fila["precio_actual"]) if fila.get("precio_actual") else None
+            )
+            fila["precio_nuevo_con_iva"] = con_iva(fila["precio_nuevo"])
+
         payload = {"price_list_id": price_list_id, "tabla": tabla}
         if dry_run:
             return {
@@ -448,6 +464,11 @@ def register(mcp) -> None:  # noqa: ANN001
                 "dry_run": True,
                 "price_list_id": price_list_id,
                 "cambios": len(tabla),
+                "nota_precios": (
+                    "Los precios de la lista son NETOS (sin IVA), que es lo que "
+                    "guarda Bsale. Las columnas *_con_iva son el precio de "
+                    "vitrina, referencial: los productos exentos no llevan IVA."
+                ),
                 "tabla_de_cambios": tabla,
                 "confirm_token": issue_confirm_token(payload),
                 "siguiente_paso": (

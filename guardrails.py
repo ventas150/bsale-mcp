@@ -110,6 +110,33 @@ def validar_costo(cost) -> float:
     return c
 
 
+def iva_pct() -> float:
+    """IVA vigente en Chile, configurable por si cambia."""
+    try:
+        return float(os.getenv("BSALE_IVA_PCT", "19"))
+    except ValueError:
+        return 19.0
+
+
+def con_iva(neto: float) -> float:
+    """Precio de vitrina a partir del neto.
+
+    variantValue de una lista de precios de Bsale es el precio NETO, sin IVA.
+    Verificado contra produccion el 09-sep-2026: la variante 117733 en la lista
+    12 (OUTLET) vale 25.201,6806722689, y 25.201,68 x 1,19 = 29.990 exacto, que
+    es el precio de vitrina.
+
+    Esto importa porque nadie lo declaraba. Si a este conector se le pide "sube
+    este producto a $32.990", escribe 32.990 como NETO y la vitrina queda en
+    $39.258: 19% de error en un precio, sin que nada avise. Es la misma clase
+    de error silencioso con numeros que se estuvo sacando de este repo.
+
+    Referencial: los productos exentos no llevan IVA. Sirve para que un humano
+    lea la tabla de cambios en la moneda en que piensa, no para calcular.
+    """
+    return round(float(neto) * (1 + iva_pct() / 100), 0)
+
+
 def writable_price_lists() -> set[int]:
     """Listas de precio en las que se permite escribir. Vacio = ninguna."""
     raw = os.getenv("BSALE_WRITABLE_PRICE_LISTS", "").strip()

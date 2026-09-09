@@ -2145,3 +2145,52 @@ def test_el_detalle_de_precio_se_verifica_contra_la_variante(monkeypatch):
     assert r["tabla_de_cambios"][0]["precio_actual"] == 19990.0
     assert r["confirm_token"]
     assert cli.escrituras == [], "un dry_run no escribe"
+
+
+def test_el_precio_de_la_lista_es_neto_y_la_tabla_lo_declara(monkeypatch):
+    """variantValue es el precio NETO, sin IVA, y nada lo decia.
+
+    Medido contra produccion el 09-sep-2026: la variante 117733 en la lista 12
+    (OUTLET) vale 25.201,6806722689, y 25.201,68 x 1,19 = 29.990 exacto, que es
+    el precio de vitrina.
+
+    Importa porque los precios de MyScrubs se hablan CON IVA. Pedirle al
+    conector "dejalo en $32.990" escribe 32.990 como neto y la vitrina queda en
+    $39.258: 19% de error en un precio, en silencio.
+    """
+    g = pytest.importorskip("guardrails")
+    tw = pytest.importorskip("tools_writes")
+
+    assert g.con_iva(25201.6806722689) == 29990.0
+    assert g.con_iva(32990) == 39258.0
+
+    class _CliPrecios:
+        def get(self, path, params=None, **k):
+            return {"items": [
+                {"id": 111, "variantValue": "25201.6806722689",
+                 "variant": {"id": 117733}},
+            ]}
+
+    monkeypatch.setenv("BSALE_PRICE_WRITES_ENABLED", "1")
+    monkeypatch.setenv("BSALE_WRITABLE_PRICE_LISTS", "12")
+    monkeypatch.setattr(tw, "get_client", lambda: _CliPrecios())
+    m = _McpFalso()
+    tw.register(m)
+
+    r = m.tools["bsale_actualizar_precios_masivo"](
+        price_list_id=12, updates=[{"variant_id": 117733, "new_price": 25202.6806722689}]
+    )
+    fila = r["tabla_de_cambios"][0]
+    assert fila["precio_actual_con_iva"] == 29990.0
+    assert fila["precio_nuevo_con_iva"] == 29991.0
+    assert "NETOS" in r["nota_precios"]
+
+
+def test_el_iva_es_configurable(monkeypatch):
+    """Por si cambia la tasa. Hoy 19%."""
+    g = pytest.importorskip("guardrails")
+
+    monkeypatch.setenv("BSALE_IVA_PCT", "0")
+    assert g.con_iva(1000) == 1000.0
+    monkeypatch.setenv("BSALE_IVA_PCT", "19")
+    assert g.con_iva(1000) == 1190.0
