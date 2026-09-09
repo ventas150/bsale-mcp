@@ -32,8 +32,66 @@ from db import (
     session as db_session,
     official_sale_conditions,
     signed_amount,
+    stock_actual,
     variants_snapshot,
 )
+
+
+def _stock_de_variantes(
+    vids: list[int], office_id: int | None = None
+) -> tuple[dict[int, dict[int, dict[str, Any]]], dict[str, Any]]:
+    """Stock por variante y sucursal, leido de stock_actual en UNA consulta.
+
+    Reemplaza el patron de pedir /v1/stocks.json?variantid=X dentro de un bucle:
+    con top_velocity_check=100 eso eran 100 llamadas a la API por invocacion, y
+    la cuota de Bsale es COMPARTIDA con Loadingplay y con la app de documentos.
+    Un barrido que aca se ve gratis alla aparece como 429.
+
+    stock_actual tiene el inventario entero (240.427 filas al 09-sep-2026) con
+    PK (variant_id, office_id), asi que una sola consulta responde por todas las
+    variantes. El costo en API es CERO.
+
+    Devuelve tambien la frescura: quien use este stock tiene que poder decir de
+    cuando es. La regla de la casa es que un numero que no declara su cobertura
+    es un numero que miente, y aca la cobertura es temporal.
+    """
+    if not vids:
+        return {}, {"fuente": "stock_actual", "variantes": 0, "actualizado": None}
+
+    stmt = select(
+        stock_actual.c.variant_id,
+        stock_actual.c.office_id,
+        stock_actual.c.quantity,
+        stock_actual.c.office_name,
+        stock_actual.c.updated_at,
+    ).where(stock_actual.c.variant_id.in_(vids))
+    if office_id:
+        stmt = stmt.where(stock_actual.c.office_id == office_id)
+
+    por_variante: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
+    mas_viejo = None
+    with db_session() as s:
+        for row in s.execute(stmt):
+            por_variante[row.variant_id][row.office_id] = {
+                "office_name": row.office_name,
+                "stock": float(row.quantity or 0),
+            }
+            if row.updated_at is not None and (mas_viejo is None or row.updated_at < mas_viejo):
+                mas_viejo = row.updated_at
+
+    meta = {
+        "fuente": "stock_actual (Postgres)",
+        "variantes_pedidas": len(vids),
+        "variantes_con_stock": len(por_variante),
+        "actualizado_desde": mas_viejo.isoformat() if mas_viejo else None,
+        "nota": (
+            "Stock leido del snapshot, no de Bsale en vivo: 0 llamadas a la API "
+            "en vez de una por variante. La cuota de Bsale es compartida con "
+            "Loadingplay y la app de documentos. Para el numero al segundo, "
+            "pasar stock_live=True."
+        ),
+    }
+    return dict(por_variante), meta
 
 
 def _service_variant_ids_subquery():
@@ -173,23 +231,29 @@ def register(mcp) -> None:  # noqa: ANN001
         office_id: int | None = None,
         min_velocity: float = 0.5,
         top_velocity_check: int = 100,
+        stock_live: bool = False,
     ) -> dict[str, Any]:
-        """Quiebres proyectados. HIBRIDO: velocity SQL + stock LIVE Bsale.
+        """Quiebres proyectados. Velocity SQL + stock del snapshot.
 
         Pasos:
         1. SQL: top N variantes por velocity en lookback period (de snapshot completo)
-        2. Bsale live: stock actual de esas variantes (1 API call por variante)
+        2. SQL: stock de esas variantes, en UNA consulta a stock_actual
         3. Computa dias_hasta_quiebre y filtra por horizon
 
-        Tiempo tipico: 30-90s para top_velocity_check=100.
+        Antes el paso 2 era una llamada a la API POR VARIANTE: con el default de
+        100, cien llamadas por invocacion. La cuota de Bsale es compartida con
+        Loadingplay y con la app de documentos, asi que ese barrido aparecia como
+        429 en las otras integraciones. Ahora son 0 llamadas.
 
         Args:
             days_horizon: Horizonte de prediccion (default 14d).
             lookback_days: Ventana de velocity (default 30d).
             office_id: Filtra por sucursal. None = totales.
             min_velocity: Velocity minima (units/d) para considerar.
-            top_velocity_check: Cuantas variantes top-velocity revisar contra stock live.
-                Mas alto = mas completo pero mas lento.
+            top_velocity_check: Cuantas variantes top-velocity revisar.
+            stock_live: True pide el stock a Bsale al segundo, una llamada por
+                variante. Solo para decisiones que no toleran la frescura del
+                snapshot, que el resultado declara en stock_meta.
         """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
@@ -227,30 +291,43 @@ def register(mcp) -> None:  # noqa: ANN001
 
             vel_rows = s.execute(vel_stmt).fetchall()
 
-        # 2. Stock live de Bsale por cada variante (paralelizable pero por simplicidad serial)
-        client = get_client()
+        # 2. Stock. Del snapshot en UNA consulta, o en vivo si lo piden explicito.
+        vids = [r.variant_id for r in vel_rows]
+        snap: dict[int, dict[int, dict[str, Any]]] = {}
+        if stock_live:
+            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+        else:
+            snap, stock_meta = _stock_de_variantes(vids, office_id)
+
+        client = get_client() if stock_live else None
         risks = []
         for r in vel_rows:
             vid = r.variant_id
-            try:
-                stock_params = {"variantid": vid, "limit": 50, "expand": "[office]"}
-                if office_id:
-                    stock_params["officeid"] = office_id
-                stock_data = client.get("/v1/stocks.json", params=stock_params, use_cache=False)
-                stock_items = stock_data.get("items", []) or []
-            except Exception:  # noqa: BLE001
-                continue
-
-            stock_by_office = {}
-            stock_total = 0.0
-            for item in stock_items:
-                office = item.get("office") or {}
-                oid = office.get("id")
-                if oid is None:
+            if stock_live:
+                try:
+                    stock_params = {"variantid": vid, "limit": 50, "expand": "[office]"}
+                    if office_id:
+                        stock_params["officeid"] = office_id
+                    stock_data = client.get("/v1/stocks.json", params=stock_params, use_cache=False)
+                    stock_items = stock_data.get("items", []) or []
+                except Exception:  # noqa: BLE001
                     continue
-                qv = float(item.get("quantity", 0) or 0)
-                stock_by_office[oid] = qv
-                stock_total += qv
+
+                stock_by_office = {}
+                stock_total = 0.0
+                for item in stock_items:
+                    office = item.get("office") or {}
+                    oid = office.get("id")
+                    if oid is None:
+                        continue
+                    qv = float(item.get("quantity", 0) or 0)
+                    stock_by_office[oid] = qv
+                    stock_total += qv
+            else:
+                stock_by_office = {
+                    oid: d["stock"] for oid, d in snap.get(vid, {}).items()
+                }
+                stock_total = sum(stock_by_office.values())
 
             vtot = float(r.total_qty or 0)
             vpd = vtot / lookback_days
@@ -272,7 +349,9 @@ def register(mcp) -> None:  # noqa: ANN001
         risks.sort(key=lambda x: x["days_until_stockout"])
 
         return {
-            "source": "hybrid (velocity:snapshot, stock:live)",
+            "source": ("hybrid (velocity:snapshot, stock:live)" if stock_live
+                       else "snapshot (velocity y stock)"),
+            "stock_meta": stock_meta,
             "horizon_days": days_horizon,
             "lookback_days": lookback_days,
             "office_id": office_id,
@@ -393,13 +472,17 @@ def register(mcp) -> None:  # noqa: ANN001
         lookback_days: int = 90,
         min_velocity: float = 0.5,
         top_velocity_check: int = 100,
+        stock_live: bool = False,
     ) -> dict[str, Any]:
-        """Proyeccion de compras. HIBRIDO: velocity SQL + stock LIVE Bsale.
+        """Proyeccion de compras. Velocity SQL + stock del snapshot.
 
         Calcula compra sugerida = max(0, velocity_per_day * target_coverage_days - stock_total).
         Solo recorre las top_velocity_check variantes por venta historica.
 
-        Tiempo tipico: 30-90s para top_velocity_check=100.
+        El stock sale de stock_actual en UNA consulta. Antes era una llamada a la
+        API por variante -- cien con el default -- contra una cuota compartida con
+        Loadingplay y la app de documentos. stock_live=True vuelve al camino en
+        vivo; el resultado declara siempre cual se uso y de cuando es el dato.
         """
         now = datetime.now(timezone.utc)
         lookback_cutoff = now - timedelta(days=lookback_days)
@@ -432,22 +515,32 @@ def register(mcp) -> None:  # noqa: ANN001
 
             vel_rows = s.execute(vel_stmt).fetchall()
 
-        # 2. Stock live por variante
-        client = get_client()
+        # 2. Stock: del snapshot en UNA consulta, o en vivo si lo piden explicito.
+        vids = [r.variant_id for r in vel_rows]
+        snap: dict[int, dict[int, dict[str, Any]]] = {}
+        if stock_live:
+            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+        else:
+            snap, stock_meta = _stock_de_variantes(vids)
+
+        client = get_client() if stock_live else None
         recs = []
         for r in vel_rows:
             vid = r.variant_id
-            try:
-                stock_data = client.get(
-                    "/v1/stocks.json",
-                    params={"variantid": vid, "limit": 50},
-                    use_cache=False,
-                )
-                stock_items = stock_data.get("items", []) or []
-            except Exception:  # noqa: BLE001
-                continue
+            if stock_live:
+                try:
+                    stock_data = client.get(
+                        "/v1/stocks.json",
+                        params={"variantid": vid, "limit": 50},
+                        use_cache=False,
+                    )
+                    stock_items = stock_data.get("items", []) or []
+                except Exception:  # noqa: BLE001
+                    continue
+                stock_total = sum(float(item.get("quantity", 0) or 0) for item in stock_items)
+            else:
+                stock_total = sum(d["stock"] for d in snap.get(vid, {}).values())
 
-            stock_total = sum(float(item.get("quantity", 0) or 0) for item in stock_items)
             vtot = float(r.total_qty or 0)
             vpd = vtot / lookback_days
             target = vpd * target_coverage_days
@@ -468,7 +561,9 @@ def register(mcp) -> None:  # noqa: ANN001
         recs.sort(key=lambda x: x["current_coverage_days"])
 
         return {
-            "source": "hybrid (velocity:snapshot, stock:live)",
+            "source": ("hybrid (velocity:snapshot, stock:live)" if stock_live
+                       else "snapshot (velocity y stock)"),
+            "stock_meta": stock_meta,
             "target_coverage_days": target_coverage_days,
             "lookback_days": lookback_days,
             "min_velocity": min_velocity,
@@ -488,17 +583,22 @@ def register(mcp) -> None:  # noqa: ANN001
         lookback_days: int = 30,
         min_velocity: float = 0.05,
         top_check: int = 150,
+        stock_live: bool = False,
     ) -> dict[str, Any]:
         """Detecta SKUs sobrestockeados (cobertura > N dias). Inversa de quiebres.
 
-        Identifica capital muerto en bodega. Hibrido: velocity + precio del snapshot,
-        stock LIVE de Bsale.
+        Identifica capital muerto en bodega. Velocity, precio y stock salen todos
+        del snapshot; el stock, en UNA consulta a stock_actual. Antes eran hasta
+        150 llamadas a la API por invocacion contra una cuota compartida con
+        Loadingplay y la app de documentos.
 
         Args:
             min_coverage_days: Umbral. Default 180 = 6 meses de stock = sobrestock.
             lookback_days: Ventana de velocity (default 30d).
             min_velocity: Velocity minima (units/d) para incluir. <esto = stock muerto, no sobrestockeo.
             top_check: Cuantas variantes top-velocity revisar (max 200 por timeout).
+            stock_live: True pide el stock a Bsale, una llamada por variante. Para
+                un sobrestockeo de 6 meses la frescura del snapshot sobra.
 
         Returns:
             Lista de SKUs sobrestockeados con capital_tied calculado.
@@ -540,35 +640,49 @@ def register(mcp) -> None:  # noqa: ANN001
 
             vel_rows = s.execute(vel_stmt).fetchall()
 
-        # 2. Stock live por variante + calculo cobertura
-        client = get_client()
+        # 2. Stock: del snapshot en UNA consulta, o en vivo si lo piden explicito.
+        vids = [r.variant_id for r in vel_rows]
+        snap: dict[int, dict[int, dict[str, Any]]] = {}
+        if stock_live:
+            stock_meta = {"fuente": "Bsale en vivo", "llamadas_api": len(vids)}
+        else:
+            snap, stock_meta = _stock_de_variantes(vids)
+
+        client = get_client() if stock_live else None
         sobrestockeos = []
         for r in vel_rows:
             vid = r.variant_id
-            try:
-                stock_data = client.get(
-                    "/v1/stocks.json",
-                    params={"variantid": vid, "limit": 50, "expand": "[office]"},
-                    use_cache=False,
-                )
-                stock_items = stock_data.get("items", []) or []
-            except Exception:  # noqa: BLE001
-                continue
-
             stock_by_office: dict[int, dict[str, Any]] = {}
             stock_total = 0.0
-            for item in stock_items:
-                office = item.get("office") or {}
-                oid = office.get("id")
-                if oid is None:
+
+            if stock_live:
+                try:
+                    stock_data = client.get(
+                        "/v1/stocks.json",
+                        params={"variantid": vid, "limit": 50, "expand": "[office]"},
+                        use_cache=False,
+                    )
+                    stock_items = stock_data.get("items", []) or []
+                except Exception:  # noqa: BLE001
                     continue
-                qv = float(item.get("quantity", 0) or 0)
-                if qv > 0:
-                    stock_by_office[oid] = {
-                        "office_name": office.get("name"),
-                        "stock": qv,
-                    }
-                    stock_total += qv
+
+                for item in stock_items:
+                    office = item.get("office") or {}
+                    oid = office.get("id")
+                    if oid is None:
+                        continue
+                    qv = float(item.get("quantity", 0) or 0)
+                    if qv > 0:
+                        stock_by_office[oid] = {
+                            "office_name": office.get("name"),
+                            "stock": qv,
+                        }
+                        stock_total += qv
+            else:
+                for oid, d in snap.get(vid, {}).items():
+                    if d["stock"] > 0:
+                        stock_by_office[oid] = dict(d)
+                        stock_total += d["stock"]
 
             if stock_total == 0:
                 continue
@@ -618,7 +732,9 @@ def register(mcp) -> None:  # noqa: ANN001
 
         total_valorizado = sum(s["valorizado_a_precio_venta_clp"] for s in sobrestockeos)
         return {
-            "source": "hybrid (velocity:snapshot, stock:live)",
+            "source": ("hybrid (velocity:snapshot, stock:live)" if stock_live
+                       else "snapshot (velocity y stock)"),
+            "stock_meta": stock_meta,
             "min_coverage_days": min_coverage_days,
             "lookback_days": lookback_days,
             "checked_variants": len(vel_rows),
@@ -887,24 +1003,20 @@ def register(mcp) -> None:  # noqa: ANN001
 
             top_vel = [r for r in top_vel if r.variant_id not in service_ids]
 
-        # 5. Stock live para top 30 velocity → detectar quiebres + proyeccion
-        client = get_client()
+        # 5. Stock del snapshot para top 30 velocity -> quiebres + proyeccion.
+        #
+        # Esto eran 30 llamadas a la API cada vez que corria el briefing, que es
+        # el tool que mas se invoca. La cuota de Bsale es compartida con
+        # Loadingplay y con la app de documentos: 30 lecturas gratis aca son 30
+        # menos alla. Con stock_actual es UNA consulta a Postgres.
+        snap_briefing, stock_meta = _stock_de_variantes([r.variant_id for r in top_vel])
         quiebres_criticos = []
         compras_urgentes = []
         for r in top_vel:
             vid = r.variant_id
             vtot = float(r.units or 0)
             vpd = vtot / 30
-            try:
-                stock_data = client.get(
-                    "/v1/stocks.json",
-                    params={"variantid": vid, "limit": 50},
-                    use_cache=False,
-                )
-                stocks = stock_data.get("items", []) or []
-                stock_total = sum(float(it.get("quantity", 0) or 0) for it in stocks)
-            except Exception:  # noqa: BLE001
-                continue
+            stock_total = sum(d["stock"] for d in snap_briefing.get(vid, {}).values())
 
             days_to_stockout = stock_total / vpd if vpd > 0 else 9999
             if days_to_stockout <= 14:
@@ -946,6 +1058,7 @@ def register(mcp) -> None:  # noqa: ANN001
             ],
             "quiebres_criticos_proximos_14d": quiebres_criticos[:10],
             "compras_urgentes_top_velocity": compras_urgentes[:10],
+            "stock_meta": stock_meta,
         }
 
     # ============================
