@@ -3229,7 +3229,9 @@ def test_el_raw_minimizado_no_conserva_datos_del_cliente():
     assert "'client', jsonb_build_object('id', raw->'client'->'id'" in sql
     for k in ("totalAmount", "netAmount", "emissionDate", "number", "state"):
         assert f"'{k}', raw->'{k}'" in sql
-    assert f"'{rt.RAW_MARCA}', jsonb_build_object('minimizado', :ts, 'meses', :meses)" in sql
+    # con CAST: sin el, psycopg no infiere el tipo dentro de jsonb_build_object
+    # y Postgres tira IndeterminateDatatype (la primera corrida real fallo asi)
+    assert f"'{rt.RAW_MARCA}', jsonb_build_object('minimizado', CAST(:ts AS text), 'meses', CAST(:meses AS integer))" in sql
     # el SQL sale de las tuplas: la lista que se audita es la que se aplica
     for k in rt.RAW_CAMPOS_QUE_QUEDAN:
         assert f"'{k}', raw->'{k}'" in sql

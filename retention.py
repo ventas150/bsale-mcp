@@ -258,8 +258,13 @@ def _sql_raw_minimo() -> str:
     for padre, hijos in RAW_SUBCAMPOS_QUE_QUEDAN.items():
         sub = ", ".join(f"'{h}', raw->'{padre}'->'{h}'" for h in hijos)
         partes.append(f"'{padre}', jsonb_build_object({sub})")
+    # CAST explicito: dentro de jsonb_build_object psycopg no puede inferir el
+    # tipo del parametro y Postgres responde IndeterminateDatatype (paso en la
+    # primera corrida real, 09-sep 02:00). La sesion falsa de los tests no lo
+    # ve: esto solo lo prueba Postgres.
     partes.append(
-        f"'{RAW_MARCA}', jsonb_build_object('minimizado', :ts, 'meses', :meses)"
+        f"'{RAW_MARCA}', jsonb_build_object("
+        "'minimizado', CAST(:ts AS text), 'meses', CAST(:meses AS integer))"
     )
     return "jsonb_strip_nulls(jsonb_build_object(" + ", ".join(partes) + "))"
 
