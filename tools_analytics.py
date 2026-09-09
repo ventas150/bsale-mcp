@@ -130,6 +130,7 @@ def register(mcp) -> None:  # noqa: ANN001
 
         venta_oficial = 0.0
         n_oficial = 0
+        n_nc = 0
         n_guias = 0
         notas_venta_monto = 0.0
         n_notas_venta = 0
@@ -157,7 +158,14 @@ def register(mcp) -> None:  # noqa: ANN001
 
             amount = doc_revenue_signed(doc)  # nota de credito = negativo
             venta_oficial += amount
-            n_oficial += 1
+            # La NC RESTA plata pero no es un documento de venta: se cuenta
+            # aparte, igual que en bsale_ventas_fast. Contarla adentro daba
+            # ~14% mas "documentos" que el _fast para el mismo mes, y un ticket
+            # promedio derivado mas bajo.
+            if (doc.get("document_type") or {}).get("use") == 1:
+                n_nc += 1
+            else:
+                n_oficial += 1
 
             office = doc.get("office") or {}
             doctype = doc.get("document_type") or {}
@@ -195,7 +203,9 @@ def register(mcp) -> None:  # noqa: ANN001
             "filters": {"officeid": officeid, "documenttypeid": documenttypeid},
             "regla": "venta oficial = Boletas + Facturas + ND - NC (sin notas de venta, sin guias, sin anulados)",
             "venta_oficial": venta_oficial,
+            "unidad_venta_oficial": "CLP BRUTO con IVA (totalAmount), NC restadas",
             "documentos_de_venta": n_oficial,
+            "notas_de_credito": n_nc,
             "excluidos": {
                 "guias_de_despacho": n_guias,
                 "notas_de_venta": n_notas_venta,

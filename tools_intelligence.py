@@ -187,12 +187,19 @@ def register(mcp) -> None:  # noqa: ANN001
         days_horizon: int = 14,
         lookback_days: int = 30,
         office_id: int | None = None,
-        min_velocity: float = 0.1,
+        min_velocity: float = 0.5,
     ) -> dict[str, Any]:
-        """Predice variantes que se quebraran en los proximos N dias.
+        """Predice variantes que se quebraran en los proximos N dias. EN VIVO.
 
         Calcula velocity (unidades/dia) basado en consumo ultimos lookback_days
         y proyecta dias_hasta_quiebre = stock_actual / velocity.
+
+        PREFERIR bsale_quiebres_proyectados_fast: mismo calculo desde el
+        snapshot, 0 llamadas a la API, y excluye servicios (unlimitedStock=1).
+        DIFIERE de la version _fast en: (a) este lee stock en vivo y esta
+        TOPADO a las primeras filas de stock (ver cobertura_stock); (b) este
+        NO excluye servicios. min_velocity ahora es 0.5 en los dos (antes 0.1
+        aqui: una variante a 0.3 u/dia salia en riesgo en uno y no en el otro).
 
         Args:
             days_horizon: Horizonte de prediccion (default 14d).
@@ -526,6 +533,14 @@ def register(mcp) -> None:  # noqa: ANN001
         venta / pedidos web / cotizaciones y anulados. `doc_count` cuenta solo
         documentos de venta; las notas de credito van aparte.
 
+        Montos en CLP BRUTO con IVA (totalAmount), NC restadas.
+
+        Ventana: exactamente `days_back` dias de emision, hoy INCLUIDO
+        (hoy y los days_back-1 anteriores). Es la misma ventana que
+        bsale_ranking_sucursales_fast. Antes este tool usaba un rango
+        inclusivo de hoy-30 a hoy: 31 dias contra 30, y los dos tools daban
+        distinto total para "ultimos 30 dias".
+
         Args:
             days_back: Ventana de analisis (default 30d).
             max_documents: Tope de documentos a leer. Si se alcanza, la
@@ -533,7 +548,7 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         client = get_client()
         end_date = datetime.now(timezone.utc).date()
-        start_date = end_date - timedelta(days=days_back)
+        start_date = end_date - timedelta(days=days_back - 1)
 
         params = {
             "limit": 50,
@@ -625,7 +640,6 @@ def register(mcp) -> None:  # noqa: ANN001
     @mcp.tool()
     def bsale_segmentacion_clientes_rfm(
         days_back: int = 365,
-        max_clients: int = 1000,
     ) -> dict[str, Any]:
         """Segmenta clientes por RFM (Recency, Frequency, Monetary).
 
@@ -633,7 +647,6 @@ def register(mcp) -> None:  # noqa: ANN001
 
         Args:
             days_back: Ventana de analisis (default 365d).
-            max_clients: Cap a analizar (default 1000 docs procesados).
         """
         client = get_client()
         end_date = datetime.now(timezone.utc).date()

@@ -244,10 +244,36 @@ def build_ventas_periodo(dias: int) -> dict[str, Any]:
             """.format(OFICIAL=_official_sale_sql("h"))
         ), {"d": dias}).fetchall()
 
+        # Cobertura de detalle: el top de productos sale de las lineas, y un
+        # documento sin detalle cargado no aporta. Sin esto "el mas vendido de
+        # 90 dias" era el mas vendido ENTRE LOS QUE TENIAN DETALLE, y el
+        # digest -que es mas barato y por eso el agente lo prefiere- no lo
+        # decia. Mismo universo (regla oficial) en numerador y denominador.
+        cob = s.execute(text(
+            """
+            SELECT count(*) AS docs,
+                   count(*) FILTER (WHERE EXISTS (
+                       SELECT 1 FROM document_details_snapshot x
+                        WHERE x.document_id = documents_snapshot.document_id)) AS con_detalle
+            FROM documents_snapshot
+            WHERE emission_date >= now() - make_interval(days => :d)
+              AND {OFICIAL}
+            """.format(OFICIAL=_official_sale_sql())
+        ), {"d": dias}).first()
+
+    docs_periodo = int((cob.docs if cob else 0) or 0)
+    con_detalle = int((cob.con_detalle if cob else 0) or 0)
     return {
         "ventana_dias": dias,
+        "unidad_montos": "CLP bruto con IVA (totalAmount), NC restadas",
         "documentos": int((tot.docs if tot else 0) or 0),
         "total": float((tot.total if tot else 0) or 0),
+        "cobertura_detalle": {
+            "documentos_del_periodo": docs_periodo,
+            "documentos_con_detalle": con_detalle,
+            "pct": round(con_detalle / docs_periodo * 100, 1) if docs_periodo else None,
+            "nota": "top_productos solo ve los documentos con detalle de linea cargado.",
+        },
         "top_productos": [
             {
                 "sku": r.variant_code,

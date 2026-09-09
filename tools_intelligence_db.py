@@ -637,13 +637,18 @@ def register(mcp) -> None:  # noqa: ANN001
             min_coverage_days: Umbral. Default 180 = 6 meses de stock = sobrestock.
             lookback_days: Ventana de velocity (default 30d).
             min_velocity: Velocity minima (units/d) para incluir. <esto = stock muerto, no sobrestockeo.
-            top_check: Cuantas variantes top-velocity revisar (max 200 por timeout).
+            top_check: Cuantas variantes top-velocity revisar. Tope 200 (se
+                rechaza por encima, no se recorta en silencio).
             stock_live: True pide el stock a Bsale, una llamada por variante. Para
                 un sobrestockeo de 6 meses la frescura del snapshot sobra.
 
         Returns:
-            Lista de SKUs sobrestockeados con capital_tied calculado.
+            Lista de SKUs sobrestockeados con valorizado_a_precio_venta_clp
+            (a PRECIO DE VENTA con IVA, no a costo: ver nota_valorizacion).
         """
+        if top_check > 200:
+            return {"aplicado": False,
+                    "motivo": f"top_check={top_check}: el tope es 200 (con stock_live=True son 200 llamadas a la API)."}
         now = datetime.now(timezone.utc)
         if lookback_days <= 0:
             return {"aplicado": False,
@@ -806,11 +811,20 @@ def register(mcp) -> None:  # noqa: ANN001
     ) -> dict[str, Any]:
         """Ranking sucursales desde snapshot. Lectura SQL pura, sub-segundo.
 
-        Neto correcto: notas de credito (use=1) restan; guias (use=2) excluidas;
-        sin doble conteo (PK = document_id).
+        Montos en CLP BRUTO con IVA (totalAmount), con las notas de credito
+        RESTADAS. Ojo: eso no es "neto" (neto = sin IVA; para eso,
+        bsale_ventas_fast.venta_oficial_sin_iva). Notas de credito (use=1)
+        restan; guias (use=2) excluidas; sin doble conteo (PK = document_id).
+
+        Ventana: exactamente `days_back` dias de emision, hoy INCLUIDO. Misma
+        ventana que bsale_ranking_sucursales (vivo). El corte va a medianoche
+        UTC de hace days_back-1 dias, porque emission_date es medianoche UTC
+        exacta: cortar con now() - N dias dejaba fuera el dia mas viejo segun
+        la hora a la que se llamara.
         """
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=days_back)
+        cutoff = datetime.combine(now.date() - timedelta(days=days_back - 1),
+                                  datetime.min.time()).replace(tzinfo=timezone.utc)
 
         amt = signed_amount(
             documents_snapshot.c.total_amount,
@@ -859,6 +873,8 @@ def register(mcp) -> None:  # noqa: ANN001
         return {
             "source": "snapshot",
             "period_days": days_back,
+            "ventana": {"desde": cutoff.date().isoformat(), "hasta": now.date().isoformat(), "hoy_incluido": True},
+            "unidad_montos": "CLP bruto con IVA (totalAmount), NC restadas",
             "total_revenue": total_rev,
             "ranking": ranking,
         }
@@ -954,10 +970,12 @@ def register(mcp) -> None:  # noqa: ANN001
     def bsale_briefing_diario(
         lookback_days: int = 7,
     ) -> dict[str, Any]:
-        """Briefing matinal: ventas dia anterior + quiebres + proyeccion + top sellers + at-risk RFM.
+        """Briefing matinal: ventas de ayer + ranking de sucursales + top
+        productos de la semana + quiebres criticos + compras urgentes.
 
-        Aggregator que combina lo mas accionable en una sola call.
-        Tipico runtime: 30-60s.
+        Todo del snapshot, cero llamadas a la API. Fechas en hora de Chile.
+        Montos en CLP BRUTO con IVA (totalAmount), notas de credito restadas.
+        No incluye RFM. Tipico runtime: 1-3 s.
 
         Args:
             lookback_days: Ventana para top_sellers y ranking (default 7d).
@@ -967,9 +985,13 @@ def register(mcp) -> None:  # noqa: ANN001
         # de Santiago ya es el dia siguiente en UTC, asi que el briefing
         # mostraba las ventas de HOY (parciales) rotuladas como las de ayer.
         # Mismo criterio que digests.TZ_NEGOCIO.
-        yesterday = now.astimezone(ZoneInfo(TZ_NEGOCIO)).date() - timedelta(days=1)
-        week_ago = now.date() - timedelta(days=lookback_days)
-        lookback30_cutoff = now - timedelta(days=30)
+        # Un solo "hoy" para todo el briefing. Antes yesterday iba en hora de
+        # Chile y week_ago/fecha_briefing en UTC: a las 22:00 de Santiago el
+        # rotulo decia MANANA y la ventana de 7 dias arrancaba un dia corrido.
+        hoy_cl = now.astimezone(ZoneInfo(TZ_NEGOCIO)).date()
+        yesterday = hoy_cl - timedelta(days=1)
+        week_ago = hoy_cl - timedelta(days=lookback_days)
+        lookback30_cutoff = datetime.combine(hoy_cl - timedelta(days=30), datetime.min.time()).replace(tzinfo=timezone.utc)
 
         amt = signed_amount(
             documents_snapshot.c.total_amount,
@@ -1089,7 +1111,10 @@ def register(mcp) -> None:  # noqa: ANN001
         compras_urgentes.sort(key=lambda x: x["current_coverage"])
 
         return {
-            "fecha_briefing": now.date().isoformat(),
+            "fecha_briefing": hoy_cl.isoformat(),
+            "zona_horaria": TZ_NEGOCIO,
+            "unidad_montos": "CLP bruto con IVA (totalAmount), NC restadas",
+            "cobertura_detalle": cobertura_ultimos_dias(lookback_days),
             "ventas_ayer": {
                 "fecha": yesterday.isoformat(),
                 "documentos": yest.docs if yest else 0,

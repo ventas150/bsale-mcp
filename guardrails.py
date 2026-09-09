@@ -128,6 +128,15 @@ def validar_costo(cost) -> float:
     return c
 
 
+def sin_iva(precio_bruto: float) -> float:
+    """Precio de vitrina -> NETO que guarda Bsale. Es la conversion que toca
+    plata: para escribir un precio hay que dividir por (1 + IVA), y hacerlo a
+    mano con 1.19 hardcodeado se desalinea en silencio el dia que cambie
+    BSALE_IVA_PCT. 29.990 -> 25.201,68 (float, sin redondear: Bsale guarda
+    decimales)."""
+    return float(precio_bruto) / (1 + iva_pct() / 100)
+
+
 def iva_pct() -> float:
     """IVA vigente en Chile, configurable por si cambia."""
     try:

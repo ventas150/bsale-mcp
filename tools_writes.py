@@ -7,6 +7,7 @@ Use con cuidado: estos tools modifican data real en Bsale.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from bsale_client import get_client
@@ -50,6 +51,10 @@ def _stock_actual_de(client, variant_id: int, office_id: int):
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _flag_env(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _costo_promedio_de(client, variant_id: int):
@@ -600,6 +605,12 @@ def register(mcp) -> None:  # noqa: ANN001
 
         Mismos candados que bsale_actualizar_precios_masivo: kill-switch, allowlist
         de listas, dry_run por default y confirm_token. Ver ese tool para el flujo.
+        
+        UNIDAD: `new_price` es el precio NETO (sin IVA), que es lo que guarda
+        Bsale en variantValue. Para dejar un producto en $32.990 de vitrina,
+        new_price = guardrails.sin_iva(32990) = 27.722,69. Mandar 32.990 lo
+        deja en $39.258 en la tienda. La tabla del dry_run trae las dos
+        columnas (precio_*_con_iva) para verificarlo antes de confirmar.
         """
         return bsale_actualizar_precios_masivo(
             price_list_id=price_list_id,
@@ -657,6 +668,19 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         try:
             guard_variant_write(f"actualizar variante {variant_id}")
+            if code is not None:
+                # Candado PROPIO para el SKU, aparte del de catalogo. Cuando
+                # BSALE_CATALOG_WRITES_ENABLED se abra para editar una
+                # descripcion, este tool no puede aprovechar la ventana para
+                # romper el sku_mapping de los tres canales.
+                if not _flag_env("BSALE_SKU_WRITES_ENABLED"):
+                    raise GuardrailError(
+                        "Cambiar `code` (el SKU) esta BLOQUEADO por politica "
+                        "(BSALE_SKU_WRITES_ENABLED=0), aunque el catalogo este "
+                        "abierto: rompe el sku_mapping con Shopify y Mercado "
+                        "Libre sin dar error. Para un cambio puntual se habilita "
+                        "esa variable, se aplica y se apaga. No se escribio nada."
+                    )
         except GuardrailError as e:
             return {"aplicado": False, "bloqueado_por": str(e)}
         client = get_client()

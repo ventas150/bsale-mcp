@@ -45,10 +45,10 @@ def register(mcp) -> None:  # noqa: ANN001
         el cron nocturno (cron_snapshot.py), que es un proceso aparte.
 
         Por que: este tool corre DENTRO del web service, el mismo proceso que
-        responde /health. snapshot_stock baja ~3.000 paginas; desde el
-        08-sep-2026 va en paralelo y tarda ~10 min (antes, en serie, mas de 2
-        horas), pero sigue siendo demasiado para este proceso, y 'all' hace
-        ademas variants y details. Con eso el
+        responde /health. snapshot_stock baja ~4.800 paginas y tarda ~38 min
+        con 4 workers (medido el 08-sep-2026; en serie eran 2h06), que es
+        demasiado para este proceso, y 'all' hace ademas variants y details.
+        Con eso el
         healthcheck no responde en 5 segundos, Render marca el servicio caido y
         reinicia la instancia a mitad de la carga. Ya paso el 07-sep-2026 con un
         backfill de 46.738 documentos, que es una fraccion de esto — y 'all' era
@@ -61,7 +61,7 @@ def register(mcp) -> None:  # noqa: ANN001
         """
         PESADOS = {
             "all": "la corrida nocturna completa (stock + variants + details)",
-            "stock": "la foto de stock (~6.000 paginas, ~2 horas)",
+            "stock": "la foto de stock (~4.800 paginas de stock, ~38 min con 4 workers)",
             "variants": "el catalogo completo de variantes (~2.000 paginas)",
         }
         if target in PESADOS:
@@ -214,7 +214,7 @@ def register(mcp) -> None:  # noqa: ANN001
                     "el hueco historico completo no hace falta forzar: el cron "
                     "nocturno ya lo va cerrando solo."
                 ),
-                "alternativa": "llamar varias veces con max_docs<=4000",
+                "alternativa": "llamar varias veces con max_docs<=2000",
             }
         return snapshot_details(
             batch_size=batch_size,
@@ -568,7 +568,9 @@ def register(mcp) -> None:  # noqa: ANN001
             excluidos = s.execute(
                 select(
                     func.count().label("docs"),
-                    func.coalesce(func.sum(d.total_amount), 0.0).label("total"),
+                    # Con signo, como todo lo demas: una NC anulada (use=1,
+                    # state!=0) entraba al monto excluido en POSITIVO.
+                    func.coalesce(func.sum(amt), 0.0).label("total"),
                 ).where(and_(*excl_where, ~and_(*official_sale_conditions(documents_snapshot))))
             ).one()
 
@@ -634,11 +636,23 @@ def register(mcp) -> None:  # noqa: ANN001
                 if total_row.docs else None
             ),
             "venta_oficial": float(total_row.total or 0),
-            "venta_oficial_neta": float(total_row.neto or 0),
+            "venta_oficial_sin_iva": float(total_row.neto or 0),
+            "unidad": {
+                "venta_oficial": "CLP BRUTO con IVA (totalAmount), NC restadas",
+                "venta_oficial_sin_iva": "CLP NETO sin IVA (netAmount), NC restadas",
+                "nota": (
+                    "'neto' en este repo significa SIN IVA. Que las NC resten no "
+                    "es 'neto', es la regla de venta oficial y aplica a los dos."
+                ),
+            },
             "excluidos": {
                 "documentos": excluidos.docs,
-                "monto_bruto": float(excluidos.total or 0),
-                "detalle": "guias de despacho + notas de venta/pedidos web/cotizaciones + anulados",
+                "monto_con_signo": float(excluidos.total or 0),
+                # Las guias (use=2) NUNCA entran a documents_snapshot: is_sales_doc
+                # las filtra al escribir. Prometerlas aca hacia que un intento de
+                # cuadrar venta_oficial + excluidos contra Bsale concluyera que
+                # faltaban documentos y disparara un backfill innecesario.
+                "detalle": "notas de venta / pedidos web / cotizaciones + anulados (las guias no estan en el snapshot)",
             },
             "by_office": by_office,
             "by_document_type": by_doctype,

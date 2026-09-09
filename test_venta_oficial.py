@@ -1793,11 +1793,18 @@ def test_las_escrituras_de_catalogo_tienen_kill_switch(monkeypatch):
     assert cli.llamadas == [], "no puede haber tocado Bsale"
 
 
-def test_cambiar_el_sku_pasa_por_el_candado(monkeypatch):
-    """El code es la llave con Shopify y Mercado Libre via sku_mapping."""
+def test_cambiar_el_sku_pasa_por_DOS_candados(monkeypatch):
+    """El code es la llave con Shopify y Mercado Libre via sku_mapping. Desde
+    el 09-sep tiene candado propio: abrir el catalogo para una descripcion no
+    abre el SKU."""
     tools, cli = _tools_de_escritura(monkeypatch)
     monkeypatch.setenv("BSALE_CATALOG_WRITES_ENABLED", "1")
+    monkeypatch.delenv("BSALE_SKU_WRITES_ENABLED", raising=False)
 
+    r = tools["bsale_actualizar_variante"](123, code="SKU-NUEVO")
+    assert r["aplicado"] is False and cli.llamadas == []
+
+    monkeypatch.setenv("BSALE_SKU_WRITES_ENABLED", "1")
     r = tools["bsale_actualizar_variante"](123, code="SKU-NUEVO")
     assert r["aplicado"] is True
     assert cli.llamadas == [("PUT", "/v1/variants/123.json", {"code": "SKU-NUEVO"})]
@@ -2826,3 +2833,150 @@ def test_los_docs_no_ensenan_a_dejar_el_servidor_abierto():
             txt = fh.read()
         assert "no requiere auth" not in txt.lower(), nombre
         assert "MCP_URL_SECRET" in txt, f"{nombre} tiene que explicar la credencial"
+
+
+# ===========================================================================
+# Segunda auditoria, 09-sep-2026 — Lote 4: contrato hacia el agente
+# ===========================================================================
+
+def _cuerpo_de(modulo, nombre_tool, siguiente):
+    import inspect
+    src = _solo_codigo(inspect.getsource(modulo.register))
+    i = src.index(f"def {nombre_tool}(")
+    j = src.index(f"def {siguiente}(", i) if siguiente else len(src)
+    return src[i:j]
+
+
+def test_los_montos_declaran_que_son_brutos_con_iva():
+    """"Neto" significaba dos cosas: NC restadas (ranking_fast) y sin IVA
+    (ventas_fast). Un agente reportaba bruto como neto: 19% de error."""
+    tdb = pytest.importorskip("tools_intelligence_db")
+    ts = pytest.importorskip("tools_snapshot")
+    ta = pytest.importorskip("tools_analytics")
+
+    assert '"unidad_montos": "CLP bruto con IVA' in _cuerpo_de(tdb, "bsale_ranking_sucursales_fast", "bsale_segmentacion_clientes_rfm_fast")
+    assert '"unidad_montos": "CLP bruto con IVA' in _cuerpo_de(tdb, "bsale_briefing_diario", "bsale_top_productos_fast")
+    cuerpo_vf = _cuerpo_de(ts, "bsale_ventas_fast", "bsale_conciliacion_venta")
+    assert '"venta_oficial_sin_iva"' in cuerpo_vf and '"venta_oficial_neta"' not in cuerpo_vf
+    assert '"unidad_venta_oficial"' in _cuerpo_de(ta, "bsale_ventas_por_periodo", "bsale_top_productos")
+
+
+def test_ventas_fast_no_promete_guias_y_suma_excluidos_con_signo():
+    ts = pytest.importorskip("tools_snapshot")
+    cuerpo = _cuerpo_de(ts, "bsale_ventas_fast", "bsale_conciliacion_venta")
+    assert "guias de despacho +" not in cuerpo
+    assert "func.sum(d.total_amount)" not in cuerpo, "excluidos tiene que usar signed_amount"
+
+
+def test_ventas_por_periodo_separa_las_nc_del_conteo_como_el_fast():
+    ta = pytest.importorskip("tools_analytics")
+    cuerpo = _cuerpo_de(ta, "bsale_ventas_por_periodo", "bsale_top_productos")
+    assert '"notas_de_credito": n_nc' in cuerpo
+    assert "n_nc += 1" in cuerpo
+
+
+def test_los_pares_vivo_fast_comparten_defaults_y_ventana():
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    tdb = pytest.importorskip("tools_intelligence_db")
+    src_vivo = inspect.getsource(ti.register)
+    src_fast = inspect.getsource(tdb.register)
+    # min_velocity igual en quiebres
+    import re
+    mv = re.findall(r"def bsale_quiebres_proyectados(?:_fast)?\((.*?)\) ->", src_vivo + src_fast, re.S)
+    assert len(mv) == 2
+    assert all("min_velocity: float = 0.5" in m for m in mv), "min_velocity distinto entre vivo y fast"
+    # ventana del ranking: exactamente days_back dias, hoy incluido, en los dos
+    assert "start_date = end_date - timedelta(days=days_back - 1)" in _solo_codigo(src_vivo)
+    assert "timedelta(days=days_back - 1)" in _cuerpo_de(tdb, "bsale_ranking_sucursales_fast", "bsale_segmentacion_clientes_rfm_fast")
+    # y el vivo dice en que difiere
+    assert "DIFIERE de la version _fast" in src_vivo
+
+
+def test_el_briefing_usa_una_sola_zona_horaria():
+    tdb = pytest.importorskip("tools_intelligence_db")
+    cuerpo = _cuerpo_de(tdb, "bsale_briefing_diario", "bsale_top_productos_fast")
+    assert "hoy_cl = now.astimezone(ZoneInfo(TZ_NEGOCIO)).date()" in cuerpo
+    assert "week_ago = hoy_cl - timedelta" in cuerpo
+    assert '"fecha_briefing": hoy_cl.isoformat()' in cuerpo
+    assert "now.date()" not in cuerpo, "quedo una fecha en UTC"
+    assert '"cobertura_detalle"' in cuerpo
+
+
+def test_sin_iva_es_la_inversa_de_con_iva(monkeypatch):
+    g = pytest.importorskip("guardrails")
+    monkeypatch.setenv("BSALE_IVA_PCT", "19")
+    assert round(g.sin_iva(29990), 6) == round(25201.6806722689, 6)
+    assert g.con_iva(g.sin_iva(32990)) == 32990.0
+    monkeypatch.setenv("BSALE_IVA_PCT", "0")
+    assert g.sin_iva(1000) == 1000.0
+
+
+def test_precio_variante_declara_que_new_price_es_neto():
+    import inspect
+
+    tw = pytest.importorskip("tools_writes")
+    src = inspect.getsource(tw.register)
+    i = src.index("def bsale_actualizar_precio_variante")
+    j = src.index("def bsale_activar_variante", i)
+    assert "NETO" in src[i:j] and "sin_iva" in src[i:j]
+
+
+def test_parametros_muertos_y_cifras_contradictorias_fuera():
+    import inspect
+
+    ti = pytest.importorskip("tools_intelligence")
+    tdb = pytest.importorskip("tools_intelligence_db")
+    ts = pytest.importorskip("tools_snapshot")
+    tm = pytest.importorskip("tools_mapping")
+    assert "max_clients" not in inspect.getsource(ti.register)
+    sob = _cuerpo_de(tdb, "bsale_sobrestockeos_detectados", "bsale_ranking_sucursales_fast")
+    assert "if top_check > 200:" in sob
+    assert "capital_tied" not in inspect.getsource(tdb.register).split("def bsale_sobrestockeos_detectados")[1].split("def bsale_ranking")[0].split('"""')[1]
+    src_ts = inspect.getsource(ts.register)
+    run_now = src_ts[src_ts.index("def bsale_snapshot_run_now"):src_ts.index("def bsale_snapshot_backfill_rango")]
+    assert "~2 horas" not in run_now and "~10 min" not in run_now, "dos cifras distintas para la misma corrida"
+    assert "max_docs<=4000" not in src_ts
+    assert "not_implemented" not in inspect.getsource(tm)
+
+
+def test_stock_agregado_lee_el_snapshot_por_default(monkeypatch):
+    import tools_stocks as tst
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    llamado = []
+    monkeypatch.setattr(tst, "_stock_agregado_desde_snapshot", lambda oid: llamado.append(oid) or {"fuente": "snap"})
+    tools = _tools_de(tst)
+    r = tools["bsale_stock_agregado"](officeid=3)
+    assert r["fuente"] == "snap" and llamado == [3]
+
+
+def test_el_sku_tiene_candado_propio(monkeypatch):
+    """Cuando el catalogo se abra para editar una descripcion, cambiar el
+    SKU no puede colarse por la misma ventana."""
+    import tools_writes as tw
+
+    monkeypatch.setenv("BSALE_CATALOG_WRITES_ENABLED", "1")
+    monkeypatch.delenv("BSALE_SKU_WRITES_ENABLED", raising=False)
+    tools, cli = _tools_de_escritura(monkeypatch, stock={})
+
+    r = tools["bsale_actualizar_variante"](variant_id=1, code="NUEVO-SKU")
+    assert r["aplicado"] is False and "SKU" in r["bloqueado_por"]
+    assert cli.llamadas == []
+
+    r = tools["bsale_actualizar_variante"](variant_id=1, description="solo descripcion")
+    assert r["aplicado"] is True
+
+    monkeypatch.setenv("BSALE_SKU_WRITES_ENABLED", "1")
+    r = tools["bsale_actualizar_variante"](variant_id=1, code="NUEVO-SKU")
+    assert r["aplicado"] is True
+    assert tw._flag_env("BSALE_SKU_WRITES_ENABLED") is True
+
+
+def test_el_digest_de_ventas_declara_cobertura_de_detalle():
+    import inspect
+
+    dg = pytest.importorskip("digests")
+    src = _solo_codigo(inspect.getsource(dg.build_ventas_periodo))
+    assert '"cobertura_detalle"' in src and "con_detalle" in src

@@ -177,22 +177,6 @@ def register(mcp) -> None:  # noqa: ANN001
         }
 
     @mcp.tool()
-    def bsale_mapping_auto_match_sku() -> dict[str, Any]:
-        """Intenta auto-matchear variantes Bsale con SKUs Shopify por `code`.
-
-        Para funcionar necesita que el snapshot de variantes Bsale este corrido,
-        y que tengas un import previo de SKUs Shopify (TODO: futuro tool).
-
-        Por ahora devuelve un placeholder. Se implementa cuando Shopify MCP
-        este conectado y podamos hacer cross-join real.
-        """
-        return {
-            "status": "not_implemented",
-            "reason": "Requiere Shopify connector con SKU list",
-            "next_step": "Conectar Shopify MCP y armar shopify_skus_snapshot table",
-        }
-
-    @mcp.tool()
     def bsale_mapping_listar(
         limit: int = 50,
         only_complete: bool = False,
