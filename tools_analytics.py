@@ -1,5 +1,12 @@
 """Tools de analitica agregada sobre datos de Bsale (lectura en vivo).
 
+09-sep-2026: bsale_ventas_por_periodo y bsale_top_productos se RETIRARON.
+Leian Bsale en vivo (cuota compartida, topados, 33 s por mes) y tenian par
+_fast sobre el snapshot con la misma regla; coexistiendo, los dos daban
+distinto para la misma pregunta (auditoria del 09-sep, #14). Queda
+bsale_comparativo_meses, que no tiene par, y _tope_de_rango, que usa la
+conciliacion.
+
 REGLA PERMANENTE DE MYSCRUBS (22-jul-2026):
     Venta oficial = Boletas + Facturas + Notas de Debito - Notas de Credito.
     Las NOTAS DE VENTA de Bsale (isSalesNote=1: NOTA VENTA, NOTA VENTA T,
@@ -13,16 +20,13 @@ rojo desde julio: 50 paginas x 50 documentos = 2.500 documentos, poco mas de
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from bsale_client import (
     doc_revenue_signed,
     get_client,
     is_official_sale,
-    is_sales_doc,
-    is_sales_note,
     iso_to_epoch_range,
 )
 
@@ -81,237 +85,6 @@ def _tope_de_rango(start_date: str, end_date: str, max_dias: int = 92,
 
 def register(mcp) -> None:  # noqa: ANN001
     """Registra tools de analitica."""
-
-    @mcp.tool()
-    def bsale_ventas_por_periodo(
-        start_date: str,
-        end_date: str,
-        officeid: int | None = None,
-        documenttypeid: int | None = None,
-        max_documents: int = DEFAULT_MAX_DOCUMENTS,
-        incluir_notas_de_venta: bool = False,
-    ) -> dict[str, Any]:
-        """DEPRECADO: usar bsale_ventas_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
-
-        Venta oficial entre dos fechas (YYYY-MM-DD), leida de Bsale en vivo.
-
-        Args:
-            start_date: Fecha inicio YYYY-MM-DD.
-            end_date: Fecha fin YYYY-MM-DD.
-            officeid: Filtrar por sucursal.
-            documenttypeid: Filtrar por tipo de documento.
-            max_documents: Tope de documentos a leer. Si se alcanza, la
-                respuesta lo declara en `truncado`.
-            incluir_notas_de_venta: Solo para diagnostico. La venta oficial
-                NUNCA las incluye; esto agrega un bloque aparte con su monto.
-
-        Maximo 92 dias por llamada (ver _tope_de_rango). Para periodos largos
-        usar bsale_ventas_fast, que lee el snapshot y no toca Bsale.
-        """
-        tope = _tope_de_rango(
-            start_date, end_date, 92,
-            "bsale_ventas_fast(start_date, end_date), que lee el snapshot",
-        )
-        if tope:
-            return tope
-        client = get_client()
-
-        params = {
-            "limit": 50,
-            "emissiondaterange": iso_to_epoch_range(start_date, end_date),
-            "officeid": officeid,
-            "documenttypeid": documenttypeid,
-            "state": 0,  # solo documentos vigentes
-            "expand": "[document_type,office]",
-        }
-
-        fetch = client.paginated_fetch(
-            "/v1/documents.json", params=params, max_items=max_documents
-        )
-        docs = fetch["items"]
-
-        venta_oficial = 0.0
-        n_oficial = 0
-        n_nc = 0
-        n_guias = 0
-        notas_venta_monto = 0.0
-        n_notas_venta = 0
-
-        by_office: dict[Any, dict[str, Any]] = defaultdict(
-            lambda: {"office_name": "", "count": 0, "amount": 0.0}
-        )
-        by_doctype: dict[Any, dict[str, Any]] = defaultdict(
-            lambda: {"type_name": "", "count": 0, "amount": 0.0}
-        )
-        by_day: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"count": 0, "amount": 0.0}
-        )
-
-        for doc in docs:
-            if not is_sales_doc(doc):  # guia de despacho
-                n_guias += 1
-                continue
-            if is_sales_note(doc):
-                n_notas_venta += 1
-                notas_venta_monto += float(doc.get("totalAmount", 0) or 0)
-                continue
-            if not is_official_sale(doc):  # anulado
-                continue
-
-            amount = doc_revenue_signed(doc)  # nota de credito = negativo
-            venta_oficial += amount
-            # La NC RESTA plata pero no es un documento de venta: se cuenta
-            # aparte, igual que en bsale_ventas_fast. Contarla adentro daba
-            # ~14% mas "documentos" que el _fast para el mismo mes, y un ticket
-            # promedio derivado mas bajo.
-            if (doc.get("document_type") or {}).get("use") == 1:
-                n_nc += 1
-            else:
-                n_oficial += 1
-
-            office = doc.get("office") or {}
-            doctype = doc.get("document_type") or {}
-
-            office_id = office.get("id", 0)
-            by_office[office_id]["office_name"] = office.get("name", "?")
-            by_office[office_id]["count"] += 1
-            by_office[office_id]["amount"] += amount
-
-            doctype_id = doctype.get("id", 0)
-            by_doctype[doctype_id]["type_name"] = doctype.get("name", "?")
-            by_doctype[doctype_id]["count"] += 1
-            by_doctype[doctype_id]["amount"] += amount
-
-            emit_date_ts = doc.get("emissionDate")
-            if emit_date_ts:
-                try:
-                    # tz=timezone.utc explicito. Sin el, fromtimestamp usa
-                    # la zona local del proceso, que es una conversion de zona
-                    # aplicada sobre emission_date, justo lo que la regla
-                    # prohibe: emissionDate es medianoche UTC exacta. Hoy Render
-                    # corre en UTC y sale bien por accidente; el dia que alguien
-                    # setee TZ=America/Santiago, TODOS los dias se corren uno
-                    # hacia atras y la venta del lunes aparece como del domingo.
-                    day = datetime.fromtimestamp(
-                        int(emit_date_ts), tz=timezone.utc
-                    ).strftime("%Y-%m-%d")
-                    by_day[day]["count"] += 1
-                    by_day[day]["amount"] += amount
-                except (ValueError, TypeError):
-                    pass
-
-        out: dict[str, Any] = {
-            "period": {"start": start_date, "end": end_date},
-            "filters": {"officeid": officeid, "documenttypeid": documenttypeid},
-            "regla": "venta oficial = Boletas + Facturas + ND - NC (sin notas de venta, sin guias, sin anulados)",
-            "venta_oficial": venta_oficial,
-            "unidad_venta_oficial": "CLP BRUTO con IVA (totalAmount), NC restadas",
-            "documentos_de_venta": n_oficial,
-            "notas_de_credito": n_nc,
-            "excluidos": {
-                "guias_de_despacho": n_guias,
-                "notas_de_venta": n_notas_venta,
-            },
-            "by_office": dict(by_office),
-            "by_document_type": dict(by_doctype),
-            "by_day": dict(sorted(by_day.items())),
-            **_truncation_note(fetch),
-        }
-        if incluir_notas_de_venta:
-            out["notas_de_venta"] = {
-                "count": n_notas_venta,
-                "amount": notas_venta_monto,
-                "nota": "NO forma parte de la venta oficial. Solo diagnostico.",
-            }
-        return out
-
-    @mcp.tool()
-    def bsale_top_productos(
-        start_date: str,
-        end_date: str,
-        top_n: int = 20,
-        max_documents: int = 2000,
-    ) -> dict[str, Any]:
-        """DEPRECADO: usar bsale_top_productos_fast (lee el snapshot, 0 llamadas a la API, misma regla de venta oficial). Este lee Bsale EN VIVO, paga cuota compartida y esta topado. Se retira en la proxima limpieza.
-
-        Top N productos vendidos en un periodo (YYYY-MM-DD), en vivo.
-
-        Las notas de credito RESTAN unidades y monto (una devolucion no es una
-        venta). Se excluyen guias, notas de venta y anulados.
-
-        Ojo: este tool pide el detalle documento por documento. Para periodos
-        largos usar bsale_top_productos_fast, que lee el snapshot.
-        """
-        client = get_client()
-
-        params = {
-            "limit": 50,
-            "emissiondaterange": iso_to_epoch_range(start_date, end_date),
-            "state": 0,
-            "expand": "[document_type]",
-        }
-        fetch = client.paginated_fetch(
-            "/v1/documents.json", params=params, max_items=max_documents
-        )
-        docs = [d for d in fetch["items"] if is_official_sale(d)]
-
-        product_counter: Counter[str] = Counter()
-        product_revenue: dict[str, float] = defaultdict(float)
-        product_names: dict[str, str] = {}
-
-        docs_con_lineas_truncadas = 0
-        docs_con_error = 0
-        for doc in docs:
-            doc_id = doc.get("id")
-            if not doc_id:
-                continue
-            doctype = doc.get("document_type") or {}
-            sign = -1.0 if doctype.get("use") == 1 else 1.0
-            try:
-                # Paginado, NO un GET suelto con limit=50: una factura
-                # institucional a una clinica trae 100-200 lineas (uniformes por
-                # talla y color) y con el GET suelto solo entraban las primeras
-                # 50 al ranking. Es el mismo bug que se arreglo en
-                # snapshot_details; aqui seguia vivo en el tool que decide que
-                # se repone. workers=1 para no anidar pools.
-                fetch_det = client.paginated_fetch(
-                    f"/v1/documents/{doc_id}/details.json",
-                    params={"limit": 50, "expand": "[variant,product]"},
-                    max_items=2000, workers=1,
-                )
-                if fetch_det.get("truncated"):
-                    docs_con_lineas_truncadas += 1
-                for detail in fetch_det.get("items", []):
-                    variant = detail.get("variant") or {}
-                    code = variant.get("code") or f"variant_{variant.get('id', '?')}"
-                    qty = float(detail.get("quantity", 0) or 0) * sign
-                    amount = float(detail.get("totalAmount", 0) or 0) * sign
-                    product_counter[code] += qty
-                    product_revenue[code] += amount
-                    product_names[code] = variant.get("description") or "Sin nombre"
-            except Exception:  # noqa: BLE001
-                docs_con_error += 1
-                continue
-
-        top = [
-            {
-                "code": code,
-                "name": product_names.get(code, ""),
-                "units_sold": qty,
-                "revenue": product_revenue[code],
-            }
-            for code, qty in product_counter.most_common(top_n)
-        ]
-
-        return {
-            "period": {"start": start_date, "end": end_date},
-            "documentos_de_venta_analizados": len(docs),
-            "documentos_con_lineas_truncadas": docs_con_lineas_truncadas,
-            "documentos_sin_detalle_por_error": docs_con_error,
-            "unidad_revenue": "CLP bruto con IVA (totalAmount de la linea), NC restadas",
-            "top_products": top,
-            **_truncation_note(fetch),
-        }
 
     @mcp.tool()
     def bsale_comparativo_meses(

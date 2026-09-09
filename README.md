@@ -13,10 +13,10 @@ Expone tools de **lectura** (productos, stock, ventas, documentos, sucursales) y
 - `bsale_stock_por_sucursal` — vista agregada de stock por sucursal
 - `bsale_listar_documentos` — facturas, boletas, notas de crédito
 - `bsale_obtener_documento` — detalle de un documento (incluye items)
-- `bsale_ventas_por_periodo` — ventas agregadas en rango de fechas
+- `bsale_ventas_fast` — venta oficial de un periodo desde el snapshot (Postgres)
 - `bsale_listar_sucursales` — sucursales activas
 - `bsale_listar_clientes` — clientes (con filtros)
-- `bsale_top_productos` — análisis de top sellers por período
+- `bsale_top_productos_fast` — top sellers por periodo desde el snapshot
 
 ### Tools de escritura
 - `bsale_actualizar_stock` — ajustar cantidad de stock

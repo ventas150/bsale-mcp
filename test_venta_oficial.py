@@ -1779,65 +1779,6 @@ def test_un_digest_caido_marca_la_corrida():
     assert sync.recolectar_errores({"digests": {"ventas_hoy": "ok"}}) == []
 
 
-def test_los_tools_de_decision_ya_no_usan_el_paginado_que_tira_el_truncado():
-    """paginated_get devuelve ["items"] y descarta el aviso de truncado.
-
-    bsale_quiebres_proyectados leia 2.500 filas de las 240.427 que tiene Bsale
-    (medido el 08-sep-2026): el 1,04%, presentado como si fuera el total.
-    """
-    import ast
-    import inspect
-
-    ti = pytest.importorskip("tools_intelligence")
-    # Con ast, no buscando texto: este archivo NOMBRA paginated_get en los
-    # comentarios para explicar por que se saco, y _solo_codigo() no alcanza a
-    # descartar todos los docstrings anidados. Un test que busca texto sobre
-    # este repo se prueba a si mismo.
-    arbol = ast.parse(inspect.getsource(ti))
-    llamadas = [
-        n.func.attr
-        for n in ast.walk(arbol)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    ]
-    assert "paginated_get" not in llamadas, (
-        "paginated_get tira el aviso de truncado; usar _fetch_declarado"
-    )
-    assert "paginated_fetch" in llamadas
-
-
-def test_una_lectura_truncada_lo_dice_y_ofrece_el_tool_que_si_cubre():
-    ti = pytest.importorskip("tools_intelligence")
-
-    class _Cli:
-        def paginated_fetch(self, path, params=None, max_items=0, workers=None):
-            return {"items": [{"i": n} for n in range(max_items)],
-                    "total_count": 240427, "truncated": True}
-
-    items, cob = ti._fetch_declarado(
-        _Cli(), "/v1/stocks.json", {}, 2500, "filas de stock", "usar el _fast",
-    )
-    assert len(items) == 2500
-    assert cob["truncado"] is True
-    assert cob["total_en_bsale"] == 240427
-    assert cob["pct"] == 1.04
-    assert "PISO" in cob["advertencia"]
-    assert cob["alternativa"] == "usar el _fast"
-
-
-def test_una_lectura_completa_no_grita():
-    ti = pytest.importorskip("tools_intelligence")
-
-    class _Cli:
-        def paginated_fetch(self, path, params=None, max_items=0, workers=None):
-            return {"items": [{"i": n} for n in range(120)],
-                    "total_count": 120, "truncated": False}
-
-    _items, cob = ti._fetch_declarado(_Cli(), "/x.json", {}, 5000, "cosas")
-    assert cob["truncado"] is False
-    assert cob["pct"] == 100.0
-    assert "advertencia" not in cob
-
-
 # ---------------------------------------------------- 5. pools desanidados
 def test_el_detalle_no_anida_pools_contra_bsale():
     """4 workers externos x 4 internos = 16 simultaneas. Bsale frena en 6.
@@ -2116,41 +2057,6 @@ def test_el_tope_de_delta_sigue_funcionando_con_precio_normal():
 # Correcciones de cifras de la auditoria (frente "correctitud del dinero").
 # ===========================================================================
 
-def test_el_rfm_en_vivo_aplica_la_regla_de_venta_oficial_completa():
-    """Solo sacaba guias, y eso hacia contar los pedidos web dos veces.
-
-    Bsale genera PEDIDO WEB (tipo 26, nota de venta) Y la boleta por la misma
-    compra. is_sales_doc solo excluye use=2, asi que las dos entraban: un
-    cliente con 3 compras web salia con frequency 6 y el doble de facturacion,
-    y cruzaba el umbral de "Champion". La version _fast (SQL) si aplicaba la
-    regla completa, o sea que los dos RFM daban distinto para el mismo cliente.
-    """
-    ti = pytest.importorskip("tools_intelligence")
-    # Acotado al cuerpo del RFM. Antes se buscaba en el modulo entero, y
-    # "is_official_sale" seguia apareciendo en el ranking: el test pasaba con
-    # el RFM revertido a is_sales_doc.
-    codigo = _cuerpo_de(ti, "bsale_segmentacion_clientes_rfm", None)
-
-    assert "if not is_sales_doc(doc):" not in codigo, (
-        "is_sales_doc no alcanza: hay que usar is_official_sale"
-    )
-    assert "if not is_official_sale(doc):" in codigo
-
-
-def test_producttypeid_llega_a_la_consulta():
-    """Se aceptaba, se documentaba como filtro y se devolvia en la respuesta.
-
-    Pero no entraba en ningun params: preguntar por una marca devolvia el
-    catalogo entero rotulado como si fuera de esa marca.
-    """
-    import inspect
-
-    ti = pytest.importorskip("tools_intelligence")
-    codigo = _solo_codigo(inspect.getsource(ti))
-
-    assert '_p_stock["producttypeid"] = producttypeid' in codigo
-
-
 def test_ninguna_fecha_se_convierte_con_la_zona_local_del_proceso():
     """fromtimestamp sin tz usa la zona local: es convertir emission_date.
 
@@ -2161,7 +2067,7 @@ def test_ninguna_fecha_se_convierte_con_la_zona_local_del_proceso():
     import ast
     import inspect
 
-    for mod in ("tools_analytics", "tools_intelligence", "snapshot", "digests"):
+    for mod in ("tools_analytics", "tools_intelligence_db", "snapshot", "digests"):
         m = pytest.importorskip(mod)
         arbol = ast.parse(inspect.getsource(m))
         for n in ast.walk(arbol):
@@ -2555,49 +2461,14 @@ def test_el_backfill_historico_no_bota_el_flag_de_truncado():
         assert "truncated" in src, f"{fn.__name__} tiene que MIRAR el flag, no solo obtenerlo"
 
 
-def test_el_rfm_en_vivo_no_cuenta_la_nota_de_credito_como_compra(monkeypatch):
-    """Cliente con dos boletas y una NC: frequency 2, no 3, y la recencia es la
-    de la ultima boleta, no la de la devolucion. El _fast ya lo hacia asi; el
-    vivo marcaba Champion a alguien que devolvio ayer."""
-    import inspect
-
-    ti = pytest.importorskip("tools_intelligence")
-    src = _solo_codigo(inspect.getsource(ti.register))
-    # El monto sigue restando; frecuencia y recencia solo con documentos que no son NC.
-    assert "es_nc" in src and 'get("use") == 1' in src
-    i_nc = src.index("if not es_nc:")
-    i_freq = src.index('["frequency"] += 1')
-    i_mon = src.index('["monetary"] += amount')
-    assert i_nc < i_freq < i_mon, "frequency tiene que quedar dentro del if not es_nc, y monetary fuera"
-
-
 def test_lookback_days_cero_no_revienta():
     """ZeroDivisionError en cinco tools con lookback_days=0, que el schema
     acepta. El agente veia un 500 sin causa."""
     import inspect
 
     tdb = pytest.importorskip("tools_intelligence_db")
-    ti = pytest.importorskip("tools_intelligence")
     src_db = _solo_codigo(inspect.getsource(tdb.register))
-    src_vivo = _solo_codigo(inspect.getsource(ti.register))
     assert src_db.count("if lookback_days <= 0:") >= 4
-    assert "v_total / lookback_days\n" not in src_vivo, "division sin guardia en el vivo"
-    assert src_vivo.count("/ lookback_days if lookback_days > 0 else 0") >= 3
-
-
-def test_top_productos_pagina_el_detalle_de_cada_documento():
-    """Un GET suelto con limit=50 por documento dejaba fuera del ranking las
-    lineas 51+ de las facturas institucionales, que son justo las largas."""
-    import inspect
-
-    ta = pytest.importorskip("tools_analytics")
-    src = _solo_codigo(inspect.getsource(ta.register))
-    i = src.index("def bsale_top_productos")
-    j = src.index("def bsale_comparativo_meses")
-    cuerpo = src[i:j]
-    assert "paginated_fetch(" in cuerpo and "/details.json" in cuerpo
-    assert 'client.get(\n                    f"/v1/documents/{doc_id}/details.json"' not in cuerpo
-    assert "documentos_con_lineas_truncadas" in cuerpo
 
 
 def test_solo_codigo_funciona_sobre_un_tool_anidado():
@@ -2945,13 +2816,11 @@ def test_los_montos_declaran_que_son_brutos_con_iva():
     (ventas_fast). Un agente reportaba bruto como neto: 19% de error."""
     tdb = pytest.importorskip("tools_intelligence_db")
     ts = pytest.importorskip("tools_snapshot")
-    ta = pytest.importorskip("tools_analytics")
 
     assert '"unidad_montos": "CLP bruto con IVA' in _cuerpo_de(tdb, "bsale_ranking_sucursales_fast", "bsale_segmentacion_clientes_rfm_fast")
     assert '"unidad_montos": "CLP bruto con IVA' in _cuerpo_de(tdb, "bsale_briefing_diario", "bsale_top_productos_fast")
     cuerpo_vf = _cuerpo_de(ts, "bsale_ventas_fast", "bsale_conciliacion_venta")
     assert '"venta_oficial_sin_iva"' in cuerpo_vf and '"venta_oficial_neta"' not in cuerpo_vf
-    assert '"unidad_venta_oficial"' in _cuerpo_de(ta, "bsale_ventas_por_periodo", "bsale_top_productos")
 
 
 def test_ventas_fast_no_promete_guias_y_suma_excluidos_con_signo():
@@ -2959,32 +2828,6 @@ def test_ventas_fast_no_promete_guias_y_suma_excluidos_con_signo():
     cuerpo = _cuerpo_de(ts, "bsale_ventas_fast", "bsale_conciliacion_venta")
     assert "guias de despacho +" not in cuerpo
     assert "func.sum(d.total_amount)" not in cuerpo, "excluidos tiene que usar signed_amount"
-
-
-def test_ventas_por_periodo_separa_las_nc_del_conteo_como_el_fast():
-    ta = pytest.importorskip("tools_analytics")
-    cuerpo = _cuerpo_de(ta, "bsale_ventas_por_periodo", "bsale_top_productos")
-    assert '"notas_de_credito": n_nc' in cuerpo
-    assert "n_nc += 1" in cuerpo
-
-
-def test_los_pares_vivo_fast_comparten_defaults_y_ventana():
-    import inspect
-
-    ti = pytest.importorskip("tools_intelligence")
-    tdb = pytest.importorskip("tools_intelligence_db")
-    src_vivo = inspect.getsource(ti.register)
-    src_fast = inspect.getsource(tdb.register)
-    # min_velocity igual en quiebres
-    import re
-    mv = re.findall(r"def bsale_quiebres_proyectados(?:_fast)?\((.*?)\) ->", src_vivo + src_fast, re.S)
-    assert len(mv) == 2
-    assert all("min_velocity: float = 0.5" in m for m in mv), "min_velocity distinto entre vivo y fast"
-    # ventana del ranking: exactamente days_back dias, hoy incluido, en los dos
-    assert "start_date = end_date - timedelta(days=days_back - 1)" in _solo_codigo(src_vivo)
-    assert "timedelta(days=days_back - 1)" in _cuerpo_de(tdb, "bsale_ranking_sucursales_fast", "bsale_segmentacion_clientes_rfm_fast")
-    # y el vivo dice en que difiere
-    assert "DIFIERE de la version _fast" in src_vivo
 
 
 def test_el_briefing_usa_una_sola_zona_horaria():
@@ -3019,11 +2862,9 @@ def test_precio_variante_declara_que_new_price_es_neto():
 def test_parametros_muertos_y_cifras_contradictorias_fuera():
     import inspect
 
-    ti = pytest.importorskip("tools_intelligence")
     tdb = pytest.importorskip("tools_intelligence_db")
     ts = pytest.importorskip("tools_snapshot")
     tm = pytest.importorskip("tools_mapping")
-    assert "max_clients" not in inspect.getsource(ti.register)
     sob = _cuerpo_de(tdb, "bsale_sobrestockeos_detectados", "bsale_ranking_sucursales_fast")
     assert "if top_check > 200:" in sob
     assert "capital_tied" not in inspect.getsource(tdb.register).split("def bsale_sobrestockeos_detectados")[1].split("def bsale_ranking")[0].split('"""')[1]
@@ -3686,3 +3527,48 @@ def test_conciliacion_sin_venta_en_vivo_no_divide_por_cero(monkeypatch):
     conc, _, _ = _conciliacion_con(monkeypatch, [], [_Fila(document_id=1, monto=10.0)])
     r = conc(start_date="2026-08-01", end_date="2026-08-31")
     assert r["diferencia_pct"] is None and r["diferencia"] == 10.0
+
+
+# ===========================================================================
+# Los tools "en vivo" con par _fast se RETIRARON (09-sep-2026)
+# ===========================================================================
+# Mientras coexistian, vivo y fast respondian distinto a la misma pregunta
+# (#14 de la segunda auditoria) y el vivo pagaba cuota compartida de la API.
+# Revisado antes de borrar: ninguna tarea programada, skill ni KPI de Notion
+# los nombraba (los KPIs apuntan a los _fast). Este test impide que vuelvan.
+
+_RETIRADOS = (
+    "bsale_ventas_por_periodo", "bsale_top_productos", "bsale_quiebres_proyectados",
+    "bsale_sugerencia_allocation", "bsale_proyeccion_compras",
+    "bsale_ranking_sucursales", "bsale_segmentacion_clientes_rfm",
+)
+
+
+def test_los_tools_en_vivo_retirados_no_vuelven():
+    import importlib.util
+    import inspect
+
+    assert importlib.util.find_spec("tools_intelligence") is None, "tools_intelligence.py se borro entero"
+
+    import server as sv
+
+    assert "tools_intelligence" not in _solo_codigo(inspect.getsource(sv)).replace("tools_intelligence_db", "")
+
+    registrados = {}
+    for mod in ("tools_analytics", "tools_snapshot", "tools_intelligence_db", "tools_documents"):
+        registrados.update(_tools_de(pytest.importorskip(mod)))
+    for nombre in _RETIRADOS:
+        assert nombre not in registrados, f"{nombre} volvio a registrarse"
+    # lo que reemplaza a cada uno sigue ahi
+    for nombre in ("bsale_ventas_fast", "bsale_top_productos_fast", "bsale_quiebres_proyectados_fast",
+                   "bsale_sugerencia_allocation_fast", "bsale_proyeccion_compras_fast",
+                   "bsale_ranking_sucursales_fast", "bsale_segmentacion_clientes_rfm_fast",
+                   "bsale_comparativo_meses"):
+        assert nombre in registrados, f"falta {nombre}"
+    # y ningun docstring o mensaje manda al agente a un tool que ya no existe
+    for mod in ("tools_analytics", "tools_snapshot", "tools_intelligence_db", "tools_documents", "digests"):
+        src = inspect.getsource(pytest.importorskip(mod))
+        for nombre in _RETIRADOS:
+            for m in __import__("re").finditer(nombre + r"(?!_fast)\b", src):
+                linea = src[src.rfind("\n", 0, m.start()) + 1: src.find("\n", m.end())]
+                assert "retir" in linea.lower(), f"{mod} nombra {nombre}: {linea.strip()[:80]}"

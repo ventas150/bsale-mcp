@@ -5,9 +5,10 @@ Estas leen del snapshot Postgres en vez de paginar Bsale en vivo.
 
 Se registran solo si DATABASE_URL esta configurado (ver server.py).
 
-Sobreescriben las versiones de tools_intelligence.py si esta cargado.
-Decision: registrar nombres DISTINTOS con sufijo _fast para que ambas coexistan
-y el agente pueda elegir. Si las _fast funcionan, las antiguas se pueden retirar.
+Historia del sufijo _fast: nacieron junto a versiones EN VIVO del mismo
+nombre (tools_intelligence.py) para que coexistieran. Las _fast funcionaron
+y las en vivo se retiraron el 09-sep-2026. El sufijo se conserva porque
+los KPIs de Notion y los digests nombran estos tools.
 
 Correctitud (P0):
 - documents_snapshot tiene PK = document_id (una fila por documento), asi que
@@ -817,7 +818,7 @@ def register(mcp) -> None:  # noqa: ANN001
         restan; guias (use=2) excluidas; sin doble conteo (PK = document_id).
 
         Ventana: exactamente `days_back` dias de emision, hoy INCLUIDO. Misma
-        ventana que bsale_ranking_sucursales (vivo). El corte va a medianoche
+        ventana que tenia bsale_ranking_sucursales (vivo, retirado). El corte va a medianoche
         UTC de hace days_back-1 dias, porque emission_date es medianoche UTC
         exacta: cortar con now() - N dias dejaba fuera el dia mas viejo segun
         la hora a la que se llamara.

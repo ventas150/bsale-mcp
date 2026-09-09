@@ -89,7 +89,7 @@ def register(mcp) -> None:  # noqa: ANN001
             "excluidos_en_esta_pagina": {"guias_de_despacho": guias, "notas_de_venta": notas},
             "advertencia_paginacion": (
                 "Esto es UNA pagina. Para totales de un periodo usar "
-                "bsale_ventas_por_periodo o bsale_ventas_fast, que suman todo."
+                "bsale_ventas_fast, que suma todo el periodo."
             ),
             "items": items,
         }
