@@ -27,10 +27,11 @@ services:
         value: "3.11.9"
 
       # --- Autenticacion del endpoint MCP -------------------------------
-      # Mientras este vacio, el servidor acepta llamadas SIN credenciales:
-      # cualquiera con la URL puede usar los tools de escritura. Al setear un
-      # valor aca, todo (incluido /mcp) exige `Authorization: Bearer <valor>`
-      # y hay que agregar ese header en la configuracion del cliente MCP.
+      # OBLIGATORIA desde el 09-sep-2026: sin MCP_URL_SECRET (o MCP_AUTH_TOKEN)
+      # el servidor SE NIEGA A ARRANCAR. Antes arrancaba abierto a internet.
+      # MCP_AUTH_TOKEN es el bearer para /audit y /health/deep; el conector de
+      # Cowork usa el secreto en la URL (abajo). Los dos son sync:false: el
+      # blueprint no los provee, se escriben a mano en el dashboard.
       - key: MCP_AUTH_TOKEN
         sync: false
       # Secreto embebido en la URL del MCP (/mcp/<secreto>). Existe porque el

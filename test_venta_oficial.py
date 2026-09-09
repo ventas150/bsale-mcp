@@ -117,6 +117,49 @@ def test_paginated_get_sigue_funcionando():
 # --- Candados de escritura (guardrails.py) ----------------------------------
 import guardrails  # noqa: E402
 
+# Variables que los tests tocan. Se restauran despues de CADA test para que
+# ninguno dependa del orden: _reset_flags escribia os.environ y no restauraba,
+# asi que test_precios_exigen_allowlist dejaba PRICE=1 hasta que otro lo pisara.
+_ENV_QUE_TOCAN_LOS_TESTS = (
+    "BSALE_PRICE_WRITES_ENABLED", "BSALE_WRITABLE_PRICE_LISTS",
+    "BSALE_STOCK_WRITES_ENABLED", "BSALE_CATALOG_WRITES_ENABLED",
+    "BSALE_SKU_WRITES_ENABLED", "BSALE_IVA_PCT", "MCP_URL_SECRET",
+    "MCP_AUTH_TOKEN", "DATABASE_URL", "CACHE_DIR", "AUDIT_DIR",
+)
+
+
+@pytest.fixture(autouse=True)
+def _entorno_limpio():
+    """Cada test arranca sin DATABASE_URL y con las variables de arriba como
+    estaban al terminar.
+
+    DATABASE_URL: bsale_client hace load_dotenv() al importar. En una maquina
+    con .env (un shell de Render, un dev que copie .env.example), el test de
+    rotacion del audit escribia 400 eventos basura en el audit_log de
+    PRODUCCION (audit.py va a Postgres primero) y recien despues fallaba. En
+    el PC no hay .env, por eso no se vio.
+    """
+    import sys
+
+    antes = {k: os.environ.get(k) for k in _ENV_QUE_TOCAN_LOS_TESTS}
+    os.environ.pop("DATABASE_URL", None)
+    # db.DATABASE_URL se lee al importar: si ya esta importado, apagarlo ahi
+    # tambien, que es lo que audit._escribir_en_postgres consulta.
+    db_mod = sys.modules.get("db")
+    db_url_antes = getattr(db_mod, "DATABASE_URL", None) if db_mod else None
+    if db_mod is not None:
+        db_mod.DATABASE_URL = None
+    try:
+        yield
+    finally:
+        for k, v in antes.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if db_mod is not None:
+            db_mod.DATABASE_URL = db_url_antes
+
 
 def _reset_flags(price="0", listas=""):
     os.environ["BSALE_PRICE_WRITES_ENABLED"] = price
@@ -691,11 +734,13 @@ def test_engine_tiene_timeouts_configurados():
 
     import db
 
-    src = inspect.getsource(db.get_engine)
+    # _solo_codigo: el docstring de get_engine nombra "connect_timeout", asi
+    # que sin filtrar el test pasaba con el parametro quitado.
+    src = _solo_codigo(inspect.getsource(db.get_engine))
     for esperado in ("connect_timeout", "pool_timeout", "statement_timeout"):
         assert esperado in src, f"falta {esperado} en get_engine"
     # y la creacion tiene que estar bajo lock (era check-then-act)
-    assert "_engine_lock" in src
+    assert "with _engine_lock:" in src
 
 
 def test_health_no_bloquea_el_event_loop():
@@ -709,23 +754,9 @@ def test_health_no_bloquea_el_event_loop():
 
     # OJO: hay que mirar el CODIGO, no los comentarios. El docstring de
     # health_check nombra las claves que se sacaron para explicar por que se
-    # sacaron; si se escanea el fuente crudo, el propio comentario hace fallar
-    # el test. Se descartan lineas de comentario y el docstring.
-    lineas = []
-    en_docstring = False
-    for linea in src.splitlines():
-        limpia = linea.strip()
-        if limpia.startswith('"""') or limpia.startswith("'''"):
-            comillas = limpia[:3]
-            # docstring de una sola linea
-            if len(limpia) > 3 and limpia.endswith(comillas):
-                continue
-            en_docstring = not en_docstring
-            continue
-        if en_docstring or limpia.startswith("#"):
-            continue
-        lineas.append(linea)
-    codigo = "\n".join(lineas)
+    # sacaron. Este test conservaba el toggle por linea que _solo_codigo
+    # reemplazo por estar roto; ahora usa el mismo helper que el resto.
+    codigo = _solo_codigo(src)
 
     # y no debe filtrar internals
     for prohibido in ("cache_file", "db_error", "escritura_precios"):
@@ -812,16 +843,50 @@ def test_precios_no_postean_al_endpoint_que_no_existe():
     assert "details/{detalle_id}.json" in src, "tiene que ir por PUT al detalle"
 
 
-def test_precios_abortan_si_falta_el_id_del_detalle():
-    """Sin detail_id no hay forma de escribir; no se escribe nada a medias."""
-    import inspect
+def test_precios_abortan_si_falta_el_id_del_detalle(monkeypatch):
+    """Sin detail_id no hay forma de escribir; no se escribe nada a medias.
 
-    tools_writes = pytest.importorskip("tools_writes")
-    src = inspect.getsource(tools_writes.register)
+    Antes: `src.index("sin_detalle") < src.index("client.put(")` sobre el
+    fuente crudo, y el primer "sin_detalle" era un COMENTARIO que esta antes
+    de cualquier put. Pasaba con el chequeo movido despues del bucle. Ahora
+    se ejecuta: dos variantes, una sin detalle, y ni un PUT."""
+    tw = pytest.importorskip("tools_writes")
 
-    assert "variantes_sin_detalle" in src
-    # el chequeo tiene que estar ANTES del bucle que escribe
-    assert src.index("sin_detalle") < src.index("client.put(")
+    class _Cli:
+        def __init__(self):
+            self.escrituras = []
+
+        def get(self, path, params=None, **k):
+            # La 424242 tiene precio pero Bsale no devuelve el id del detalle:
+            # sin ese id no hay a que hacerle PUT.
+            return {"items": [
+                {"id": 111, "variantValue": "19990", "variant": {"id": 117733}},
+                {"variantValue": "5000", "variant": {"id": 424242}},
+            ]}
+
+        def put(self, path, json_body=None, **k):
+            self.escrituras.append((path, json_body))
+            return {"id": 1}
+
+    monkeypatch.setenv("BSALE_PRICE_WRITES_ENABLED", "1")
+    monkeypatch.setenv("BSALE_WRITABLE_PRICE_LISTS", "5")
+    cli = _Cli()
+    monkeypatch.setattr(tw, "get_client", lambda: cli)
+    m = _McpFalso()
+    tw.register(m)
+    tool = m.tools["bsale_actualizar_precios_masivo"]
+
+    r = tool(price_list_id=5, updates=[
+        {"variant_id": 117733, "new_price": 20500},
+        {"variant_id": 424242, "new_price": 10000},   # sin detalle en la lista
+    ])
+    # _leer_detalles_actuales exige valor E id, asi que la variante sin id no
+    # entra al dict y aborta el guardrail de precio actual; el de sin_detalle
+    # queda como segunda barrera. Lo que importa: abortar ENTERO, sin tabla y
+    # sin un solo PUT, y que el mensaje nombre a la variante.
+    assert "bloqueado_por" in r and "424242" in r["bloqueado_por"]
+    assert "tabla_de_cambios" not in r, "abortar ENTERO, no armar tabla parcial"
+    assert cli.escrituras == []
 
 
 # ============================================================
@@ -1081,21 +1146,40 @@ def test_ningun_consumidor_lee_la_tabla_vieja():
 
 
 def test_la_retencion_tiene_su_propio_timeout():
-    """El de 20 s protege al web service; un mantenimiento no lo hereda."""
+    """El de 20 s protege al web service; un mantenimiento no lo hereda.
+
+    Antes buscaba "_sin_timeout_corto(s)" en el modulo entero y lo encontraba
+    en el `def`: pasaba aunque nadie lo llamara. Ahora se exige la LLAMADA
+    dentro de cada funcion que borra, con comentarios y docstrings fuera."""
     import inspect
 
-    retention = pytest.importorskip("retention")
-    src = inspect.getsource(retention)
-    assert "SET LOCAL statement_timeout" in src
-    assert "_sin_timeout_corto(s)" in src
+    rt = pytest.importorskip("retention")
+    for fn in (rt._borrar_por_lotes, rt.purge_variants_snapshots, rt.purge_stock_snapshots):
+        src = _solo_codigo(inspect.getsource(fn))
+        assert "_sin_timeout_corto(s)" in src, f"{fn.__name__} no llama _sin_timeout_corto"
+    assert "SET LOCAL statement_timeout" in _solo_codigo(inspect.getsource(rt._sin_timeout_corto))
 
 
-def test_un_fallo_de_retencion_se_ve():
-    """Anidado en un dict que nadie mira, un fallo no marca la corrida."""
+def test_un_fallo_de_retencion_se_ve(monkeypatch):
+    """Anidado en un dict que nadie mira, un fallo no marca la corrida.
+
+    Antes: `"hubo_error" in getsource(apply_retention)` sin filtrar, y el
+    docstring lo nombraba. Ahora se ejecuta con el purge reventando."""
     import inspect
 
-    retention = pytest.importorskip("retention")
-    assert "hubo_error" in inspect.getsource(retention.apply_retention)
+    rt = pytest.importorskip("retention")
+
+    def revienta(**kw):
+        raise RuntimeError("timeout simulado")
+
+    monkeypatch.setattr(rt, "purge_stock_snapshots", revienta)
+    monkeypatch.setattr(rt, "purge_variants_snapshots", lambda: 0)
+    out = rt.apply_retention()
+    assert out["hubo_error"] is True and "stock_error" in out
+
+    monkeypatch.setattr(rt, "purge_stock_snapshots", lambda **kw: {"borradas_total": 0})
+    out = rt.apply_retention()
+    assert out["hubo_error"] is False
 
     snapshot = pytest.importorskip("snapshot")
     nocturno = _solo_codigo(inspect.getsource(snapshot.nightly_snapshot))
@@ -1183,14 +1267,43 @@ def test_el_audit_no_depende_de_un_disco():
     assert codigo.index("_escribir_en_postgres") < codigo.index("AUDIT_FILE.open")
 
 
-def test_el_audit_nunca_voltea_una_escritura():
-    """Lo llama cada write hacia Bsale: un problema de logging no puede romperla."""
-    import inspect
+def test_el_audit_nunca_voltea_una_escritura(monkeypatch):
+    """Lo llama cada write hacia Bsale: un problema de logging no puede romperla.
 
+    Antes: `"return False" in src`, que satisfacia el `if not DATABASE_URL:
+    return False` aunque el except hiciera raise. Ahora se ejecuta con la
+    sesion reventando."""
     audit = pytest.importorskip("audit")
-    src = inspect.getsource(audit._escribir_en_postgres)
-    assert "except Exception" in src
-    assert "return False" in src
+
+    class SesionRota:
+        def __enter__(self):
+            raise RuntimeError("postgres caido")
+
+        def __exit__(self, *a):
+            return False
+
+    import db
+    # _escribir_en_postgres importa DATABASE_URL y session desde db AL LLAMARSE.
+    monkeypatch.setattr(db, "DATABASE_URL", "postgresql://x")
+    monkeypatch.setattr(db, "session", lambda: SesionRota())
+
+    ev = {"ts": 1788913105.0, "method": "POST", "path": "/x", "actor": "t"}
+    assert audit._escribir_en_postgres(ev) is False
+
+    # Y con la base "sana" devuelve True: el False de arriba no era el del
+    # `if not DATABASE_URL`.
+    class SesionSana:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt):
+            return None
+
+    monkeypatch.setattr(db, "session", lambda: SesionSana())
+    assert audit._escribir_en_postgres(ev) is True
 
 
 def test_no_poder_leer_el_audit_no_es_lo_mismo_que_no_haber_escrituras():
@@ -2004,7 +2117,18 @@ def test_una_variante_en_cero_no_puede_recibir_cualquier_precio():
 
     with pytest.raises(g.GuardrailError) as e:
         g.validate_price_updates([{"variant_id": 1, "new_price": 99000}], current={1: 0.0})
-    assert "no se escribio nada" in str(e.value).lower()
+    # "no se escribio nada" esta en TODOS los GuardrailError: no distinguia
+    # nada. Lo que distingue es que el motivo sea el precio actual en cero, y
+    # que un precio actual normal con el mismo delta NO aborte por eso.
+    assert "sin_precio_actual" in str(e.value) or "precio actual" in str(e.value).lower()
+    assert "umbral" not in str(e.value).lower(), "tiene que abortar por el 0, no por el 5%"
+
+
+def test_precio_actual_negativo_tambien_cuenta_como_sin_precio():
+    """El filtro es `<= 0`, no `is None` ni `not antes`: -1 tambien aborta."""
+    g = pytest.importorskip("guardrails")
+    with pytest.raises(g.GuardrailError):
+        g.validate_price_updates([{"variant_id": 1, "new_price": 10000}], current={1: -1.0})
 
 
 def test_el_tope_de_delta_sigue_funcionando_con_precio_normal():
@@ -2033,10 +2157,11 @@ def test_el_rfm_en_vivo_aplica_la_regla_de_venta_oficial_completa():
     y cruzaba el umbral de "Champion". La version _fast (SQL) si aplicaba la
     regla completa, o sea que los dos RFM daban distinto para el mismo cliente.
     """
-    import inspect
-
     ti = pytest.importorskip("tools_intelligence")
-    codigo = _solo_codigo(inspect.getsource(ti))
+    # Acotado al cuerpo del RFM. Antes se buscaba en el modulo entero, y
+    # "is_official_sale" seguia apareciendo en el ranking: el test pasaba con
+    # el RFM revertido a is_sales_doc.
+    codigo = _cuerpo_de(ti, "bsale_segmentacion_clientes_rfm", None)
 
     assert "if not is_sales_doc(doc):" not in codigo, (
         "is_sales_doc no alcanza: hay que usar is_official_sale"
@@ -2980,3 +3105,129 @@ def test_el_digest_de_ventas_declara_cobertura_de_detalle():
     dg = pytest.importorskip("digests")
     src = _solo_codigo(inspect.getsource(dg.build_ventas_periodo))
     assert '"cobertura_detalle"' in src and "con_detalle" in src
+
+
+# ===========================================================================
+# Segunda auditoria, 09-sep-2026 — Lote 5: tests de COMPORTAMIENTO para los
+# tools que deciden compras (tools_intelligence_db.py estaba al 7,3%: ningun
+# tool se ejecutaba en ningun test).
+# ===========================================================================
+
+class _Fila:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _SesionVelocity:
+    """db.session() falso: devuelve las mismas filas de velocity a cualquier select."""
+
+    def __init__(self, filas):
+        self.filas = filas
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, stmt, params=None):
+        filas = self.filas
+
+        class R:
+            def fetchall(self_inner):
+                return filas
+
+            def first(self_inner):
+                return filas[0] if filas else None
+
+            def scalar(self_inner):
+                return None
+
+        return R()
+
+
+def _tools_db_con(monkeypatch, vel_rows, snap, meta=None):
+    tdb = pytest.importorskip("tools_intelligence_db")
+    import bsale_client as _bc
+    # official_sale_conditions() importa y llama bsale_client.sales_note_type_ids()
+    # AL LLAMARSE, y eso va a la API de Bsale (la primera corrida de este
+    # test pego un 401 real). Nunca red desde un test.
+    monkeypatch.setattr(_bc, "sales_note_type_ids", lambda: frozenset({3, 23, 24, 26, 27}))
+    monkeypatch.setattr(tdb, "db_session", lambda: _SesionVelocity(vel_rows))
+    monkeypatch.setattr(tdb, "cobertura_ultimos_dias", lambda *a, **k: {"pct": 100})
+    meta = meta or {"fuente": "fake", "variantes_pedidas": len(vel_rows),
+                    "variantes_con_fila": len(snap),
+                    "variantes_sin_dato": [r.variant_id for r in vel_rows if r.variant_id not in snap],
+                    "actualizado_desde": "2026-09-08T18:43:14+00:00", "nota": ""}
+    monkeypatch.setattr(tdb, "_stock_de_variantes", lambda vids, office_id=None: (snap, meta))
+    return _tools_de(tdb)
+
+
+def test_proyeccion_de_compras_calcula_y_salta_la_variante_sin_dato(monkeypatch):
+    """Variante 7: 90 u en 90 dias = 1/dia, stock 10, cobertura 45 dias ->
+    pedir 35. Variante 99: sin fila en el snapshot -> NO aparece con orden
+    inventada (bug #2 de la segunda auditoria)."""
+    vel = [_Fila(variant_id=7, total_qty=90.0, code="A", desc="a"),
+           _Fila(variant_id=99, total_qty=45.0, code="B", desc="b")]
+    snap = {7: {1: {"office_name": "s1", "stock": 4.0}, 2: {"office_name": "s2", "stock": 6.0}}}
+    tools = _tools_db_con(monkeypatch, vel, snap)
+
+    r = tools["bsale_proyeccion_compras_fast"](target_coverage_days=45, lookback_days=90)
+
+    assert r["checked_variants"] == 2
+    recs = {x["variant_id"]: x for x in r["recommendations"]}
+    assert 99 not in recs, "sin dato NO es stock 0"
+    assert recs[7]["stock_total"] == 10.0
+    assert recs[7]["velocity_per_day"] == 1.0
+    assert recs[7]["order_qty_suggested"] == 35.0
+    assert r["stock_meta"]["variantes_sin_dato"] == [99]
+    assert r["source"].startswith("snapshot")
+
+
+def test_quiebres_proyectados_ordena_por_dias_y_respeta_el_horizonte(monkeypatch):
+    vel = [_Fila(variant_id=1, total_qty=30.0, code="x", desc=""),   # 1/dia
+           _Fila(variant_id=2, total_qty=30.0, code="y", desc=""),   # 1/dia
+           _Fila(variant_id=3, total_qty=30.0, code="z", desc="")]   # 1/dia
+    snap = {1: {1: {"office_name": "", "stock": 3.0}},     # 3 dias -> critico
+            2: {1: {"office_name": "", "stock": 40.0}},    # 40 dias -> fuera del horizonte 14
+            3: {1: {"office_name": "", "stock": 10.0}}}    # 10 dias -> bajo
+    tools = _tools_db_con(monkeypatch, vel, snap)
+
+    r = tools["bsale_quiebres_proyectados_fast"](days_horizon=14, lookback_days=30)
+
+    ids = [x["variant_id"] for x in r["risks"]]
+    assert ids == [1, 3], "ordenado por dias hasta quiebre y sin la que tiene 40 dias"
+    assert r["risks"][0]["category"] == "critico" and r["risks"][1]["category"] == "bajo"
+    assert r["risks"][0]["stock_by_office"] == {1: 3.0}
+
+
+def test_lookback_cero_devuelve_motivo_y_no_revienta(monkeypatch):
+    tools = _tools_db_con(monkeypatch, [], {})
+    for nombre in ("bsale_quiebres_proyectados_fast", "bsale_proyeccion_compras_fast",
+                   "bsale_sobrestockeos_detectados"):
+        r = tools[nombre](lookback_days=0)
+        assert r.get("aplicado") is False and "lookback_days" in r["motivo"], nombre
+
+
+def test_sobrestockeos_ignora_stock_cero_y_valoriza_a_precio_de_venta(monkeypatch):
+    vel = [_Fila(variant_id=5, total_qty=3.0, total_revenue=30000.0, code="q", desc=""),  # 0.1/dia
+           _Fila(variant_id=6, total_qty=3.0, total_revenue=30000.0, code="w", desc="")]
+    snap = {5: {1: {"office_name": "s1", "stock": 100.0}},   # 1000 dias de cobertura
+            6: {1: {"office_name": "s1", "stock": 0.0}}}     # cero: no es sobrestock
+    tools = _tools_db_con(monkeypatch, vel, snap)
+
+    r = tools["bsale_sobrestockeos_detectados"](min_coverage_days=180, lookback_days=30, min_velocity=0.05)
+
+    ids = [x["variant_id"] for x in r["sobrestockeos"]]
+    assert ids == [5]
+    s = r["sobrestockeos"][0]
+    assert s["coverage_days"] == 1000.0
+    # valorizado a precio de venta: 100 unidades x (30000/3 por unidad) = 1.000.000
+    assert s["valorizado_a_precio_venta_clp"] == 1_000_000.0
+    assert "PRECIO DE VENTA" in r["nota_valorizacion"]
+
+
+def test_sobrestockeos_rechaza_top_check_mayor_a_200(monkeypatch):
+    tools = _tools_db_con(monkeypatch, [], {})
+    r = tools["bsale_sobrestockeos_detectados"](top_check=201)
+    assert r["aplicado"] is False and "200" in r["motivo"]
