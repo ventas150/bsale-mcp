@@ -226,7 +226,15 @@ def recolectar_errores(obj: Any, _ruta: str = "", _prof: int = 0) -> list[str]:
 # error devuelve None y el llamador decide el default conservador.
 # ---------------------------------------------------------------------------
 
+class EstadoIlegible(Exception):
+    """sync_estado no se pudo leer (Postgres caido, timeout). Distinto de
+    'no hay fila': quien decide algo con el estado tiene que saber cual de
+    los dos es, porque con la base mal es justo cuando mas importa."""
+
+
 def _leer_estado(clave: str) -> dict[str, Any] | None:
+    """Fila de sync_estado, o None si no existe. Levanta EstadoIlegible si
+    no se pudo consultar."""
     from sqlalchemy import text
     from db import session as db_session
     try:
@@ -234,10 +242,10 @@ def _leer_estado(clave: str) -> dict[str, Any] | None:
             fila = s.execute(text(
                 "select valor from sync_estado where clave = :c"
             ), {"c": clave}).scalar()
-        return fila if isinstance(fila, dict) else None
     except Exception as e:  # noqa: BLE001
         logger.warning("_leer_estado(%s): %s", clave, e)
-        return None
+        raise EstadoIlegible(str(e)) from e
+    return fila if isinstance(fila, dict) else None
 
 
 def _registrar_estado(clave: str, valor: dict[str, Any]) -> None:
@@ -270,50 +278,82 @@ def _registrar_estado(clave: str, valor: dict[str, Any]) -> None:
 #
 # Un documento sin detalle solo puede ser uno que el snapshot de documentos
 # escribio (o reescribio) DESPUES de la ultima vez que se verifico que no
-# faltaba ninguno. Esa es la marca: se guarda el instante de inicio de una
-# verificacion que termino limpia (0 pendientes, 0 errores) y la corrida
-# siguiente mira solo snapshot_date >= marca - margen. Con la ventana de 30
-# dias del sync de ventas eso son ~6.000 documentos, no 163.000.
+# faltaba ninguno. Esa es la marca: se guarda el instante de inicio de la
+# corrida cuya verificacion termino limpia (0 pendientes, 0 errores) y la
+# corrida siguiente mira solo snapshot_date >= marca - margen. Con la
+# ventana de 30 dias del sync de ventas eso son ~6.000 documentos, no
+# 163.000.
 #
-# Dos redes de seguridad, porque una marca que avanza de mas pierde
+# Tres redes de seguridad, porque una marca que avanza de mas pierde
 # documentos para siempre (ya paso con hist_end() y con days_back=2):
 #   1. Margen de 6 horas hacia atras. snapshot_date es la hora en que EMPEZO
-#      la bajada de documentos, y otro proceso (backfill.py, el tool
-#      run_now del web service) puede confirmar filas viejas de snapshot_date
-#      despues de que esta corrida las busco.
-#   2. Barrido COMPLETO una vez al dia (DETALLE_BARRIDO_HORA_UTC, de
-#      madrugada en Chile), sin marca y con un statement_timeout propio de
-#      3 minutos. Lo que se le haya escapado al incremental se recoge ahi.
+#      la bajada de documentos, y otro proceso (backfill.py usa UN solo
+#      snapshot_ts para todos sus meses; el tool run_now del web service)
+#      puede confirmar filas viejas de snapshot_date despues de que esta
+#      corrida las busco.
+#   2. Barrido COMPLETO por EDAD, no por hora de reloj: cuando el ultimo
+#      barrido completo limpio tiene mas de DETALLE_BARRIDO_CADA_HORAS, sin
+#      marca y con un statement_timeout propio de 3 minutos. Por edad y no
+#      por hora porque una corrida se puede saltar (advisory lock tomado por
+#      una corrida de stock de 2 h) o fallar, y entonces se reintenta a los
+#      30 minutos en vez de esperar al dia siguiente. Se prefiere la
+#      madrugada (DETALLE_BARRIDO_HORA_UTC) cuando la edad ya paso de
+#      DETALLE_BARRIDO_CADA_HORAS, pero se hace a cualquier hora al superar
+#      el doble.
+#   3. Una marca que no avanza en mas de DETALLE_MARCA_ESTANCADA_HORAS
+#      declara `marca_estancada_error` (p.ej. un documento cuyo detalle
+#      falla siempre): pasa por la racha y termina alertando.
 DETALLE_MARCA_CLAVE = "detalle_historico_marca"
 DETALLE_MARCA_MARGEN_HORAS = float(os.getenv("DETALLE_MARCA_MARGEN_HORAS", "6"))
 DETALLE_BARRIDO_HORA_UTC = int(os.getenv("DETALLE_BARRIDO_HORA_UTC", "6"))
+DETALLE_BARRIDO_CADA_HORAS = float(os.getenv("DETALLE_BARRIDO_CADA_HORAS", "20"))
 DETALLE_BARRIDO_TIMEOUT_MS = int(os.getenv("DETALLE_BARRIDO_TIMEOUT_MS", "180000"))
+DETALLE_MARCA_ESTANCADA_HORAS = float(os.getenv("DETALLE_MARCA_ESTANCADA_HORAS", "24"))
 
 
-def _es_hora_de_barrido_completo(now: datetime) -> bool:
-    return now.hour == DETALLE_BARRIDO_HORA_UTC and now.minute < 30
+def _fecha(valor: Any) -> datetime | None:
+    try:
+        d = datetime.fromisoformat(valor)
+    except (TypeError, ValueError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _toca_barrido_completo(marca: dict[str, Any], now: datetime) -> bool:
+    ultimo = _fecha(marca.get("ultimo_barrido_completo_ok"))
+    if ultimo is None:
+        return True
+    edad_h = (now - ultimo).total_seconds() / 3600
+    if edad_h >= 2 * DETALLE_BARRIDO_CADA_HORAS:
+        return True
+    return edad_h >= DETALLE_BARRIDO_CADA_HORAS and now.hour == DETALLE_BARRIDO_HORA_UTC
+
+
+def _marca_desde(now: datetime | None = None) -> tuple[datetime | None, dict[str, Any], str]:
+    """(desde, marca, barrido): el limite inferior de snapshot_date para
+    buscar detalle pendiente, o None si toca recorrer todo."""
+    now = now or datetime.now(timezone.utc)
+    from datetime import timedelta
+    try:
+        marca = _leer_estado(DETALLE_MARCA_CLAVE) or {}
+    except EstadoIlegible:
+        # Sin poder leer la marca se recorre todo: mas lento, nunca
+        # incorrecto. Si Postgres esta tan mal, la consulta fallara igual y
+        # el error se vera en la racha.
+        return None, {}, "completo"
+    verificado = _fecha(marca.get("verificado_hasta"))
+    if verificado is None or _toca_barrido_completo(marca, now):
+        return None, marca, "completo"
+    return verificado - timedelta(hours=DETALLE_MARCA_MARGEN_HORAS), marca, "incremental"
 
 
 def detalle_historico_step(now: datetime | None = None) -> dict[str, Any]:
     """Detalle de linea de lo que aun no lo tiene, con marca de agua."""
-    from datetime import timedelta
     from snapshot import snapshot_details
 
     now = now or datetime.now(timezone.utc)
-    marca = _leer_estado(DETALLE_MARCA_CLAVE) or {}
-    desde: datetime | None = None
-    barrido = "completo"
-    if not _es_hora_de_barrido_completo(now) and marca.get("verificado_hasta"):
-        try:
-            desde = datetime.fromisoformat(marca["verificado_hasta"])
-            if desde.tzinfo is None:
-                desde = desde.replace(tzinfo=timezone.utc)
-            desde = desde - timedelta(hours=DETALLE_MARCA_MARGEN_HORAS)
-            barrido = "incremental"
-        except (TypeError, ValueError):
-            desde = None
+    desde, marca, barrido = _marca_desde(now)
 
-    inicio = datetime.now(timezone.utc)
     res = snapshot_details(
         max_docs=int(os.getenv("DETALLE_HISTORICO_POR_CORRIDA", "2000")),
         oldest_first=True,
@@ -325,21 +365,36 @@ def detalle_historico_step(now: datetime | None = None) -> dict[str, Any]:
     # La marca avanza SOLO si esta verificacion fue limpia: todos los
     # candidatos del alcance entraron (remaining 0) y ninguno fallo. Un
     # documento cuyo detalle fallo por red no tiene fila, y si la marca lo
-    # dejara atras nadie lo volveria a mirar hasta el barrido del dia
-    # siguiente; con errors > 0 la marca se queda donde estaba.
+    # dejara atras nadie lo volveria a mirar hasta el barrido siguiente; con
+    # errors > 0 la marca se queda donde estaba. Y avanza a `now`, el inicio
+    # de la CORRIDA (anterior a todo lo que esta corrida escribio), no al
+    # instante de la consulta: lo escrito entre medio se vuelve a mirar, que
+    # es el lado seguro.
     limpio = res.get("errors") == 0 and res.get("remaining_to_process") == 0
     if limpio:
+        nueva = dict(marca)
+        nueva.update({
+            "verificado_hasta": now.isoformat(),
+            "barrido": barrido,
+            "docs_processed": res.get("docs_processed"),
+        })
+        if barrido == "completo":
+            nueva["ultimo_barrido_completo_ok"] = now.isoformat()
         try:
-            _registrar_estado(DETALLE_MARCA_CLAVE, {
-                "verificado_hasta": inicio.isoformat(),
-                "barrido": barrido,
-                "docs_processed": res.get("docs_processed"),
-            })
-            res["marca_avanzo_a"] = inicio.isoformat()
+            _registrar_estado(DETALLE_MARCA_CLAVE, nueva)
+            res["marca_avanzo_a"] = now.isoformat()
         except Exception as e:  # noqa: BLE001
-            # Sin marca la corrida siguiente hace el barrido completo: mas
-            # lento, nunca incorrecto.
             logger.warning("No se pudo registrar la marca de detalle: %s", e)
+    else:
+        verificado = _fecha(marca.get("verificado_hasta"))
+        if verificado is not None:
+            estancada_h = (now - verificado).total_seconds() / 3600
+            if estancada_h >= DETALLE_MARCA_ESTANCADA_HORAS:
+                res["marca_estancada_error"] = (
+                    "la marca de detalle lleva %.0f h sin avanzar (errors=%s, "
+                    "pendientes=%s): hay documentos cuyo detalle no entra nunca"
+                    % (estancada_h, res.get("errors"), res.get("remaining_to_process"))
+                )
     return res
 
 
@@ -355,35 +410,69 @@ def detalle_historico_step(now: datetime | None = None) -> dict[str, Any]:
 # que la corrida salga en rojo. El error se loguea igual desde la primera, y
 # la racha queda en sync_estado para que bsale_snapshot_status la muestre.
 #
+# "Seguidas" es por PASO y cuenta solo las corridas en que el paso CORRIO:
+# la racha de un paso se limpia cuando ese paso termina bien, no cuando la
+# corrida siguiente no lo ejecuta. Sin eso, un paso diario (variantes a las
+# 05 UTC, el barrido completo) que fallara todos los dias quedaria en racha
+# 1 para siempre y nunca alertaria.
+#
 # Si no se puede leer ni escribir la racha (Postgres caido), se sale en 1 a
 # la primera: sin memoria no hay forma de saber que es transitorio.
 CRON_FALLAS_CLAVE = "cron_fallas"
 CRON_FALLAS_PARA_ALERTAR = int(os.getenv("CRON_FALLAS_PARA_ALERTAR", "3"))
 
 
+def _paso_de(ruta: str) -> str:
+    """'stock.stock_error' -> 'stock'; 'detalle_historico_error' ->
+    'detalle_historico'; 'historico[0].hist_error' -> 'historico';
+    'digests.ventas_hoy' -> 'digests'."""
+    import re
+    cabeza = re.split(r"[.\[]", ruta, maxsplit=1)[0]
+    if cabeza.endswith("_error"):
+        cabeza = cabeza[: -len("_error")]
+    return cabeza or ruta
+
+
+# Pasos cuya clave de EXITO en results no es su propio nombre: la excepcion
+# de sync_ventas deja "ventas_error" pero el exito deja "documents"; la de
+# backfill_historico_step deja "hist_error" y el exito "historico".
+_EXITO_DE_PASO = {"ventas": ("documents", "details"), "hist": ("historico",)}
+
+
+def _paso_corrio_bien(paso: str, results: dict[str, Any]) -> bool:
+    claves = _EXITO_DE_PASO.get(paso, (paso,))
+    return any(k in results for k in claves)
+
+
 def _evaluar_fallas(failed: list[str], results: dict[str, Any] | None = None) -> int:
     """Actualiza la racha por paso y decide el codigo de salida."""
-    # _leer_estado devuelve None tanto si nunca hubo fallas como si no se
-    # pudo leer; en los dos casos la racha parte de cero. La proteccion
-    # contra una base caida esta mas abajo: si tampoco se puede ESCRIBIR la
-    # racha, se sale en 1 a la primera.
-    estado = _leer_estado(CRON_FALLAS_CLAVE) or {}
+    results = results or {}
+    try:
+        estado = _leer_estado(CRON_FALLAS_CLAVE) or {}
+    except EstadoIlegible:
+        if failed:
+            logger.error("Hay pasos con error y no se pudo leer la racha: se sale en 1.")
+            return 1
+        estado = {}
     rachas: dict[str, int] = dict(estado.get("rachas") or {})
-    ahora = datetime.now(timezone.utc).isoformat()
 
+    fallaron = {_paso_de(r) for r in failed}
     nuevas: dict[str, int] = {}
-    for paso in failed:
-        nuevas[paso] = rachas.get(paso, 0) + 1
-    # Los pasos que hoy no fallaron vuelven a cero.
+    for paso, n in rachas.items():
+        # Un paso que corrio y salio bien (esta en results y no en failed)
+        # vuelve a cero; el que no corrio conserva su racha.
+        if paso not in fallaron and _paso_corrio_bien(paso, results):
+            continue
+        nuevas[paso] = n
+    for paso in fallaron:
+        nuevas[paso] = nuevas.get(paso, 0) + 1
     persistentes = {p: n for p, n in nuevas.items() if n >= CRON_FALLAS_PARA_ALERTAR}
 
     valor = {
         "rachas": nuevas,
         "umbral": CRON_FALLAS_PARA_ALERTAR,
-        "ultima_corrida": ahora,
-        "ultimos_errores": {
-            p: str(_valor_en(results or {}, p))[:300] for p in failed
-        },
+        "ultima_corrida": datetime.now(timezone.utc).isoformat(),
+        "ultimos_errores": {r: str(_valor_en(results, r))[:300] for r in failed},
         "alerto": sorted(persistentes),
     }
     try:
@@ -475,7 +564,14 @@ def sync_ventas() -> dict[str, Any]:
     # Ventana de 90 dias: cada corrida procesa hasta 400 documentos sin detalle,
     # asi el cron va completando el backlog historico de ~90 dias por si solo
     # (de lo mas reciente a lo mas viejo). Cuando esta al dia, solo mantiene lo nuevo.
-    out["details"] = snapshot_details(batch_size=400, max_docs=100000, only_recent_days=90)
+    # Acotado tambien por la marca de agua (misma razon que detalle_historico:
+    # este anti-join sobre 90 dias, ~30.000 documentos, corria cada 30 min).
+    # Sin marca legible, recorre los 90 dias como antes.
+    desde, _, _ = _marca_desde()
+    out["details"] = snapshot_details(
+        batch_size=400, max_docs=100000, only_recent_days=90,
+        desde_snapshot_date=desde,
+    )
     return out
 
 

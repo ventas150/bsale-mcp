@@ -394,9 +394,19 @@ def ensure_indexes(engine=None) -> None:
     for nombre, tabla, columna in INDICES_POSTERIORES:
         try:
             with engine.begin() as conn:
-                conn.execute(text(
-                    f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla} ({columna})"
-                ))
+                # Primero mirar si existe: CREATE INDEX IF NOT EXISTS toma el
+                # ShareLock sobre la tabla ANTES de chequear el nombre, y eso
+                # es un lock en cada arranque del web y cada corrida del cron.
+                if conn.execute(text("select to_regclass(:n)"), {"n": nombre}).scalar():
+                    continue
+                # lock_timeout corto: si hay un upsert largo en vuelo no se
+                # encola detras (encolaria a todos los escritores nuevos);
+                # se reintenta en el proximo arranque. statement_timeout
+                # propio porque el del engine (20 s) es para consultas.
+                conn.execute(text("SET LOCAL lock_timeout = 5000"))
+                conn.execute(text("SET LOCAL statement_timeout = 180000"))
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla} ({columna})"))
+                logger.info("ensure_indexes: creado %s", nombre)
         except Exception as e:  # noqa: BLE001
             logger.warning("ensure_indexes %s: %s", nombre, e)
 

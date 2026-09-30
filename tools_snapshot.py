@@ -391,6 +391,10 @@ def register(mcp) -> None:  # noqa: ANN001
             marca_detalle = estado.get("detalle_historico_marca")
         except Exception as e:  # noqa: BLE001
             ultima_corrida_stock = {"error_al_leer": str(e)[:200]}
+            # None se leeria como "sin fallas / sin marca"; que diga que no
+            # se pudo leer.
+            cron_fallas = {"error_al_leer": str(e)[:200]}
+            marca_detalle = {"error_al_leer": str(e)[:200]}
 
         with db_session() as s:
             doc_max = s.execute(select(func.max(documents_snapshot.c.snapshot_date))).scalar()

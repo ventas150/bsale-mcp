@@ -722,7 +722,7 @@ def snapshot_details(
         """Fila marcadora para que el documento cuente como PROCESADO.
 
         line_id -1: el documento no tiene lineas. line_id -2: tiene mas de
-        2.000 y no se cargo. Con variant_id NULL y quantity 0 no suma a ningun
+        2.000 y no se cargo. line_id -3: Bsale respondio 404 al detalle. Con variant_id NULL y quantity 0 no suma a ningun
         agregado (todos filtran variant_id IS NOT NULL o suman cantidades), y
         SI cuenta en la cobertura de detalle, que es lo correcto: el documento
         fue leido.
@@ -732,7 +732,11 @@ def snapshot_details(
             "line_id": line_id,
             "variant_id": None,
             "variant_code": None,
-            "variant_description": "(sin lineas)" if line_id == -1 else "(mas de 2000 lineas, no cargado)",
+            "variant_description": {
+                -1: "(sin lineas)",
+                -2: "(mas de 2000 lineas, no cargado)",
+                -3: "(detalle no disponible en Bsale: 404)",
+            }[line_id],
             "office_id": cand.office_id,
             "emission_date": cand.emission_date,
             "document_type_use": cand.document_type_use or 0,
@@ -774,7 +778,13 @@ def snapshot_details(
                 # pendiente de un tratamiento aparte.
                 return doc_id, [_centinela(cand, -2)], "truncado"
             items = fetch["items"] or []
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Un 404 es permanente: el documento ya no existe en Bsale (o no
+            # tiene detalle consultable). Sin centinela iba primero en cada
+            # corrida (oldest_first), sumaba errors=1 para siempre y, con la
+            # marca de agua, congelaba la marca: nada avanzaba nunca mas.
+            if "respondio 404" in str(e):
+                return doc_id, [_centinela(cand, -3)], "404"
             return doc_id, [], True
 
         if not items:
@@ -830,6 +840,7 @@ def snapshot_details(
 
     docs_sin_lineas = 0
     docs_truncados = 0
+    docs_404 = 0
     if todo:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             for _doc_id, filas, hubo_error in pool.map(_bajar, todo):
@@ -838,6 +849,8 @@ def snapshot_details(
                     continue
                 if hubo_error == "truncado":
                     docs_truncados += 1
+                elif hubo_error == "404":
+                    docs_404 += 1
                 elif filas and filas[0]["line_id"] == -1:
                     docs_sin_lineas += 1
                 # Dedupe por (document_id, line_id), misma razon que en documentos.
@@ -854,6 +867,7 @@ def snapshot_details(
         "errors": errors,
         "docs_sin_lineas": docs_sin_lineas,
         "docs_con_mas_de_2000_lineas": docs_truncados,
+        "docs_404_en_bsale": docs_404,
         "cap_efectivo": cap,
         "remaining_to_process": max(0, pendientes_antes - docs_processed),
         "candidates_total": pendientes_antes,
