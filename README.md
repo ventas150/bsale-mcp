@@ -57,6 +57,25 @@ python -m src.server
 
 El server arranca en `http://localhost:8000/mcp`
 
+## Tests
+
+Dos familias, las dos se corren desde el PC con el venv (`pip install -r requirements-dev.txt`):
+
+- **Unitaria** (`test_venta_oficial.py`): sin red ni base, sesion y cliente falsos.
+  `.venv\Scripts\python.exe -m pytest -q`
+- **Integracion** (`test_integracion.py`): contra un **Postgres real**. Crea el esquema
+  con `init_db()`, siembra 200 documentos y 500 lineas, y corre de verdad
+  `snapshot_details` con marca de agua, `ensure_indexes`, la racha del cron,
+  `apply_retention`, los digests y los tools `_fast`. Sin `DATABASE_URL_TEST` se
+  SALTA entera; se niega a correr contra una URL de Render. Bsale sigue falso.
+  `scripts\pg-test.cmd` (solo integracion) o `scripts\pg-test.cmd todo` (las dos).
+
+El Postgres de pruebas del PC es portable (sin instalador ni servicio): binarios
+EDB de PostgreSQL 18 en `C:\Users\rolguin\pg18\pgsql`, datos en
+`C:\Users\rolguin\pgdata`, puerto **5433**, usuario `postgres` sin clave (trust,
+solo localhost), base `bsale_test`. `pg-test.cmd` lo arranca si esta apagado;
+para apagarlo: `C:\Users\rolguin\pg18\pgsql\bin\pg_ctl -D C:\Users\rolguin\pgdata stop`.
+
 ## Deploy en Render
 
 Ver `DEPLOY.md` para el paso a paso de deployment.
