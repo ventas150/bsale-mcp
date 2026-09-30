@@ -377,11 +377,18 @@ def register(mcp) -> None:  # noqa: ANN001
         (`en_curso`) o con que error se cayo. "Fresco" no es "completo".
         """
         ultima_corrida_stock = None
+        cron_fallas = None
+        marca_detalle = None
         try:
             with db_session() as s:
-                ultima_corrida_stock = s.execute(text(
-                    "select valor from sync_estado where clave = 'stock_ultima_corrida'"
-                )).scalar()
+                filas = s.execute(text(
+                    "select clave, valor from sync_estado where clave in "
+                    "('stock_ultima_corrida', 'cron_fallas', 'detalle_historico_marca')"
+                )).fetchall()
+            estado = {clave: valor for clave, valor in filas}
+            ultima_corrida_stock = estado.get("stock_ultima_corrida")
+            cron_fallas = estado.get("cron_fallas")
+            marca_detalle = estado.get("detalle_historico_marca")
         except Exception as e:  # noqa: BLE001
             ultima_corrida_stock = {"error_al_leer": str(e)[:200]}
 
@@ -427,6 +434,17 @@ def register(mcp) -> None:  # noqa: ANN001
             "variants": {
                 "last_snapshot": var_max.isoformat() if var_max else None,
                 "total_rows": var_count,
+            },
+            # Racha de fallas por paso del cron (sync_incremental). El cron
+            # sale en rojo recien cuando un paso falla `umbral` corridas
+            # seguidas; una racha de 1 es un transitorio que se limpio solo.
+            "cron": {
+                "fallas": cron_fallas,
+                "detalle_marca": marca_detalle,
+                "nota": (
+                    "rachas = corridas seguidas con error por paso; alerto = pasos "
+                    "que llegaron al umbral en la ultima corrida."
+                ),
             },
         }
 

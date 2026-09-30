@@ -15,7 +15,7 @@ from typing import Any
 
 from concurrent.futures import ThreadPoolExecutor
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bsale_client import get_client, is_sales_doc, iso_to_epoch_range
@@ -602,6 +602,8 @@ def snapshot_details(
     date_from: str | None = None,
     date_to: str | None = None,
     oldest_first: bool = False,
+    desde_snapshot_date: datetime | None = None,
+    statement_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     """Para docs en documents_snapshot que aun no tienen details, fetch y store.
 
@@ -624,6 +626,17 @@ def snapshot_details(
             a esa ventana se iba a completar NUNCA por si solo.
         oldest_first: Procesa del mas viejo al mas nuevo. Para que un backfill
             historico avance en vez de quedarse siempre en lo reciente.
+        desde_snapshot_date: Solo docs con snapshot_date >= este instante, o
+            sea los que el snapshot de documentos escribio (o reescribio)
+            desde entonces. Es la marca de agua del cron: sin ella el
+            anti-join recorre los 163.000 documentos contra las 370.000
+            lineas cada 30 minutos SOLO para descubrir que no falta nada, y
+            con la base ocupada se pasa del statement_timeout de 20 s
+            (corrida en rojo del 30-sep-2026, verificada en el log; los
+            avisos del 09, 11 y 17-sep no se pudieron verificar).
+        statement_timeout_ms: statement_timeout SOLO para la consulta de
+            candidatos (SET LOCAL). Lo usa el barrido completo diario, que
+            si tiene que recorrer todo y no cabe en los 20 s del engine.
 
     Returns:
         Dict con count de docs procesados, lineas insertadas, errores y el
@@ -639,10 +652,19 @@ def snapshot_details(
     # documentos del snapshot para cruzarlos en memoria (159.000 filas y
     # subiendo) solo para quedarse con unos cientos.
     with db_session() as s:
+        if statement_timeout_ms:
+            # SET LOCAL: vale solo para esta transaccion. El engine fija 20 s
+            # por conexion (db.py) y eso esta bien para el web service; el
+            # barrido completo del cron es la unica consulta que necesita mas.
+            # SET no acepta parametros ligados: el valor va inline, y es un
+            # int() a proposito.
+            s.execute(text("SET LOCAL statement_timeout = %d" % int(statement_timeout_ms)))
         ya_tienen = select(document_details_snapshot.c.document_id).where(
             document_details_snapshot.c.document_id == documents_snapshot.c.document_id
         )
         filtros = [~ya_tienen.exists()]
+        if desde_snapshot_date is not None:
+            filtros.append(documents_snapshot.c.snapshot_date >= desde_snapshot_date)
         if only_recent_days:
             from datetime import timedelta as _td
             cutoff = datetime.now(timezone.utc) - _td(days=only_recent_days)
@@ -835,6 +857,11 @@ def snapshot_details(
         "cap_efectivo": cap,
         "remaining_to_process": max(0, pendientes_antes - docs_processed),
         "candidates_total": pendientes_antes,
+        # Que alcance declara la cifra: un "0 pendientes" con marca de agua
+        # solo habla de lo escrito desde esa marca, no de toda la tabla.
+        "desde_snapshot_date": (
+            desde_snapshot_date.isoformat() if desde_snapshot_date is not None else None
+        ),
     }
 
 

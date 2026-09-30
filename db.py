@@ -53,7 +53,11 @@ documents_snapshot = Table(
     "documents_snapshot",
     metadata,
     Column("document_id", Integer, primary_key=True),
-    Column("snapshot_date", DateTime(timezone=True)),
+    # index=True desde el 30-sep-2026: es la marca de agua del backfill de
+    # detalle (snapshot_details(desde_snapshot_date=...)). En la base que ya
+    # existe lo crea ensure_indexes(), porque create_all no toca tablas que
+    # ya estan.
+    Column("snapshot_date", DateTime(timezone=True), index=True),
     Column("emission_date", DateTime(timezone=True), index=True),
     Column("office_id", Integer, index=True),
     Column("office_name", String(200)),
@@ -365,7 +369,36 @@ def init_db() -> None:
         return
     engine = get_engine()
     metadata.create_all(engine)
+    ensure_indexes(engine)
     logger.info("DB schema inicializado")
+
+
+# Indices agregados DESPUES de que la tabla existia. create_all(checkfirst)
+# se salta las tablas que ya estan, indices nuevos incluidos, asi que un
+# index=True en la Column solo sirve para bases nuevas. Aca se crean con
+# IF NOT EXISTS y el MISMO nombre que SQLAlchemy les da (ix_<tabla>_<col>),
+# para que una base nueva y una vieja terminen iguales.
+INDICES_POSTERIORES = (
+    ("ix_documents_snapshot_snapshot_date", "documents_snapshot", "snapshot_date"),
+)
+
+
+def ensure_indexes(engine=None) -> None:
+    """Crea los indices de INDICES_POSTERIORES si faltan. Idempotente.
+
+    No puede voltear el arranque: sin el indice la marca de agua funciona
+    igual (mas lenta), y ya hubo un incidente de servicio caido por un
+    detalle del esquema.
+    """
+    engine = engine or get_engine()
+    for nombre, tabla, columna in INDICES_POSTERIORES:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla} ({columna})"
+                ))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ensure_indexes %s: %s", nombre, e)
 
 
 def db_health() -> dict[str, Any]:

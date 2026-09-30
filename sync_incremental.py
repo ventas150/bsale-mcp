@@ -221,6 +221,203 @@ def recolectar_errores(obj: Any, _ruta: str = "", _prof: int = 0) -> list[str]:
     return hallazgos
 
 
+# ---------------------------------------------------------------------------
+# Estado persistente del cron (tabla sync_estado). Lectura tolerante: ante un
+# error devuelve None y el llamador decide el default conservador.
+# ---------------------------------------------------------------------------
+
+def _leer_estado(clave: str) -> dict[str, Any] | None:
+    from sqlalchemy import text
+    from db import session as db_session
+    try:
+        with db_session() as s:
+            fila = s.execute(text(
+                "select valor from sync_estado where clave = :c"
+            ), {"c": clave}).scalar()
+        return fila if isinstance(fila, dict) else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("_leer_estado(%s): %s", clave, e)
+        return None
+
+
+def _registrar_estado(clave: str, valor: dict[str, Any]) -> None:
+    """Upsert en sync_estado. A diferencia de snapshot._registrar_estado,
+    ESTE SI LEVANTA la excepcion: _evaluar_fallas necesita saber si la racha
+    quedo escrita para decidir si puede confiar en ella."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from db import session as db_session, sync_estado
+    with db_session() as s:
+        stmt = pg_insert(sync_estado).values(
+            clave=clave, valor=valor, actualizado=datetime.now(timezone.utc),
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["clave"],
+            set_={"valor": stmt.excluded.valor, "actualizado": stmt.excluded.actualizado},
+        )
+        s.execute(stmt)
+
+
+# Marca de agua del backfill de detalle de linea.
+#
+# El paso "detalle_historico" buscaba, cada 30 minutos, documentos sin lineas
+# en TODA documents_snapshot: un anti-join de 163.000 documentos contra
+# 370.000 lineas, dos veces (candidatos y count), para descubrir que no falta
+# nada. Con la base ocupada (el web service, el insert de detalle que corre
+# justo antes) se pasaba del statement_timeout de 20 s, el paso quedaba en
+# *_error y el cron salia en rojo. Verificado en el log del 30-sep-2026
+# (QueryCanceled en esa consulta); Render mando el mismo aviso el 09, 11 y
+# 17-sep, pero esos logs ya no estaban para confirmar la causa.
+#
+# Un documento sin detalle solo puede ser uno que el snapshot de documentos
+# escribio (o reescribio) DESPUES de la ultima vez que se verifico que no
+# faltaba ninguno. Esa es la marca: se guarda el instante de inicio de una
+# verificacion que termino limpia (0 pendientes, 0 errores) y la corrida
+# siguiente mira solo snapshot_date >= marca - margen. Con la ventana de 30
+# dias del sync de ventas eso son ~6.000 documentos, no 163.000.
+#
+# Dos redes de seguridad, porque una marca que avanza de mas pierde
+# documentos para siempre (ya paso con hist_end() y con days_back=2):
+#   1. Margen de 6 horas hacia atras. snapshot_date es la hora en que EMPEZO
+#      la bajada de documentos, y otro proceso (backfill.py, el tool
+#      run_now del web service) puede confirmar filas viejas de snapshot_date
+#      despues de que esta corrida las busco.
+#   2. Barrido COMPLETO una vez al dia (DETALLE_BARRIDO_HORA_UTC, de
+#      madrugada en Chile), sin marca y con un statement_timeout propio de
+#      3 minutos. Lo que se le haya escapado al incremental se recoge ahi.
+DETALLE_MARCA_CLAVE = "detalle_historico_marca"
+DETALLE_MARCA_MARGEN_HORAS = float(os.getenv("DETALLE_MARCA_MARGEN_HORAS", "6"))
+DETALLE_BARRIDO_HORA_UTC = int(os.getenv("DETALLE_BARRIDO_HORA_UTC", "6"))
+DETALLE_BARRIDO_TIMEOUT_MS = int(os.getenv("DETALLE_BARRIDO_TIMEOUT_MS", "180000"))
+
+
+def _es_hora_de_barrido_completo(now: datetime) -> bool:
+    return now.hour == DETALLE_BARRIDO_HORA_UTC and now.minute < 30
+
+
+def detalle_historico_step(now: datetime | None = None) -> dict[str, Any]:
+    """Detalle de linea de lo que aun no lo tiene, con marca de agua."""
+    from datetime import timedelta
+    from snapshot import snapshot_details
+
+    now = now or datetime.now(timezone.utc)
+    marca = _leer_estado(DETALLE_MARCA_CLAVE) or {}
+    desde: datetime | None = None
+    barrido = "completo"
+    if not _es_hora_de_barrido_completo(now) and marca.get("verificado_hasta"):
+        try:
+            desde = datetime.fromisoformat(marca["verificado_hasta"])
+            if desde.tzinfo is None:
+                desde = desde.replace(tzinfo=timezone.utc)
+            desde = desde - timedelta(hours=DETALLE_MARCA_MARGEN_HORAS)
+            barrido = "incremental"
+        except (TypeError, ValueError):
+            desde = None
+
+    inicio = datetime.now(timezone.utc)
+    res = snapshot_details(
+        max_docs=int(os.getenv("DETALLE_HISTORICO_POR_CORRIDA", "2000")),
+        oldest_first=True,
+        desde_snapshot_date=desde,
+        statement_timeout_ms=DETALLE_BARRIDO_TIMEOUT_MS if barrido == "completo" else None,
+    )
+    res["barrido"] = barrido
+
+    # La marca avanza SOLO si esta verificacion fue limpia: todos los
+    # candidatos del alcance entraron (remaining 0) y ninguno fallo. Un
+    # documento cuyo detalle fallo por red no tiene fila, y si la marca lo
+    # dejara atras nadie lo volveria a mirar hasta el barrido del dia
+    # siguiente; con errors > 0 la marca se queda donde estaba.
+    limpio = res.get("errors") == 0 and res.get("remaining_to_process") == 0
+    if limpio:
+        try:
+            _registrar_estado(DETALLE_MARCA_CLAVE, {
+                "verificado_hasta": inicio.isoformat(),
+                "barrido": barrido,
+                "docs_processed": res.get("docs_processed"),
+            })
+            res["marca_avanzo_a"] = inicio.isoformat()
+        except Exception as e:  # noqa: BLE001
+            # Sin marca la corrida siguiente hace el barrido completo: mas
+            # lento, nunca incorrecto.
+            logger.warning("No se pudo registrar la marca de detalle: %s", e)
+    return res
+
+
+# Racha de fallas por paso.
+#
+# El cron sale con codigo 1 si CUALQUIER paso deja un *_error (y eso esta
+# bien: la retencion fallo meses en silencio antes de que existiera esa
+# regla). Pero Render manda un correo por cada corrida en rojo, y un paso que
+# falla UNA vez por algo transitorio (QueryCanceled, una tanda de 429, un
+# 5xx de Bsale) y se recupera solo a los 30 minutos no merece un correo
+# (4 avisos en septiembre sobre ~1.000 corridas). Regla: el mismo paso tiene que
+# fallar en CRON_FALLAS_PARA_ALERTAR corridas SEGUIDAS (3 = 1,5 horas) para
+# que la corrida salga en rojo. El error se loguea igual desde la primera, y
+# la racha queda en sync_estado para que bsale_snapshot_status la muestre.
+#
+# Si no se puede leer ni escribir la racha (Postgres caido), se sale en 1 a
+# la primera: sin memoria no hay forma de saber que es transitorio.
+CRON_FALLAS_CLAVE = "cron_fallas"
+CRON_FALLAS_PARA_ALERTAR = int(os.getenv("CRON_FALLAS_PARA_ALERTAR", "3"))
+
+
+def _evaluar_fallas(failed: list[str], results: dict[str, Any] | None = None) -> int:
+    """Actualiza la racha por paso y decide el codigo de salida."""
+    # _leer_estado devuelve None tanto si nunca hubo fallas como si no se
+    # pudo leer; en los dos casos la racha parte de cero. La proteccion
+    # contra una base caida esta mas abajo: si tampoco se puede ESCRIBIR la
+    # racha, se sale en 1 a la primera.
+    estado = _leer_estado(CRON_FALLAS_CLAVE) or {}
+    rachas: dict[str, int] = dict(estado.get("rachas") or {})
+    ahora = datetime.now(timezone.utc).isoformat()
+
+    nuevas: dict[str, int] = {}
+    for paso in failed:
+        nuevas[paso] = rachas.get(paso, 0) + 1
+    # Los pasos que hoy no fallaron vuelven a cero.
+    persistentes = {p: n for p, n in nuevas.items() if n >= CRON_FALLAS_PARA_ALERTAR}
+
+    valor = {
+        "rachas": nuevas,
+        "umbral": CRON_FALLAS_PARA_ALERTAR,
+        "ultima_corrida": ahora,
+        "ultimos_errores": {
+            p: str(_valor_en(results or {}, p))[:300] for p in failed
+        },
+        "alerto": sorted(persistentes),
+    }
+    try:
+        _registrar_estado(CRON_FALLAS_CLAVE, valor)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("No se pudo registrar la racha de fallas: %s", e)
+        return 1 if failed else 0
+
+    if persistentes:
+        logger.error("Pasos con error en %d o mas corridas seguidas: %s",
+                     CRON_FALLAS_PARA_ALERTAR, persistentes)
+        return 1
+    if failed:
+        logger.warning("Pasos con error (transitorio hasta ahora, racha %s; "
+                       "alerta al llegar a %d): %s",
+                       nuevas, CRON_FALLAS_PARA_ALERTAR, failed)
+    return 0
+
+
+def _valor_en(obj: Any, ruta: str) -> Any:
+    """Sigue una ruta 'a.b[0].c' de recolectar_errores dentro del dict."""
+    import re
+    cur = obj
+    for tramo in re.findall(r"[^.\[\]]+|\[\d+\]", ruta):
+        try:
+            if tramo.startswith("["):
+                cur = cur[int(tramo[1:-1])]
+            else:
+                cur = cur[tramo]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return cur
+
+
 def backfill_historico_step() -> dict[str, Any]:
     """Carga UN mes histórico de documentos y avanza el cursor. Idempotente."""
     cur = _hist_cursor_get()
@@ -457,13 +654,12 @@ def _run(modo: str) -> int:
     # doc/s medidos. Con 48 corridas al dia son ~96.000 documentos diarios,
     # o sea que los ~51.000 pendientes se cierran en menos de un dia sin
     # alargar ninguna corrida ni arriesgar solapamiento.
+    #
+    # Desde el 30-sep-2026 va con marca de agua (ver detalle_historico_step):
+    # el anti-join sobre toda la tabla cada 30 minutos era lo que se pasaba
+    # del statement_timeout y pintaba el cron de rojo.
     try:
-        from snapshot import snapshot_details
-
-        results["detalle_historico"] = snapshot_details(
-            max_docs=int(os.getenv("DETALLE_HISTORICO_POR_CORRIDA", "2000")),
-            oldest_first=True,
-        )
+        results["detalle_historico"] = detalle_historico_step(now)
     except Exception as e:  # noqa: BLE001
         logger.error("Error en el backfill historico de detalle: %s", e)
         results["detalle_historico_error"] = str(e)
@@ -507,8 +703,7 @@ def _run(modo: str) -> int:
     failed = recolectar_errores(results)
     if failed:
         logger.error("Pasos con error: %s", failed)
-        return 1
-    return 0
+    return _evaluar_fallas(failed, results)
 
 
 def main() -> int:

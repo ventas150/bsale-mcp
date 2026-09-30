@@ -1191,11 +1191,16 @@ def test_el_backfill_historico_vive_donde_el_cron_lo_ejecuta():
     sync = pytest.importorskip("sync_incremental")
     codigo = _solo_codigo(inspect.getsource(sync._run))
 
-    assert "snapshot_details(" in codigo, (
+    # Desde el 30-sep-2026 el paso vive en detalle_historico_step (marca de
+    # agua), y _run lo llama. Lo que se protege es lo mismo: que el cron lo
+    # ejecute de verdad.
+    assert "detalle_historico_step(" in codigo, (
         "el backfill historico de detalle tiene que estar en sync_incremental.run(), "
         "que es lo que el cron ejecuta de verdad"
     )
-    assert "oldest_first=True" in codigo, (
+    paso = _solo_codigo(inspect.getsource(sync.detalle_historico_step))
+    assert "snapshot_details(" in paso
+    assert "oldest_first=True" in paso, (
         "sin oldest_first nunca se llega a los periodos viejos"
     )
 
@@ -1209,7 +1214,7 @@ def test_el_presupuesto_por_corrida_cabe_en_la_cadencia():
     import inspect
 
     sync = pytest.importorskip("sync_incremental")
-    codigo = _solo_codigo(inspect.getsource(sync._run))
+    codigo = _solo_codigo(inspect.getsource(sync.detalle_historico_step))
     assert 'DETALLE_HISTORICO_POR_CORRIDA", "2000"' in codigo
 
 
@@ -3860,3 +3865,240 @@ def test_cruce_detecta_la_boleta_que_falta(monkeypatch):
     assert r["cuadra"] is False
     assert r["por_sucursal"][0]["diferencia"] == -1
     assert r["por_sucursal"][0]["documentos"][0]["generado"] == "13:30:08", "hora de Chile, para ver si es reciente"
+
+
+# ===========================================================================
+# 30-sep-2026 - el cron en rojo por el anti-join de detalle
+# ===========================================================================
+# Correos de Render "Cron job failure" el 09, 11, 17 y 30-sep. El del 30
+# (el unico con log disponible): psycopg QueryCanceled (statement timeout de 20 s) en la
+# consulta de candidatos del backfill de detalle, que recorria TODA
+# documents_snapshot contra document_details_snapshot cada 30 minutos para
+# descubrir que no faltaba nada. Dos arreglos: marca de agua sobre
+# snapshot_date (con barrido completo diario) y racha de fallas por paso
+# antes de salir en 1.
+
+class _EstadoEnMemoria:
+    """sync_estado falsa: _leer_estado/_registrar_estado sobre un dict."""
+
+    def __init__(self, inicial=None, escribir_falla=False):
+        self.d = dict(inicial or {})
+        self.escribir_falla = escribir_falla
+        self.escrituras = []
+
+    def leer(self, clave):
+        return self.d.get(clave)
+
+    def registrar(self, clave, valor):
+        if self.escribir_falla:
+            raise RuntimeError("postgres caido")
+        self.d[clave] = valor
+        self.escrituras.append((clave, valor))
+
+
+def _montar_detalle(monkeypatch, estado, resultado=None):
+    """Deja detalle_historico_step corriendo contra un snapshot_details falso
+    que solo captura los kwargs con que lo llamaron."""
+    sync = pytest.importorskip("sync_incremental")
+    sn = pytest.importorskip("snapshot")
+    llamadas = []
+
+    def falso(**kw):
+        llamadas.append(kw)
+        return dict(resultado or {"errors": 0, "remaining_to_process": 0, "docs_processed": 0})
+
+    monkeypatch.setattr(sn, "snapshot_details", falso)
+    monkeypatch.setattr(sync, "_leer_estado", estado.leer)
+    monkeypatch.setattr(sync, "_registrar_estado", estado.registrar)
+    return sync, llamadas
+
+
+def test_el_backfill_de_detalle_usa_la_marca_de_agua_con_margen(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    marca = datetime(2026, 9, 30, 17, 30, tzinfo=timezone.utc)
+    estado = _EstadoEnMemoria({"detalle_historico_marca": {"verificado_hasta": marca.isoformat()}})
+    sync, llamadas = _montar_detalle(monkeypatch, estado)
+
+    ahora = datetime(2026, 9, 30, 18, 0, tzinfo=timezone.utc)  # no es la hora del barrido
+    res = sync.detalle_historico_step(ahora)
+
+    assert len(llamadas) == 1
+    kw = llamadas[0]
+    assert kw["desde_snapshot_date"] == marca - timedelta(hours=sync.DETALLE_MARCA_MARGEN_HORAS), (
+        "el incremental mira desde la marca MENOS el margen, no desde la marca"
+    )
+    assert kw["oldest_first"] is True
+    assert kw["statement_timeout_ms"] is None, "el incremental usa el timeout normal del engine"
+    assert res["barrido"] == "incremental"
+
+    # Verificacion limpia: la marca avanza al INICIO de la consulta, no al final.
+    assert estado.escrituras and estado.escrituras[-1][0] == "detalle_historico_marca"
+    nueva = datetime.fromisoformat(estado.d["detalle_historico_marca"]["verificado_hasta"])
+    assert nueva > marca
+    assert "marca_avanzo_a" in res
+
+
+def test_sin_marca_el_barrido_es_completo_y_con_timeout_propio(monkeypatch):
+    from datetime import datetime, timezone
+
+    estado = _EstadoEnMemoria()
+    sync, llamadas = _montar_detalle(monkeypatch, estado)
+
+    res = sync.detalle_historico_step(datetime(2026, 9, 30, 18, 0, tzinfo=timezone.utc))
+    kw = llamadas[0]
+    assert kw["desde_snapshot_date"] is None
+    assert kw["statement_timeout_ms"] == sync.DETALLE_BARRIDO_TIMEOUT_MS
+    assert res["barrido"] == "completo"
+
+
+def test_a_la_hora_del_barrido_se_ignora_la_marca(monkeypatch):
+    """Red de seguridad: lo que se le escape al incremental se recoge una vez
+    al dia recorriendo todo, con un statement_timeout que si alcance."""
+    from datetime import datetime, timezone
+
+    estado = _EstadoEnMemoria({"detalle_historico_marca": {"verificado_hasta": "2026-09-30T17:30:00+00:00"}})
+    sync, llamadas = _montar_detalle(monkeypatch, estado)
+
+    ahora = datetime(2026, 10, 1, sync.DETALLE_BARRIDO_HORA_UTC, 5, tzinfo=timezone.utc)
+    res = sync.detalle_historico_step(ahora)
+    assert llamadas[0]["desde_snapshot_date"] is None
+    assert llamadas[0]["statement_timeout_ms"] == sync.DETALLE_BARRIDO_TIMEOUT_MS
+    assert res["barrido"] == "completo"
+    assert estado.d["detalle_historico_marca"]["barrido"] == "completo"
+
+
+@pytest.mark.parametrize("resultado", [
+    {"errors": 3, "remaining_to_process": 0, "docs_processed": 10},   # fallo de red en 3 docs
+    {"errors": 0, "remaining_to_process": 500, "docs_processed": 2000},  # quedaron pendientes
+])
+def test_la_marca_no_avanza_si_la_verificacion_no_fue_limpia(monkeypatch, resultado):
+    """Una marca que avanza de mas pierde documentos para siempre: ya paso
+    con hist_end() y con days_back=2. Con errores o pendientes se queda."""
+    from datetime import datetime, timezone
+
+    vieja = {"verificado_hasta": "2026-09-30T17:30:00+00:00"}
+    estado = _EstadoEnMemoria({"detalle_historico_marca": dict(vieja)})
+    sync, _ = _montar_detalle(monkeypatch, estado, resultado)
+
+    res = sync.detalle_historico_step(datetime(2026, 9, 30, 18, 0, tzinfo=timezone.utc))
+    assert estado.escrituras == []
+    assert estado.d["detalle_historico_marca"] == vieja
+    assert "marca_avanzo_a" not in res
+
+
+def test_snapshot_details_filtra_por_snapshot_date_y_lo_declara():
+    import inspect
+
+    sn = pytest.importorskip("snapshot")
+    params = inspect.signature(sn.snapshot_details).parameters
+    assert "desde_snapshot_date" in params and "statement_timeout_ms" in params
+    src = _solo_codigo(inspect.getsource(sn.snapshot_details))
+    assert "documents_snapshot.c.snapshot_date >= desde_snapshot_date" in src
+    assert '"desde_snapshot_date":' in src, "el resultado declara el alcance del conteo"
+    assert "SET LOCAL statement_timeout" in src, "el timeout largo es SET LOCAL, no del engine"
+    assert "statement_timeout = :ms" not in src, "SET no acepta parametros ligados"
+
+
+def test_snapshot_date_tiene_indice_por_las_dos_vias():
+    """create_all no agrega indices a tablas que ya existen: en la base viva
+    lo crea ensure_indexes() con el MISMO nombre que le daria SQLAlchemy."""
+    import inspect
+
+    db = pytest.importorskip("db")
+    col = db.documents_snapshot.c.snapshot_date
+    assert col.index is True
+    assert ("ix_documents_snapshot_snapshot_date", "documents_snapshot", "snapshot_date") in db.INDICES_POSTERIORES
+    assert "ensure_indexes(" in _solo_codigo(inspect.getsource(db.init_db))
+    assert "IF NOT EXISTS" in _solo_codigo(inspect.getsource(db.ensure_indexes))
+
+
+def _montar_racha(monkeypatch, estado):
+    sync = pytest.importorskip("sync_incremental")
+    monkeypatch.setattr(sync, "_leer_estado", estado.leer)
+    monkeypatch.setattr(sync, "_registrar_estado", estado.registrar)
+    monkeypatch.setattr(sync, "CRON_FALLAS_PARA_ALERTAR", 3)
+    return sync
+
+
+def test_un_error_transitorio_no_pinta_el_cron_de_rojo(monkeypatch):
+    """El mismo paso tiene que fallar 3 corridas seguidas (1,5 h) para
+    salir en 1. Un QueryCanceled suelto que se limpia solo a los 30 min
+    ya no manda correo."""
+    estado = _EstadoEnMemoria()
+    sync = _montar_racha(monkeypatch, estado)
+    results = {"detalle_historico_error": "QueryCanceled"}
+
+    assert sync._evaluar_fallas(["detalle_historico_error"], results) == 0
+    assert estado.d["cron_fallas"]["rachas"] == {"detalle_historico_error": 1}
+    assert sync._evaluar_fallas(["detalle_historico_error"], results) == 0
+    assert sync._evaluar_fallas(["detalle_historico_error"], results) == 1, (
+        "a la tercera seguida SI se alerta"
+    )
+    assert estado.d["cron_fallas"]["alerto"] == ["detalle_historico_error"]
+    assert "QueryCanceled" in estado.d["cron_fallas"]["ultimos_errores"]["detalle_historico_error"]
+
+    # Una corrida limpia resetea la racha; la siguiente falla parte de 1.
+    assert sync._evaluar_fallas([], {}) == 0
+    assert estado.d["cron_fallas"]["rachas"] == {}
+    assert sync._evaluar_fallas(["detalle_historico_error"], results) == 0
+
+
+def test_la_racha_es_por_paso_no_global(monkeypatch):
+    """Tres pasos distintos fallando una vez cada uno no es un problema
+    persistente; el mismo paso tres veces si."""
+    estado = _EstadoEnMemoria()
+    sync = _montar_racha(monkeypatch, estado)
+    assert sync._evaluar_fallas(["a_error"], {}) == 0
+    assert sync._evaluar_fallas(["b_error"], {}) == 0
+    assert sync._evaluar_fallas(["c_error"], {}) == 0
+    assert estado.d["cron_fallas"]["rachas"] == {"c_error": 1}
+
+
+def test_sin_poder_registrar_la_racha_se_sale_en_1_a_la_primera(monkeypatch):
+    """Sin memoria no hay forma de saber que es transitorio: mejor un correo
+    de mas que un cron mudo con Postgres caido."""
+    estado = _EstadoEnMemoria(escribir_falla=True)
+    sync = _montar_racha(monkeypatch, estado)
+    assert sync._evaluar_fallas(["x_error"], {}) == 1
+    assert sync._evaluar_fallas([], {}) == 0
+
+
+def test_el_registro_de_la_racha_si_levanta_si_falla():
+    """snapshot._registrar_estado traga la excepcion (y esta bien ahi). La
+    copia de sync_incremental NO puede: _evaluar_fallas decide por ella."""
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    src = _solo_codigo(inspect.getsource(sync._registrar_estado))
+    assert "except" not in src
+    assert "on_conflict_do_update" in src
+
+
+def test_run_pasa_los_errores_por_la_racha():
+    import inspect
+
+    sync = pytest.importorskip("sync_incremental")
+    src = _solo_codigo(inspect.getsource(sync._run))
+    assert "return _evaluar_fallas(failed, results)" in src
+    assert "return 1" not in src, "el 1 lo decide la racha, no _run"
+
+
+def test_valor_en_sigue_rutas_de_recolectar_errores():
+    sync = pytest.importorskip("sync_incremental")
+    obj = {"historico": [{"hist_error": "trunc"}], "stock": {"stock_error": "x"}}
+    assert sync._valor_en(obj, "historico[0].hist_error") == "trunc"
+    assert sync._valor_en(obj, "stock.stock_error") == "x"
+    assert sync._valor_en(obj, "no.existe") is None
+
+
+def test_el_status_expone_la_racha_del_cron_y_la_marca():
+    import inspect
+
+    ts = pytest.importorskip("tools_snapshot")
+    src = _solo_codigo(inspect.getsource(ts.register))
+    i = src.index("def bsale_snapshot_status")
+    j = src.index("def bsale_ventas_fast")
+    cuerpo = src[i:j]
+    assert "'cron_fallas'" in cuerpo and "'detalle_historico_marca'" in cuerpo
+    assert '"cron": {' in cuerpo
