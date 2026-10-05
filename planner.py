@@ -243,6 +243,57 @@ def clientes_b2b(max_nuevos: int = 80) -> dict[str, Any]:
     return {"clientes": n, "nombres_nuevos": len(faltan), "sin_nombre": sum(1 for f in filas if not f["nombre"])}
 
 
+SQL_SKU = """
+with docs as (
+  select document_id, coalesce(document_type_use,0) u
+  from documents_snapshot
+  where emission_date >= :desde and coalesce(document_type_use,0) <> 2 and coalesce(state,0) = 0
+    and (document_type_id is null or not (document_type_id = any(:notas)))
+)
+select {periodo} periodo, det.variant_code sku, det.office_id,
+       sum(case when d.u = 1 then -det.quantity else det.quantity end) unidades,
+       sum(case when d.u = 1 then -det.net_amount else det.net_amount end) neto
+from docs d join document_details_snapshot det on det.document_id = d.document_id
+where det.variant_code is not null and det.office_id is not null and det.emission_date >= :desde
+group by 1, 2, 3
+having sum(abs(det.quantity)) > 0
+"""
+
+
+def ventas_sku() -> dict[str, Any]:
+    """Venta por SKU y sucursal hacia Supabase: diario (90 días) y mensual (desde dic-2024).
+    Una vez al día; el primer run hace el backfill completo."""
+    from datetime import timedelta
+    from sync_incremental import _leer_estado, _registrar_estado
+    from bsale_client import sales_note_type_ids
+
+    est = _leer_estado("ventas_sku") or {}
+    ahora_dt = datetime.now(timezone.utc)
+    if est.get("ts") and est.get("backfill") and (ahora_dt - datetime.fromisoformat(est["ts"])).total_seconds() < 20 * 3600:
+        return {"omitido": "ya corrió hoy", "ultimo": est.get("ts")}
+    backfill = not est.get("backfill")
+    notas = [int(x) for x in (sales_note_type_ids() or [])] or [-1]
+    hoy = ahora_dt.date()
+    desde_dia = (hoy - timedelta(days=90 if backfill else 7)).isoformat()
+    desde_mes = INICIO if backfill else hoy.replace(day=1).replace(month=hoy.month - 1 if hoy.month > 1 else 12,
+                                                                     year=hoy.year if hoy.month > 1 else hoy.year - 1).isoformat()
+    ahora = ahora_dt.isoformat()
+    with db_session() as s:
+        s.execute(text("set local statement_timeout = '300s'"))
+        dias = s.execute(text(SQL_SKU.format(periodo="(det.emission_date at time zone 'UTC')::date")),
+                         {"desde": desde_dia, "notas": notas}).mappings().all()
+        meses = s.execute(text(SQL_SKU.format(periodo="date_trunc('month', det.emission_date at time zone 'UTC')::date")),
+                          {"desde": desde_mes, "notas": notas}).mappings().all()
+    fd = [{"fecha": r["periodo"].isoformat(), "sku": r["sku"], "office_id": r["office_id"], "unidades": float(r["unidades"] or 0),
+           "neto": float(r["neto"] or 0), "updated_at": ahora} for r in dias]
+    fm = [{"mes": r["periodo"].isoformat(), "sku": r["sku"], "office_id": r["office_id"], "unidades": float(r["unidades"] or 0),
+           "neto": float(r["neto"] or 0), "updated_at": ahora} for r in meses]
+    n_d = _post("bsale_venta_sku_diaria", fd, "fecha,sku,office_id")
+    n_m = _post("bsale_venta_sku_mensual", fm, "mes,sku,office_id")
+    _registrar_estado("ventas_sku", {"ts": ahora, "backfill": True, "dias": n_d, "meses": n_m})
+    return {"backfill": backfill, "diario": n_d, "mensual": n_m, "desde_dia": desde_dia, "desde_mes": desde_mes}
+
+
 def planner_step() -> dict[str, Any]:
     if not activo():
         return {"omitido": "sin SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY"}
@@ -262,4 +313,9 @@ def planner_step() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.warning("planner clientes_b2b: %s", e)
         out["clientes_b2b_warning"] = str(e)[:300]
+    try:
+        out["ventas_sku"] = ventas_sku()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("planner ventas_sku: %s", e)
+        out["ventas_sku_warning"] = str(e)[:300]
     return out
