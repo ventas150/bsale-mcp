@@ -760,6 +760,16 @@ def _run(modo: str) -> int:
         logger.error("Error en el backfill historico de detalle: %s", e)
         results["detalle_historico_error"] = str(e)
 
+    # Planner (Supabase): costo promedio por variante y resumen diario por
+    # sucursal. Opt-in por variables; sus fallas van como *_warning a proposito:
+    # no deben pintar el cron de rojo (no es parte del snapshot).
+    try:
+        from planner import planner_step
+        results["planner"] = planner_step()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Error en planner: %s", e)
+        results["planner_warning"] = str(e)[:300]
+
     # Regenerar la capa LLM (antes del stock, que es el paso lento).
     try:
         from digests import build_all

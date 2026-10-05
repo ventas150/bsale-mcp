@@ -72,4 +72,6 @@ def espejar(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return {"espejadas": n}
     except Exception as e:  # el snapshot nunca falla por el espejo
         logger.warning("espejo supabase fallo: %s", e)
-        return {"espejadas": n, "error": str(e)[:300]}
+        # "warning" y no "error": recolectar_errores pinta el cron de rojo con
+        # cualquier clave *error, y el espejo no es parte del snapshot.
+        return {"espejadas": n, "warning": str(e)[:300]}
