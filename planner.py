@@ -158,6 +158,75 @@ def resumen_diario() -> dict[str, Any]:
     return {"desde": desde, "filas": n, "backfill": not hecho}
 
 
+SQL_CLIENTES = """
+with f as (
+  select client_id, (emission_date at time zone 'UTC')::date fecha,
+         case when coalesce(document_type_use,0) = 1 then -net_amount else net_amount end neto
+  from documents_snapshot
+  where client_id is not null and emission_date >= now() - interval '365 days' and coalesce(state,0) = 0
+    and coalesce(document_type_use,0) in (0,1)
+    and (document_type_name ilike '%factura%' or (coalesce(document_type_use,0) = 1 and client_id in (
+         select client_id from documents_snapshot where document_type_name ilike '%factura%' and client_id is not null)))
+)
+select client_id, count(*) filter (where neto > 0) facturas_12m, sum(neto) neto_12m,
+       sum(neto) filter (where fecha >= current_date - 90) neto_90d,
+       min(fecha) primera_12m, max(fecha) ultima_compra,
+       case when count(*) filter (where neto > 0) > 1
+            then (max(fecha) - min(fecha))::numeric / (count(*) filter (where neto > 0) - 1) end dias_entre_compras
+from f group by 1 having sum(neto) > 0
+"""
+
+
+def clientes_b2b(max_nuevos: int = 80) -> dict[str, Any]:
+    """Clientes con factura (B2B) de los últimos 12 meses, con nombre/RUT/crédito desde /v1/clients (cacheado 30 días)."""
+    from bsale_client import get_client
+
+    with db_session() as s:
+        s.execute(text(
+            "create table if not exists client_cache (client_id integer primary key, data jsonb, fetched_at timestamptz not null default now())"))
+        s.execute(text("set local statement_timeout = '120s'"))
+        rows = s.execute(text(SQL_CLIENTES)).mappings().all()
+        cache = {r[0]: r[1] for r in s.execute(text(
+            "select client_id, data from client_cache where fetched_at > now() - interval '30 days'")).fetchall()}
+    faltan = [r["client_id"] for r in sorted(rows, key=lambda r: -(r["neto_12m"] or 0)) if r["client_id"] not in cache][:max_nuevos]
+    if faltan:
+        client = get_client()
+        nuevos = []
+        for cid in faltan:
+            try:
+                d = client.get(f"/v1/clients/{int(cid)}.json", use_cache=False) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            keep = {k: d.get(k) for k in ("company", "firstName", "lastName", "code", "email", "phone", "hasCredit", "maxCredit",
+                                          "companyOrPerson", "municipality", "city", "activity", "state")}
+            cache[cid] = keep
+            nuevos.append({"client_id": int(cid), "data": keep})
+        if nuevos:
+            import json as _json
+            with db_session() as s:
+                s.execute(text("""insert into client_cache (client_id, data, fetched_at) values (:client_id, cast(:data as jsonb), now())
+                                  on conflict (client_id) do update set data = excluded.data, fetched_at = now()"""),
+                          [{"client_id": n["client_id"], "data": _json.dumps(n["data"])} for n in nuevos])
+    ahora = datetime.now(timezone.utc).isoformat()
+    filas = []
+    for r in rows:
+        c = cache.get(r["client_id"]) or {}
+        nombre = (c.get("company") or " ".join(x for x in (c.get("firstName"), c.get("lastName")) if x) or None)
+        filas.append({
+            "client_id": int(r["client_id"]), "nombre": nombre, "rut": c.get("code"), "email": c.get("email"),
+            "comuna": c.get("municipality"), "giro": c.get("activity"),
+            "tiene_credito": bool(c.get("hasCredit")) if c.get("hasCredit") is not None else None,
+            "credito_max": float(c["maxCredit"]) if c.get("maxCredit") not in (None, "") else None,
+            "facturas_12m": int(r["facturas_12m"] or 0), "neto_12m": float(r["neto_12m"] or 0),
+            "neto_90d": float(r["neto_90d"] or 0), "primera_12m": r["primera_12m"].isoformat() if r["primera_12m"] else None,
+            "ultima_compra": r["ultima_compra"].isoformat() if r["ultima_compra"] else None,
+            "dias_entre_compras": float(r["dias_entre_compras"]) if r["dias_entre_compras"] is not None else None,
+            "updated_at": ahora,
+        })
+    n = _post("bsale_clientes_b2b", filas, "client_id")
+    return {"clientes": n, "nombres_nuevos": len(faltan), "sin_nombre": sum(1 for f in filas if not f["nombre"])}
+
+
 def planner_step() -> dict[str, Any]:
     if not activo():
         return {"omitido": "sin SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY"}
@@ -172,4 +241,9 @@ def planner_step() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.warning("planner resumen: %s", e)
         out["resumen_warning"] = str(e)[:300]
+    try:
+        out["clientes_b2b"] = clientes_b2b()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("planner clientes_b2b: %s", e)
+        out["clientes_b2b_warning"] = str(e)[:300]
     return out
