@@ -28,6 +28,8 @@ from db import (
     session as db_session,
 )
 
+from supabase_mirror import espejar as espejar_supabase
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,6 +145,7 @@ def snapshot_documents(days_back: int = 14, max_pages: int = 600) -> dict[str, A
     out = {
         "snapshot_ts": snapshot_ts.isoformat(),
         "rows": len(rows),
+        "supabase": espejar_supabase(rows),
         "days_back": days_back,
         "documentos_leidos": _f.get("fetched"),
         "documentos_en_bsale": _f.get("total_count"),
@@ -245,6 +248,7 @@ def snapshot_documents_range(
         "date_from": date_from,
         "date_to": date_to,
         "rows": len(rows),
+        "supabase": espejar_supabase(rows),
         "documentos_leidos": fetched.get("fetched"),
         "documentos_en_bsale": fetched.get("total_count"),
         "truncado": bool(fetched.get("truncated")),
