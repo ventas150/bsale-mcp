@@ -111,6 +111,9 @@ with docs as (
   from documents_snapshot
   where emission_date >= :desde and coalesce(document_type_use, 0) <> 2 and coalesce(state, 0) = 0
     and coalesce(document_type_name, '') not ilike '%nota de venta%'
+    -- 05-oct-2026: el filtro por nombre no atrapaba "NOTA VENTA" ni pedidos web/cotizaciones e inflaba 2025.
+    -- Misma regla que official_sale_conditions: fuera los tipos isSalesNote.
+    and (document_type_id is null or not (document_type_id = any(:notas)))
 ), v as (
   select fecha, office_id, max(office_name) office_name,
          count(*) filter (where u <> 1) documentos, count(*) filter (where u = 1) notas_credito,
@@ -136,12 +139,16 @@ def resumen_diario() -> dict[str, Any]:
     from datetime import timedelta
     from sync_incremental import _leer_estado, _registrar_estado  # helpers de sync_estado
 
+    from bsale_client import sales_note_type_ids
+
     _asegurar_tabla()
-    hecho = (_leer_estado("planner_backfill") or {}).get("completo")
+    # v2 (05-oct-2026): rehace el backfill completo con el filtro oficial de notas de venta.
+    hecho = (_leer_estado("planner_backfill_v2") or {}).get("completo")
     desde = INICIO if not hecho else (datetime.now(timezone.utc).date() - timedelta(days=40)).isoformat()
+    notas = [int(x) for x in (sales_note_type_ids() or [])] or [-1]
     with db_session() as s:
         s.execute(text("set local statement_timeout = '120s'"))
-        rows = s.execute(text(SQL_RESUMEN), {"desde": desde}).mappings().all()
+        rows = s.execute(text(SQL_RESUMEN), {"desde": desde, "notas": notas}).mappings().all()
     ahora = datetime.now(timezone.utc).isoformat()
     filas = [{
         "fecha": r["fecha"].isoformat(), "office_id": r["office_id"], "office_name": r["office_name"],
@@ -152,9 +159,18 @@ def resumen_diario() -> dict[str, Any]:
         "costo_cobertura": float(r["cobertura"]) if r["cobertura"] is not None else None,
         "updated_at": ahora,
     } for r in rows if r["office_id"] is not None]
+    if not hecho:
+        # Tabla derivada: en el backfill se reemplaza completa para no dejar días/sucursales que antes
+        # solo tenían notas de venta (quedarían inflados si solo se hace upsert).
+        url = os.environ["SUPABASE_URL"].rstrip("/") + f"/rest/v1/bsale_resumen_diario?fecha=gte.{INICIO}"
+        key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        with httpx.Client(timeout=60) as c:
+            r = c.delete(url, headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Profile": "myscrubs"})
+            if r.status_code >= 300:
+                raise RuntimeError(f"Supabase delete bsale_resumen_diario {r.status_code}: {r.text[:300]}")
     n = _post("bsale_resumen_diario", filas, "fecha,office_id")
     if not hecho:
-        _registrar_estado("planner_backfill", {"completo": True, "desde": INICIO, "filas": n, "ts": ahora})
+        _registrar_estado("planner_backfill_v2", {"completo": True, "desde": INICIO, "filas": n, "ts": ahora})
     return {"desde": desde, "filas": n, "backfill": not hecho}
 
 
