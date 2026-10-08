@@ -10,7 +10,9 @@ Opt-in: sin SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY no hace nada.
 2. resumen_diario(): agrega el snapshot propio (cero lecturas a Bsale) por dia y sucursal:
    venta oficial (NC restan; sin guias, sin notas de venta, solo state=0), unidades y
    costo = unidades x costo promedio. La primera vez manda todo desde dic-2024 (backfill
-   2025 completo); despues, los ultimos 40 dias en cada corrida.
+   2025 completo); despues, los ultimos 40 dias en cada corrida, y una vez al dia todo el
+   historial desde dic-2024 otra vez, para que los costos que van llegando de a 250 por
+   corrida tambien corrijan los meses viejos (sin eso el costo historico quedaba incompleto).
 
 OJO: el costo es el costo PROMEDIO ACTUAL de cada variante aplicado a ventas pasadas: es
 una aproximacion del costo historico, buena para contribucion, no para contabilidad.
@@ -144,12 +146,15 @@ def resumen_diario() -> dict[str, Any]:
     _asegurar_tabla()
     # v2 (05-oct-2026): rehace el backfill completo con el filtro oficial de notas de venta.
     hecho = (_leer_estado("planner_backfill_v2") or {}).get("completo")
-    desde = INICIO if not hecho else (datetime.now(timezone.utc).date() - timedelta(days=40)).isoformat()
+    ahora_dt = datetime.now(timezone.utc)
+    ult_completo = (_leer_estado("planner_resumen_completo") or {}).get("ts")
+    completo = not hecho or not ult_completo or (ahora_dt - datetime.fromisoformat(ult_completo)).total_seconds() >= 20 * 3600
+    desde = INICIO if completo else (ahora_dt.date() - timedelta(days=40)).isoformat()
     notas = [int(x) for x in (sales_note_type_ids() or [])] or [-1]
     with db_session() as s:
-        s.execute(text("set local statement_timeout = '120s'"))
+        s.execute(text(f"set local statement_timeout = '{300 if completo else 120}s'"))
         rows = s.execute(text(SQL_RESUMEN), {"desde": desde, "notas": notas}).mappings().all()
-    ahora = datetime.now(timezone.utc).isoformat()
+    ahora = ahora_dt.isoformat()
     filas = [{
         "fecha": r["fecha"].isoformat(), "office_id": r["office_id"], "office_name": r["office_name"],
         "documentos": r["documentos"], "notas_credito": r["notas_credito"],
@@ -171,7 +176,9 @@ def resumen_diario() -> dict[str, Any]:
     n = _post("bsale_resumen_diario", filas, "fecha,office_id")
     if not hecho:
         _registrar_estado("planner_backfill_v2", {"completo": True, "desde": INICIO, "filas": n, "ts": ahora})
-    return {"desde": desde, "filas": n, "backfill": not hecho}
+    if completo:
+        _registrar_estado("planner_resumen_completo", {"ts": ahora, "filas": n})
+    return {"desde": desde, "filas": n, "backfill": not hecho, "completo": completo}
 
 
 SQL_CLIENTES = """
