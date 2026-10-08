@@ -259,7 +259,9 @@ with docs as (
 )
 select {periodo} periodo, det.variant_code sku, det.office_id,
        sum(case when d.u = 1 then -det.quantity else det.quantity end) unidades,
-       sum(case when d.u = 1 then -det.net_amount else det.net_amount end) neto
+       sum(case when d.u = 1 then -det.net_amount else det.net_amount end) neto,
+       sum(det.quantity) filter (where d.u = 1) nc_unidades,
+       sum(det.net_amount) filter (where d.u = 1) nc_neto
 from docs d join document_details_snapshot det on det.document_id = d.document_id
 where det.variant_code is not null and det.office_id is not null and det.emission_date >= :desde
 group by 1, 2, 3
@@ -274,7 +276,8 @@ def ventas_sku() -> dict[str, Any]:
     from sync_incremental import _leer_estado, _registrar_estado
     from bsale_client import sales_note_type_ids
 
-    est = _leer_estado("ventas_sku") or {}
+    # v2 (08-oct-2026): agrega nc_unidades/nc_neto (notas de crédito por SKU y sucursal); clave nueva = backfill completo.
+    est = _leer_estado("ventas_sku_v2") or {}
     ahora_dt = datetime.now(timezone.utc)
     if est.get("ts") and est.get("backfill") and (ahora_dt - datetime.fromisoformat(est["ts"])).total_seconds() < 20 * 3600:
         return {"omitido": "ya corrió hoy", "ultimo": est.get("ts")}
@@ -292,12 +295,14 @@ def ventas_sku() -> dict[str, Any]:
         meses = s.execute(text(SQL_SKU.format(periodo="date_trunc('month', det.emission_date at time zone 'UTC')::date")),
                           {"desde": desde_mes, "notas": notas}).mappings().all()
     fd = [{"fecha": r["periodo"].isoformat(), "sku": r["sku"], "office_id": r["office_id"], "unidades": float(r["unidades"] or 0),
-           "neto": float(r["neto"] or 0), "updated_at": ahora} for r in dias]
+           "neto": float(r["neto"] or 0), "nc_unidades": float(r["nc_unidades"] or 0),
+           "nc_neto": float(r["nc_neto"] or 0), "updated_at": ahora} for r in dias]
     fm = [{"mes": r["periodo"].isoformat(), "sku": r["sku"], "office_id": r["office_id"], "unidades": float(r["unidades"] or 0),
-           "neto": float(r["neto"] or 0), "updated_at": ahora} for r in meses]
+           "neto": float(r["neto"] or 0), "nc_unidades": float(r["nc_unidades"] or 0),
+           "nc_neto": float(r["nc_neto"] or 0), "updated_at": ahora} for r in meses]
     n_d = _post("bsale_venta_sku_diaria", fd, "fecha,sku,office_id")
     n_m = _post("bsale_venta_sku_mensual", fm, "mes,sku,office_id")
-    _registrar_estado("ventas_sku", {"ts": ahora, "backfill": True, "dias": n_d, "meses": n_m})
+    _registrar_estado("ventas_sku_v2", {"ts": ahora, "backfill": True, "dias": n_d, "meses": n_m})
     return {"backfill": backfill, "diario": n_d, "mensual": n_m, "desde_dia": desde_dia, "desde_mes": desde_mes}
 
 
